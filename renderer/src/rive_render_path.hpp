@@ -45,6 +45,23 @@ public:
     bool isClockwiseDominant(const Mat2D& viewMatrix) const;
     uint64_t getRawPathMutationID() const;
 
+    bool hasSurfaceMaterialBinding() const
+    {
+        return m_hasSurfaceMaterialBinding;
+    }
+    const Mat2D& surfaceMaterialLocalToUV() const
+    {
+        return m_surfaceMaterialLocalToUV;
+    }
+    void captureSurfaceMaterialBinding(const Mat2D& localToUV)
+    {
+        if (!m_hasSurfaceMaterialBinding)
+        {
+            m_surfaceMaterialLocalToUV = localToUV;
+            m_hasSurfaceMaterialBinding = true;
+        }
+    }
+
     // 1-dimensional feathering along the normal vector quits looking like a
     // blur when there is strong curvature. This method returns a copy of the
     // path with shorter, flatter curves that will more accurately depict a
@@ -71,6 +88,8 @@ private:
     mutable AABB m_bounds;
     mutable float m_coarseArea;
     mutable uint64_t m_rawPathMutationID;
+    Mat2D m_surfaceMaterialLocalToUV;
+    bool m_hasSurfaceMaterialBinding = false;
 
     enum Dirt
     {

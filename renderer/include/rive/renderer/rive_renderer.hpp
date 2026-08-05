@@ -49,6 +49,15 @@ public:
                        float opacity) override;
     void modulateOpacity(float opacity) override;
 
+    void setSurfaceMaterial(gpu::SurfaceMaterial material,
+                            const AABB& bounds,
+                            float timeSeconds)
+    {
+        m_renderStateStack.back().surfaceMaterial = material;
+        m_renderStateStack.back().surfaceMaterialBounds = bounds;
+        m_renderStateStack.back().surfaceMaterialTimeSeconds = timeSeconds;
+    }
+
     // Determines if a path is an axis-aligned rectangle that can be represented
     // by rive::AABB.
     static bool IsAABB(const RawPath&, AABB* result);
@@ -73,6 +82,8 @@ public:
 #endif
 
 private:
+    void applySurfaceMaterial(gpu::PathDraw&, RiveRenderPath*);
+    void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);
     void clipPathImpl(const RiveRenderPath*);
 
@@ -102,10 +113,12 @@ private:
         IAABB clipRectPixelBounds;
         const gpu::ClipRectInverseMatrix* clipRectInverseMatrix = nullptr;
         float modulatedOpacity = 1.0f;
-
         // The pixel bounds for all clipping (clip rects *and* clip paths),
         // which defaults to a maximally-large rectangle
         IAABB overallClipPixelBounds = IAABB::makeMaximal();
+        gpu::SurfaceMaterial surfaceMaterial = gpu::SurfaceMaterial::none;
+        AABB surfaceMaterialBounds;
+        float surfaceMaterialTimeSeconds = 0;
     };
     std::vector<RenderState> m_renderStateStack{1};
 

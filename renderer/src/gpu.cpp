@@ -826,6 +826,18 @@ static void writeTranslate(volatile float* dst, const Mat2D& matrix)
     dst[1] = vals[5];
 }
 
+static Mat2D orient_for_framebuffer(Mat2D matrix,
+                                    const RenderTarget* renderTarget,
+                                    const PlatformFeatures& platformFeatures)
+{
+    if (platformFeatures.framebufferBottomUp)
+    {
+        matrix =
+            matrix * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
+    }
+    return matrix;
+}
+
 void PathData::set(const Mat2D& m,
                    float strokeRadius,
                    float featherRadius,
@@ -915,6 +927,7 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
                        const Gradient* gradient,
                        const Texture* imageTexture,
                        const ClipRectInverseMatrix* clipRectInverseMatrix,
+                       const SurfaceMaterialData* surfaceMaterialData,
                        const RenderTarget* renderTarget,
                        const PlatformFeatures& platformFeatures)
 {
@@ -930,12 +943,8 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
         {
             Mat2D paintMatrix;
             viewMatrix.invert(&paintMatrix);
-            if (platformFeatures.framebufferBottomUp)
-            {
-                // Flip _fragCoord.y.
-                paintMatrix =
-                    paintMatrix * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
-            }
+            paintMatrix = orient_for_framebuffer(
+                paintMatrix, renderTarget, platformFeatures);
             if (paintType == PaintType::image)
             {
                 // Since we don't use perspective transformations, the image
@@ -1007,11 +1016,7 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
     if (clipRectInverseMatrix != nullptr)
     {
         Mat2D m = clipRectInverseMatrix->inverseMatrix();
-        if (platformFeatures.framebufferBottomUp)
-        {
-            // Flip _fragCoord.y.
-            m = m * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
-        }
+        m = orient_for_framebuffer(m, renderTarget, platformFeatures);
         write_matrix(m_clipRectInverseMatrix, m);
         m_inverseFwidth.x = -1.f / (fabsf(m.xx()) + fabsf(m.xy()));
         m_inverseFwidth.y = -1.f / (fabsf(m.yx()) + fabsf(m.yy()));
@@ -1022,6 +1027,21 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
                      ClipRectInverseMatrix::WideOpen().inverseMatrix());
         m_inverseFwidth.x = 0;
         m_inverseFwidth.y = 0;
+    }
+
+    if (surfaceMaterialData != nullptr &&
+        surfaceMaterialData->material != SurfaceMaterial::none)
+    {
+        Mat2D screenToUV = orient_for_framebuffer(
+            surfaceMaterialData->screenToUV, renderTarget, platformFeatures);
+        write_matrix(m_surfaceMaterialMatrix, screenToUV);
+        m_surfaceMaterialMode = static_cast<float>(surfaceMaterialData->material);
+        m_surfaceMaterialTimeSeconds = surfaceMaterialData->timeSeconds;
+    }
+    else
+    {
+        m_surfaceMaterialMode = static_cast<float>(SurfaceMaterial::none);
+        m_surfaceMaterialTimeSeconds = 0;
     }
 }
 

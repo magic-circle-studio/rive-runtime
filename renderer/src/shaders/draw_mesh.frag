@@ -81,6 +81,10 @@ PLS_MAIN(@drawFragmentMain)
     VARYING_UNPACK(v_imageBlendMode, ushort);
 #endif
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@FEATHER_ATLAS_BLIT) &&         \
+    defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
+#endif
 
 #ifdef @FEATHER_ATLAS_BLIT
     half4 color = find_paint_color(v_paint, 1. FRAGMENT_CONTEXT_UNPACK);
@@ -91,6 +95,15 @@ PLS_MAIN(@drawFragmentMain)
                               .r,
                           make_half(.0),
                           make_half(1.));
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        color = apply_surface_material_to_paint(
+            color,
+            v_surfaceMaterialData,
+            !GENERATE_UNMULTIPLIED_PAINT_COLORS);
+    }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 #endif
 
 #ifdef @DRAW_IMAGE_MESH

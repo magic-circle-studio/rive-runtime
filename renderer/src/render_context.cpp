@@ -3048,6 +3048,7 @@ uint32_t RenderContext::LogicalFlush::pushPath(const PathDraw* draw)
                                    draw->gradient(),
                                    draw->imageTexture(),
                                    draw->clipRectInverseMatrix(),
+                                   draw->surfaceMaterialData(),
                                    m_flushDesc.renderTarget,
                                    m_ctx->platformFeatures());
 
@@ -3599,6 +3600,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
                                 draw->paintType(),
                                 vertexCount,
                                 baseVertex);
+#ifdef RIVE_WEBGL
+    if (draw->hasSurfaceMaterial())
+    {
+        // Materials share the existing HSL helper permutation but do not need
+        // destination reads or advanced-blend render passes.
+        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    }
+#endif
 
     auto pathShaderFeatures = gpu::ShaderFeatures::NONE;
     if (draw->featherRadius() != 0 &&

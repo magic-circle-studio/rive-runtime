@@ -70,6 +70,9 @@ NO_PERSPECTIVE VARYING(5, float4, v_clipRect);
 #ifdef @ENABLE_ADVANCED_BLEND
 @OPTIONALLY_FLAT VARYING(6, half, v_blendMode);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(9, float4, v_surfaceMaterialData);
+#endif
 
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
 FLAT VARYING(7, uint2, v_coveragePlacement);
@@ -124,6 +127,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_INIT(v_blendMode, half);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_INIT(v_surfaceMaterialData, float4);
 #endif
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
     VARYING_INIT(v_coveragePlacement, uint2);
@@ -226,15 +232,42 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     fragCoord.y = float(uniforms.renderTargetHeight) - fragCoord.y;
 #endif
 
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        float4 surfaceMaterialTranslate =
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+        v_surfaceMaterialData = float4(0.0, 0.0, surfaceMaterialTranslate.zw);
+        if (surfaceMaterialTranslate.z > 0.5)
+        {
+            float2x2 surfaceMaterialMatrix = make_float2x2(
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+            v_surfaceMaterialData.xy =
+                MUL(surfaceMaterialMatrix, fragCoord) + surfaceMaterialTranslate.xy;
+        }
+    }
+#endif
+
 #ifdef @ENABLE_CLIP_RECT
     if (@ENABLE_CLIP_RECT)
     {
         // clipRectInverseMatrix transforms from pixel coordinates to a space
         // where the clipRect is the normalized rectangle: [-1, -1, 1, 1].
         float2x2 clipRectInverseMatrix = make_float2x2(
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 2u));
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE + PAINT_AUX_CLIP_MATRIX_OFFSET));
         float4 clipRectInverseTranslate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 3u);
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_CLIP_TRANSLATE_OFFSET);
 #ifndef @RENDER_MODE_MSAA
         v_clipRect =
             find_clip_rect_coverage_distances(clipRectInverseMatrix,
@@ -275,9 +308,14 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     else
     {
         float2x2 paintMatrix =
-            make_float2x2(STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u));
+            make_float2x2(STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE + PAINT_AUX_PAINT_MATRIX_OFFSET));
         float4 paintTranslate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 1u);
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_PAINT_TRANSLATE_OFFSET);
         float2 paintCoord = MUL(paintMatrix, fragCoord) + paintTranslate.xy;
         if (paintType == LINEAR_GRADIENT_PAINT_TYPE ||
             paintType == RADIAL_GRADIENT_PAINT_TYPE)
@@ -389,6 +427,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_PACK(v_blendMode);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_PACK(v_surfaceMaterialData);
 #endif
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
     VARYING_PACK(v_coveragePlacement);

@@ -587,9 +587,14 @@ INLINE void resolve_paint(uint pathID,
     if (@ENABLE_CLIP_RECT && (paintData.x & PAINT_FLAG_HAS_CLIP_RECT) != 0u)
     {
         float2x2 M = make_float2x2(
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 2u));
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE + PAINT_AUX_CLIP_MATRIX_OFFSET));
         float4 translate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 3u);
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_CLIP_TRANSLATE_OFFSET);
         float2 clipCoord = MUL(M, _fragCoord) + translate.xy;
         // translate.zw contains -1 / fwidth(clipCoord), which we use to
         // calculate antialiasing.
@@ -627,9 +632,14 @@ INLINE void resolve_paint(uint pathID,
     else // LINEAR_GRADIENT_PAINT_TYPE or RADIAL_GRADIENT_PAINT_TYPE
     {
         float2x2 M =
-            make_float2x2(STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u));
+            make_float2x2(STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE + PAINT_AUX_PAINT_MATRIX_OFFSET));
         float4 translate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 1u);
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_PAINT_TRANSLATE_OFFSET);
         float2 paintCoord = MUL(M, _fragCoord) + translate.xy;
         float t = paintType == LINEAR_GRADIENT_PAINT_TYPE
                       ? /*linear*/ paintCoord.x
@@ -641,6 +651,31 @@ INLINE void resolve_paint(uint pathID,
             TEXTURE_SAMPLE_LOD(@gradTexture, gradSampler, float2(x, y), .0);
     }
     fragColorOut.a *= coverage;
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        float4 surfaceMaterialTranslate =
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+        if (surfaceMaterialTranslate.z > 0.5)
+        {
+            float2x2 surfaceMaterialMatrix = make_float2x2(
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+            float2 materialCoord =
+                MUL(surfaceMaterialMatrix, _fragCoord) + surfaceMaterialTranslate.xy;
+            fragColorOut = apply_surface_material_to_paint(
+                fragColorOut,
+                float4(materialCoord, surfaceMaterialTranslate.zw),
+                false);
+        }
+    }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 
 #if !defined(@FIXED_FUNCTION_COLOR_OUTPUT) && defined(@ENABLE_ADVANCED_BLEND)
     // Apply the advanced blend mode, if applicable.
