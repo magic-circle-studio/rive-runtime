@@ -1176,6 +1176,18 @@ static void writeTranslate(volatile float* dst, const Mat2D& matrix)
     dst[1] = vals[5];
 }
 
+static Mat2D orient_for_framebuffer(Mat2D matrix,
+                                    const RenderTarget* renderTarget,
+                                    const PlatformFeatures& platformFeatures)
+{
+    if (renderTarget->bottomUp(platformFeatures))
+    {
+        matrix =
+            matrix * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
+    }
+    return matrix;
+}
+
 void PathData::set(const Mat2D& m,
                    float strokeRadius,
                    float featherRadius,
@@ -1344,6 +1356,7 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
                        const Mat2D& inverseGradientTransform,
                        const Texture* imageTexture,
                        const ClipRectInverseMatrix* clipRectInverseMatrix,
+                       const SurfaceMaterialData* surfaceMaterialData,
                        const RenderTarget* renderTarget,
                        const PlatformFeatures& platformFeatures)
 {
@@ -1431,6 +1444,21 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
                      ClipRectInverseMatrix::WideOpen().inverseMatrix());
         m_inverseFwidth.x = 0;
         m_inverseFwidth.y = 0;
+    }
+
+    if (surfaceMaterialData != nullptr &&
+        surfaceMaterialData->material != SurfaceMaterial::none)
+    {
+        Mat2D screenToUV = orient_for_framebuffer(
+            surfaceMaterialData->screenToUV, renderTarget, platformFeatures);
+        write_matrix(m_surfaceMaterialMatrix, screenToUV);
+        m_surfaceMaterialMode = static_cast<float>(surfaceMaterialData->material);
+        m_surfaceMaterialTimeSeconds = surfaceMaterialData->timeSeconds;
+    }
+    else
+    {
+        m_surfaceMaterialMode = static_cast<float>(SurfaceMaterial::none);
+        m_surfaceMaterialTimeSeconds = 0;
     }
 }
 

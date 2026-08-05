@@ -703,6 +703,32 @@ INLINE void resolve_paint(uint pathID,
             fragColorOut.a *= abs(additivenessComplement);
         }
     }
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        float4 surfaceMaterialTranslate =
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+        if (surfaceMaterialTranslate.z > 0.5)
+        {
+            float2x2 surfaceMaterialMatrix = make_float2x2(
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+            float2 materialCoord =
+                MUL(surfaceMaterialMatrix, _fragCoord) + surfaceMaterialTranslate.xy;
+            fragColorOut = apply_surface_material_to_paint(
+                fragColorOut,
+                float4(materialCoord, surfaceMaterialTranslate.zw),
+                !paintHasAdvancedBlend);
+        }
+    }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
+
 #if !defined(@FIXED_FUNCTION_COLOR_OUTPUT) && defined(@ENABLE_ADVANCED_BLEND)
     // NOTE: fixedFunctionColorOutput is never selected for a flush that
     // contains advanced-blend draws, so paintHasAdvancedBlend is always false
