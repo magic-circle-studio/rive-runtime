@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <numeric>
 #include <optional>
 
 // Use the define to run the feather LUT code
@@ -425,6 +426,26 @@ enum class PaintType : uint32_t
     solidColor,
     linearGradient,
     radialGradient,
+};
+
+// Optional inline material applied to vector path paint colors before they are
+// composited. This is deliberately independent from BlendMode so enabling a
+// material never requires destination reads or advanced-blend render passes.
+enum class SurfaceMaterial : uint32_t
+{
+    none,
+    gold,
+    rainbow,
+};
+static_assert(static_cast<uint32_t>(SurfaceMaterial::none) == 0);
+static_assert(static_cast<uint32_t>(SurfaceMaterial::gold) == 1);
+static_assert(static_cast<uint32_t>(SurfaceMaterial::rainbow) == 2);
+
+struct SurfaceMaterialData
+{
+    Mat2D screenToUV;
+    SurfaceMaterial material = SurfaceMaterial::none;
+    float timeSeconds = 0;
 };
 
 // Specifies the location of a simple or complex horizontal color ramp within
@@ -852,7 +873,8 @@ enum class ShaderFeatures
     ENABLE_ADVANCED_BLEND = 1 << 2,
     ENABLE_FEATHER = 1 << 3,
 
-    // Fragment-only features.
+    // Fragment-only features. The WebGL surface-material fork also reuses the
+    // HSL bit to gate its vertex varying without adding a pipeline permutation.
     ENABLE_EVEN_ODD = 1 << 4,
     ENABLE_NESTED_CLIPPING = 1 << 5,
     ENABLE_HSL_BLEND_MODES = 1 << 6,
@@ -863,10 +885,19 @@ enum class ShaderFeatures
 constexpr static size_t ShaderFeatureCount = 9;
 constexpr static ShaderFeatures kAllShaderFeatures =
     static_cast<gpu::ShaderFeatures>((1 << ShaderFeatureCount) - 1);
+constexpr static ShaderFeatures kSurfaceMaterialVertexShaderFeatures =
+#ifdef RIVE_WEBGL
+    // Reuse an existing WebGL feature bit so the fork does not widen every
+    // backend's shader key for a package that only ships WebGL2 materials.
+    ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+#else
+    ShaderFeatures::NONE;
+#endif
 constexpr static ShaderFeatures kVertexShaderFeaturesMask =
     ShaderFeatures::ENABLE_CLIPPING | ShaderFeatures::ENABLE_CLIP_RECT |
     ShaderFeatures::ENABLE_ADVANCED_BLEND | ShaderFeatures::ENABLE_FEATHER |
-    ShaderFeatures::ENABLE_MODULATED_IMAGE;
+    ShaderFeatures::ENABLE_MODULATED_IMAGE |
+    kSurfaceMaterialVertexShaderFeatures;
 
 // These shader features change the way atomic pipelines are set up (or cause
 //  validation failures when enabled but not used)
@@ -1718,6 +1749,7 @@ public:
              const Gradient*,
              const Texture*,
              const ClipRectInverseMatrix*,
+             const SurfaceMaterialData*,
              const RenderTarget*,
              const gpu::PlatformFeatures&);
 
@@ -1731,15 +1763,20 @@ private:
                                       // antialiasing.
     WRITEONLY float m_imageMatrix[6]; // Maps _fragCoord to image coordinates.
     WRITEONLY float m_imageTextureLOD;
-    WRITEONLY float
-        m_padding[9]; // Padding out to 128 bytes (to have 256 byte alignment)
+    WRITEONLY float m_padding; // Align material data to the next float4.
+    WRITEONLY float m_surfaceMaterialMatrix[6];
+    WRITEONLY float m_surfaceMaterialMode;
+    WRITEONLY float m_surfaceMaterialTimeSeconds;
 };
 static_assert(sizeof(PaintAuxData) ==
               StorageBufferElementSizeInBytes(PaintAuxData::kBufferStructure) *
                   8);
 static_assert(256 % sizeof(PaintAuxData) == 0);
 constexpr static size_t kPaintAuxBufferAlignmentInElements =
-    256 / sizeof(PaintAuxData);
+    256 / std::gcd<size_t>(256, sizeof(PaintAuxData));
+static_assert((kPaintAuxBufferAlignmentInElements * sizeof(PaintAuxData)) %
+                  256 ==
+              0);
 
 // High level structure of the "contour" storage buffer. Each contour of every
 // path has a data record describing its info.

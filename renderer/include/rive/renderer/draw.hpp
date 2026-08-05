@@ -265,6 +265,19 @@ public:
              CoverageType,
              const RenderContext::FrameDescriptor&);
 
+    const gpu::SurfaceMaterialData* surfaceMaterialData() const
+    {
+        return hasSurfaceMaterial() ? &m_surfaceMaterialData : nullptr;
+    }
+    bool hasSurfaceMaterial() const
+    {
+        return m_surfaceMaterialData.material != gpu::SurfaceMaterial::none;
+    }
+    void setSurfaceMaterial(const gpu::SurfaceMaterialData& data)
+    {
+        m_surfaceMaterialData = data;
+    }
+
     CoverageType coverageType() const { return m_coverageType; }
 
     FillRule pathFillRule() const { return m_pathFillRule; }
@@ -423,6 +436,7 @@ protected:
     const Gradient* m_gradientRef; // Already modulated if opacity != 1.0
     const gpu::PaintType m_paintType;
     const CoverageType m_coverageType;
+    gpu::SurfaceMaterialData m_surfaceMaterialData;
     float m_strokeRadius = 0;
     float m_featherRadius = 0;
     gpu::ContourDirections m_contourDirections;

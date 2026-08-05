@@ -22,6 +22,10 @@
 #include "generated/shaders/advanced_blend.glsl.hpp"
 #include "generated/shaders/bezier_utils.glsl.hpp"
 #include "generated/shaders/blit_texture_as_draw.glsl.hpp"
+#ifdef RIVE_WEBGL
+#include "generated/shaders/surface_material.glsl.hpp"
+#include "generated/shaders/surface_material_dispatch.glsl.hpp"
+#endif
 #include "generated/shaders/color_ramp.glsl.hpp"
 #include "generated/shaders/common.glsl.hpp"
 #include "generated/shaders/constants.glsl.hpp"
@@ -1422,6 +1426,9 @@ RenderContextGLImpl::DrawShader::DrawShader(
 #endif
 
     std::vector<const char*> defines;
+#ifdef RIVE_WEBGL
+    defines.push_back(GLSL_RIVE_SURFACE_MATERIAL);
+#endif
     if (renderContextImpl->m_plsImpl != nullptr &&
         interlockMode != gpu::InterlockMode::depthStencil)
     {
@@ -1546,11 +1553,21 @@ RenderContextGLImpl::DrawShader::DrawShader(
     sources.push_back(glsl::constants);
     sources.push_back(glsl::flush_uniforms);
     sources.push_back(glsl::common);
-    if (shaderType == GL_FRAGMENT_SHADER &&
-        enums::is_flag_set(shaderFeatures,
-                           ShaderFeatures::ENABLE_ADVANCED_BLEND))
+    if (shaderType == GL_FRAGMENT_SHADER)
     {
-        sources.push_back(glsl::advanced_blend);
+#ifdef RIVE_WEBGL
+        if (enums::is_flag_set(shaderFeatures,
+                               ShaderFeatures::ENABLE_HSL_BLEND_MODES))
+        {
+            sources.push_back(glsl::surface_material);
+            sources.push_back(glsl::surface_material_dispatch);
+        }
+#endif
+        if (enums::is_flag_set(shaderFeatures,
+                               ShaderFeatures::ENABLE_ADVANCED_BLEND))
+        {
+            sources.push_back(glsl::advanced_blend);
+        }
     }
     switch (interlockMode)
     {

@@ -14,6 +14,29 @@
 
 namespace rive
 {
+namespace
+{
+// Rainbow's angle and density are part of the material preset. Aspect comes
+// from each surface's bounds instead of assuming a particular artboard size.
+constexpr float kRainbowAxisX = -0.64278761f;
+constexpr float kRainbowAxisY = 0.76604444f;
+constexpr float kRainbowSquish = 2.5f;
+constexpr float kRainbowSheenAxisX = 0.78f;
+constexpr float kRainbowSheenAxisY = 0.62f;
+
+Mat2D rainbowUVProjection(float aspect)
+{
+    return Mat2D(-kRainbowAxisX * kRainbowSquish,
+                 kRainbowSheenAxisX,
+                 kRainbowAxisY * kRainbowSquish * aspect,
+                 kRainbowSheenAxisY * aspect,
+                 0.5f + (kRainbowAxisX - kRainbowAxisY) *
+                            kRainbowSquish * 0.5f,
+                 0.5f -
+                     (kRainbowSheenAxisX + kRainbowSheenAxisY) * 0.5f);
+}
+} // namespace
+
 bool RiveRenderer::IsAABB(const RawPath& path, AABB* result)
 {
     RIVE_PROF_SCOPE_L(3)
@@ -261,7 +284,7 @@ void RiveRenderer::drawPath(RenderPath* renderPath, RenderPaint* renderPaint)
         float matrixMaxScale = m_renderStateStack.back().matrix.findMaxScale();
         if (paint->getFeather() * matrixMaxScale > 1)
         {
-            clipAndPushDraw(gpu::PathDraw::Make(
+            auto draw = gpu::PathDraw::Make(
                 m_context,
                 m_renderStateStack.back().matrix,
                 imageMatrixPtr,
@@ -269,19 +292,83 @@ void RiveRenderer::drawPath(RenderPath* renderPath, RenderPaint* renderPaint)
                                                     matrixMaxScale),
                 path->getFillRule(),
                 paint,
-                m_renderStateStack.back().modulatedOpacity));
+                m_renderStateStack.back().modulatedOpacity);
+            clipAndPushPathDraw(std::move(draw), path);
             return;
         }
     }
 
-    clipAndPushDraw(
-        gpu::PathDraw::Make(m_context,
-                            m_renderStateStack.back().matrix,
-                            imageMatrixPtr,
-                            ref_rcp(path),
-                            path->getFillRule(),
-                            paint,
-                            m_renderStateStack.back().modulatedOpacity));
+    auto draw = gpu::PathDraw::Make(m_context,
+                                    m_renderStateStack.back().matrix,
+                                    imageMatrixPtr,
+                                    ref_rcp(path),
+                                    path->getFillRule(),
+                                    paint,
+                                    m_renderStateStack.back().modulatedOpacity);
+    clipAndPushPathDraw(std::move(draw), path);
+}
+
+void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
+                                       RiveRenderPath* path)
+{
+    if (draw != nullptr)
+    {
+        applySurfaceMaterial(static_cast<gpu::PathDraw&>(*draw), path);
+    }
+    clipAndPushDraw(std::move(draw));
+}
+
+void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
+                                        RiveRenderPath* path)
+{
+    const auto& state = m_renderStateStack.back();
+    if (state.surfaceMaterialBounds.isEmptyOrNaN())
+    {
+        return;
+    }
+
+    const AABB& bounds = state.surfaceMaterialBounds;
+    const float width = bounds.width();
+    const float height = bounds.height();
+    const Mat2D& localToScreen = state.matrix;
+    if (!path->hasSurfaceMaterialBinding())
+    {
+        // Capture one stable local-to-material mapping. Later poses invert
+        // their current transform so the material follows the path instead of
+        // remaining attached to screen pixels.
+        const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
+            1.f / width,
+            1.f / height,
+            -bounds.left() / width,
+            -bounds.top() / height);
+        path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
+    }
+
+    if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
+    {
+        return;
+    }
+
+    Mat2D screenToLocal;
+    if (!localToScreen.invert(&screenToLocal))
+    {
+        return;
+    }
+
+    Mat2D screenToMaterial =
+        path->surfaceMaterialLocalToUV() * screenToLocal;
+    if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
+    {
+        screenToMaterial = rainbowUVProjection(width / height) *
+                           screenToMaterial;
+    }
+
+    gpu::SurfaceMaterialData materialData = {
+        .screenToUV = screenToMaterial,
+        .material = state.surfaceMaterial,
+        .timeSeconds = state.surfaceMaterialTimeSeconds,
+    };
+    draw.setSurfaceMaterial(materialData);
 }
 
 void RiveRenderer::clipPath(RenderPath* renderPath)

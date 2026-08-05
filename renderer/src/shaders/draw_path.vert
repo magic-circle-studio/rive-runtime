@@ -51,6 +51,10 @@ NO_PERSPECTIVE VARYING(5, float4, v_clipRect);
 #ifdef @ENABLE_ADVANCED_BLEND
 @OPTIONALLY_FLAT VARYING(6, half, v_blendMode);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(10, float4, v_surfaceMaterialData);
+#endif
+
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
 FLAT VARYING(7, uint2, v_coveragePlacement);
 VARYING(8, float2, v_coverageCoord);
@@ -111,6 +115,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_INIT(v_blendMode, half);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_INIT(v_surfaceMaterialData, float4);
 #endif
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
     VARYING_INIT(v_coveragePlacement, uint2);
@@ -214,6 +221,28 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     if (uniforms.renderTargetBottomUp != 0u)
     {
         fragCoord.y = float(uniforms.renderTargetHeight) - fragCoord.y;
+    }
+#endif
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        float4 surfaceMaterialTranslate =
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+        v_surfaceMaterialData = float4(0.0, 0.0, surfaceMaterialTranslate.zw);
+        if (surfaceMaterialTranslate.z > 0.5)
+        {
+            float2x2 surfaceMaterialMatrix = make_float2x2(
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+            v_surfaceMaterialData.xy =
+                MUL(surfaceMaterialMatrix, fragCoord) + surfaceMaterialTranslate.xy;
+        }
     }
 #endif
 
@@ -360,6 +389,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_PACK(v_blendMode);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_PACK(v_surfaceMaterialData);
 #endif
 #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
     VARYING_PACK(v_coveragePlacement);

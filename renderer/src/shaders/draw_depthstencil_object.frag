@@ -38,6 +38,9 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_UNPACK(v_blendMode, half);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
+#endif
 #endif // !@DRAW_IMAGE_MESH
 
 #ifdef @DRAW_IMAGE_MESH
@@ -69,6 +72,23 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
 #endif
         v_paint FRAGMENT_CONTEXT_UNPACK);
 #endif
+
+#if defined(@RIVE_SURFACE_MATERIAL) && !defined(@DRAW_IMAGE_MESH) &&           \
+    defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        color = apply_surface_material_to_paint(
+            color,
+            v_surfaceMaterialData,
+            
+#ifdef @ENABLE_ADVANCED_BLEND
+            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+#else
+            true
+#endif
+);
+    }
+#endif // RIVE_SURFACE_MATERIAL && !DRAW_IMAGE_MESH && ENABLE_HSL_BLEND_MODES
 
 // Need to check both flags here because in GL when KHR_blend_equation_advanced
 // is supported, it is possible that neither is defined.

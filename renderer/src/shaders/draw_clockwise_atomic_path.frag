@@ -216,6 +216,9 @@ CLOCKWISE_ATOMIC_PLS_MAIN(@drawFragmentMain)
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_UNPACK(v_blendMode, half);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
+#endif
     VARYING_UNPACK(v_coveragePlacement, uint2);
     VARYING_UNPACK(v_coverageCoord, float2);
 
@@ -228,6 +231,21 @@ CLOCKWISE_ATOMIC_PLS_MAIN(@drawFragmentMain)
 #endif
         v_paint FRAGMENT_CONTEXT_UNPACK);
 
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        paintColor = apply_surface_material_to_paint(
+            paintColor,
+            v_surfaceMaterialData,
+            
+#ifdef @ENABLE_ADVANCED_BLEND
+            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+#else
+            true
+#endif
+);
+    }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 #ifndef @FIXED_FUNCTION_COLOR_OUTPUT
     // Fetch the framebuffer BEFORE any atomic operations on the coverage
     // buffer. In order for advanced blend to work, we have to fetch the
