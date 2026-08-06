@@ -6,6 +6,7 @@
 #include "rive/renderer/rive_renderer.hpp"
 #include "rive/renderer/rive_render_image.hpp"
 #include "../src/rive_render_path.hpp"
+#include "../src/rive_render_paint.hpp"
 #include <catch.hpp>
 
 namespace rive::gpu
@@ -1307,6 +1308,51 @@ TEST_CASE("image-sample-option-conversions", "[RiveRenderer]")
     CHECK(wrapy(mirrorClampMipNearestOptionsKey) == rive::ImageWrap::clamp);
     CHECK(filter(mirrorClampMipNearestOptionsKey) ==
           rive::ImageFilter::nearest);
+}
+
+TEST_CASE("image draws use scoped materials without caching shared paths",
+          "[RiveRenderer]")
+{
+    std::unique_ptr<RenderContext> renderContext =
+        RenderContextNULL::MakeContext();
+    auto desc = s_frameDescriptor;
+    desc.disableRasterOrdering = true;
+    renderContext->beginFrame(desc);
+
+    RiveRenderer renderer(renderContext.get());
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold,
+                                AABB(0, 0, 100, 100),
+                                0);
+
+    auto makeRectPath = []() {
+        return make_rcp<RiveRenderPath>(FillRule::nonZero,
+                                        make_rect({0, 0, 100, 100}));
+    };
+    auto vectorPath = makeRectPath();
+    RiveRenderPaint vectorPaint;
+    vectorPaint.color(0xffffffff);
+    renderer.drawPath(vectorPath.get(), &vectorPaint);
+    CHECK(vectorPath->hasSurfaceMaterialBinding());
+
+    auto inheritedImagePath = makeRectPath();
+    RiveRenderPaint imagePaint;
+    imagePaint.image(nullptr, 1);
+    renderer.drawPath(inheritedImagePath.get(), &imagePaint);
+    CHECK_FALSE(inheritedImagePath->hasSurfaceMaterialBinding());
+
+    auto excludedImagePath = makeRectPath();
+    renderer.save();
+    renderer.setSurfaceMaterialOverride(SurfaceMaterial::none);
+    renderer.drawPath(excludedImagePath.get(), &imagePaint);
+    renderer.restore();
+    CHECK_FALSE(excludedImagePath->hasSurfaceMaterialBinding());
+
+    auto rainbowImagePath = makeRectPath();
+    renderer.save();
+    renderer.setSurfaceMaterialOverride(SurfaceMaterial::rainbow);
+    renderer.drawPath(rainbowImagePath.get(), &imagePaint);
+    renderer.restore();
+    CHECK_FALSE(rainbowImagePath->hasSurfaceMaterialBinding());
 }
 
 // Ensure the renderer gracefully handles a null texture within a

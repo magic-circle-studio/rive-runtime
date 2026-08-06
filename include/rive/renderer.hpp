@@ -16,6 +16,7 @@
 #include "rive/shapes/paint/image_sampler.hpp"
 #include "rive/shapes/paint/stroke_cap.hpp"
 #include "rive/shapes/paint/stroke_join.hpp"
+#include "rive/surface_material.hpp"
 #include "utils/lite_rtti.hpp"
 #include "rive/math/raw_path.hpp"
 #include <stdio.h>
@@ -238,6 +239,9 @@ public:
     // Not implementable on some backends so default to nothing
     virtual void clipStroke(RenderPath*, const StrokeParams&) {}
 
+    // Selects the material for one nested draw. Renderers without surface
+    // material support intentionally ignore it.
+    virtual void setSurfaceMaterialOverride(SurfaceMaterial) {}
     virtual void drawImage(const RenderImage*,
                            ImageSampler,
                            BlendMode,

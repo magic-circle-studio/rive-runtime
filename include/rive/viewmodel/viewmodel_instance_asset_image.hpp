@@ -16,12 +16,15 @@ protected:
 public:
     ViewModelInstanceAssetImage();
     void value(RenderImage* image);
+    void setSurfaceMaterial(SurfaceMaterial material);
+    SurfaceMaterial surfaceMaterial() const { return m_surfaceMaterial; }
     rcp<ImageAsset> asset() { return m_imageAsset; }
     Core* clone() const override;
     void applyValue(DataValueInteger*);
 
 private:
     rcp<ImageAsset> m_imageAsset = nullptr;
+    SurfaceMaterial m_surfaceMaterial = SurfaceMaterial::inherit;
 };
 } // namespace rive
 

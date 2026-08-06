@@ -36,16 +36,17 @@ void DataBindContextValueAssetImage::apply(Core* target,
 {
     if (target->is<Image>())
     {
+        auto source = dataBind->source()->as<ViewModelInstanceAssetImage>();
+        auto image = target->as<Image>();
+        image->surfaceMaterial(source->surfaceMaterial());
         auto asset = fileAsset(dataBind);
         if (asset != nullptr)
         {
-            target->as<Image>()->setAsset(asset);
+            image->setAsset(asset);
         }
         else
         {
-            auto source = dataBind->source();
-            target->as<Image>()->setAsset(
-                source->as<ViewModelInstanceAssetImage>()->asset());
+            image->setAsset(source->asset());
         }
     }
     else if (target->is<PaintImage>())
@@ -78,11 +79,12 @@ void DataBindContextValueAssetImage::apply(Core* target,
     else if (target->is<ViewModelInstanceAssetImage>())
     {
         auto source = dataBind->source()->as<ViewModelInstanceAssetImage>();
+        auto image = target->as<ViewModelInstanceAssetImage>();
+        image->setSurfaceMaterial(source->surfaceMaterial());
         auto sourceValue = source->propertyValue();
         if (sourceValue == static_cast<uint32_t>(-1))
         {
-            target->as<ViewModelInstanceAssetImage>()->value(
-                source->asset()->renderImage());
+            image->value(source->asset()->renderImage());
         }
         else
         {

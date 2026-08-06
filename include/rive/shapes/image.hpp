@@ -5,6 +5,7 @@
 #include "rive/generated/shapes/image_base.hpp"
 #include "rive/assets/file_asset_referencer.hpp"
 #include "rive/shapes/paint/image_sampler.hpp"
+#include "rive/surface_material.hpp"
 
 namespace rive
 {
@@ -49,6 +50,7 @@ private:
     // file version at import; defaults to the modern behavior for
     // runtime-created images.
     bool m_layoutScaleSeparate = true;
+    SurfaceMaterial m_surfaceMaterial = SurfaceMaterial::inherit;
     void updateImageScale();
 
 public:
@@ -72,6 +74,11 @@ public:
 #endif
     ImageAsset* imageAsset() const;
     ImageSampler imageSampler() const;
+    SurfaceMaterial surfaceMaterial() const { return m_surfaceMaterial; }
+    void surfaceMaterial(SurfaceMaterial material)
+    {
+        m_surfaceMaterial = material;
+    }
     void draw(Renderer* renderer) override;
     bool willDraw() override;
     Core* hitTest(HitInfo*, const Mat2D&) override;

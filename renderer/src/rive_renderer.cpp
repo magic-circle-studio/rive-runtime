@@ -322,6 +322,10 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
                                         RiveRenderPath* path)
 {
     const auto& state = m_renderStateStack.back();
+    if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
+    {
+        return;
+    }
     if (state.surfaceMaterialBounds.isEmptyOrNaN())
     {
         return;
@@ -331,32 +335,38 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
     const float width = bounds.width();
     const float height = bounds.height();
     const Mat2D& localToScreen = state.matrix;
-    if (!path->hasSurfaceMaterialBinding())
+    const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
+        1.f / width,
+        1.f / height,
+        -bounds.left() / width,
+        -bounds.top() / height);
+    Mat2D screenToMaterial;
+    if (draw.paintType() == gpu::PaintType::image)
     {
-        // Capture one stable local-to-material mapping. Later poses invert
-        // their current transform so the material follows the path instead of
-        // remaining attached to screen pixels.
-        const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
-            1.f / width,
-            1.f / height,
-            -bounds.left() / width,
-            -bounds.top() / height);
-        path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
+        // drawImage() reuses one unit-rectangle path for every image. Keep
+        // image material coordinates in artboard space rather than caching
+        // the first image's transform on that shared path.
+        screenToMaterial = screenToUV;
+    }
+    else
+    {
+        if (!path->hasSurfaceMaterialBinding())
+        {
+            // Capture one stable local-to-material mapping. Later poses invert
+            // their current transform so the material follows the path instead
+            // of remaining attached to screen pixels.
+            path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
+        }
+
+        Mat2D screenToLocal;
+        if (!localToScreen.invert(&screenToLocal))
+        {
+            return;
+        }
+        screenToMaterial =
+            path->surfaceMaterialLocalToUV() * screenToLocal;
     }
 
-    if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
-    {
-        return;
-    }
-
-    Mat2D screenToLocal;
-    if (!localToScreen.invert(&screenToLocal))
-    {
-        return;
-    }
-
-    Mat2D screenToMaterial =
-        path->surfaceMaterialLocalToUV() * screenToLocal;
     if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
     {
         screenToMaterial = rainbowUVProjection(width / height) *
