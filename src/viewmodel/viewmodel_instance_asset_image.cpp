@@ -61,6 +61,17 @@ void ViewModelInstanceAssetImage::value(RenderImage* image)
     onValueChanged();
 }
 
+void ViewModelInstanceAssetImage::setSurfaceMaterial(SurfaceMaterial material)
+{
+    if (m_surfaceMaterial == material)
+    {
+        return;
+    }
+    m_surfaceMaterial = material;
+    addDirt(ComponentDirt::Bindings);
+    onValueChanged();
+}
+
 void ViewModelInstanceAssetImage::applyValue(DataValueInteger* dataValue)
 {
     if (dataValue && dataValue->is<DataValueAssetImage>())
@@ -79,6 +90,7 @@ Core* ViewModelInstanceAssetImage::clone() const
 {
     auto cloned = new ViewModelInstanceAssetImage();
     cloned->copy(*this);
+    cloned->m_surfaceMaterial = m_surfaceMaterial;
     for (const auto& asset : assets())
     {
         cloned->addAsset(asset);

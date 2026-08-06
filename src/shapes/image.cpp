@@ -26,10 +26,16 @@ void Image::draw(Renderer* renderer)
     {
         return;
     }
-    if (needsSaveOperation())
+    const SurfaceMaterial surfaceMaterial = this->surfaceMaterial();
+    const bool hasSurfaceMaterial =
+        surfaceMaterial != SurfaceMaterial::inherit;
+    if (needsSaveOperation() || hasSurfaceMaterial)
     {
-
         renderer->save();
+    }
+    if (hasSurfaceMaterial)
+    {
+        renderer->setSurfaceMaterialOverride(surfaceMaterial);
     }
 
     float width = (float)renderImage->width();
@@ -54,7 +60,7 @@ void Image::draw(Renderer* renderer)
                             renderOpacity(),
                             additiveness());
     }
-    if (needsSaveOperation())
+    if (needsSaveOperation() || hasSurfaceMaterial)
     {
         renderer->restore();
     }
@@ -161,6 +167,7 @@ Core* Image::clone() const
 {
     Image* twin = ImageBase::clone()->as<Image>();
     twin->m_layoutScaleSeparate = m_layoutScaleSeparate;
+    twin->m_surfaceMaterial = m_surfaceMaterial;
     if (m_fileAsset != nullptr)
     {
         twin->setAsset(m_fileAsset);

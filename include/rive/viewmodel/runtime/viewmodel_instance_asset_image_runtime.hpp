@@ -18,6 +18,7 @@ public:
         ViewModelInstanceValueRuntime(viewModelInstance)
     {}
     void value(RenderImage* renderImage);
+    void setSurfaceMaterial(uint32_t material);
     const DataType dataType() override { return DataType::assetImage; }
 
 #ifdef TESTING

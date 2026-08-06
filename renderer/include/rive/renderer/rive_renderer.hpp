@@ -34,6 +34,13 @@ public:
     void transform(const Mat2D& matrix) override;
     void drawPath(RenderPath*, RenderPaint*) override;
     void clipPath(RenderPath*) override;
+    void setSurfaceMaterialOverride(SurfaceMaterial material) override
+    {
+        if (material != SurfaceMaterial::inherit)
+        {
+            m_renderStateStack.back().surfaceMaterial = material;
+        }
+    }
     void drawImage(const RenderImage*,
                    ImageSampler,
                    BlendMode,
@@ -94,7 +101,9 @@ public:
                             const AABB& bounds,
                             float timeSeconds)
     {
-        m_renderStateStack.back().surfaceMaterial = material;
+        m_renderStateStack.back().surfaceMaterial =
+            material == SurfaceMaterial::inherit ? SurfaceMaterial::none
+                                                 : material;
         m_renderStateStack.back().surfaceMaterialBounds = bounds;
         m_renderStateStack.back().surfaceMaterialTimeSeconds = timeSeconds;
     }

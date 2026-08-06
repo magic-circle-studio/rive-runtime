@@ -15,6 +15,7 @@
 #include "rive/shapes/paint/color.hpp"
 #include "rive/renderer/trivial_block_allocator.hpp"
 #include "rive/shapes/paint/image_sampler.hpp"
+#include "rive/surface_material.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -437,18 +438,9 @@ enum class PaintType : uint32_t
     radialGradient,
 };
 
-// Optional inline material applied to vector path paint colors before they are
-// composited. This is deliberately independent from BlendMode so enabling a
-// material never requires destination reads or advanced-blend render passes.
-enum class SurfaceMaterial : uint32_t
-{
-    none,
-    gold,
-    rainbow,
-};
-static_assert(static_cast<uint32_t>(SurfaceMaterial::none) == 0);
-static_assert(static_cast<uint32_t>(SurfaceMaterial::gold) == 1);
-static_assert(static_cast<uint32_t>(SurfaceMaterial::rainbow) == 2);
+// Keep existing renderer call sites source-compatible while the material type
+// lives in core runtime code, where image bindings can also reference it.
+using SurfaceMaterial = rive::SurfaceMaterial;
 
 struct SurfaceMaterialData
 {

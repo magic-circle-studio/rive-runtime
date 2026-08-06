@@ -10,6 +10,12 @@ void ViewModelInstanceAssetImageRuntime::value(RenderImage* renderImage)
         renderImage);
 }
 
+void ViewModelInstanceAssetImageRuntime::setSurfaceMaterial(uint32_t value)
+{
+    m_viewModelInstanceValue->as<ViewModelInstanceAssetImage>()
+        ->setSurfaceMaterial(surfaceMaterialFromValue(value));
+}
+
 #ifdef TESTING
 RenderImage* ViewModelInstanceAssetImageRuntime::testing_value()
 {

@@ -27,6 +27,49 @@
 
 using namespace rive;
 
+class MaterialCaptureRenderer : public NoOpRenderer
+{
+public:
+    void setSurfaceMaterialOverride(SurfaceMaterial value) override
+    {
+        material = value;
+    }
+
+    SurfaceMaterial material = SurfaceMaterial::inherit;
+};
+
+TEST_CASE("image binding materials are independent of shared image data",
+          "[data binding]")
+{
+    auto sharedImage = make_rcp<RenderImage>();
+    auto normalPetBinding = make_rcp<ViewModelInstanceAssetImage>();
+    auto rainbowPetBinding = make_rcp<ViewModelInstanceAssetImage>();
+
+    normalPetBinding->value(sharedImage.get());
+    rainbowPetBinding->value(sharedImage.get());
+
+    REQUIRE(normalPetBinding->asset() != rainbowPetBinding->asset());
+    REQUIRE(normalPetBinding->asset()->renderImage() == sharedImage.get());
+    REQUIRE(rainbowPetBinding->asset()->renderImage() == sharedImage.get());
+    CHECK(normalPetBinding->surfaceMaterial() == SurfaceMaterial::inherit);
+    CHECK(rainbowPetBinding->surfaceMaterial() == SurfaceMaterial::inherit);
+
+    normalPetBinding->setSurfaceMaterial(SurfaceMaterial::none);
+    rainbowPetBinding->setSurfaceMaterial(SurfaceMaterial::rainbow);
+
+    CHECK(normalPetBinding->surfaceMaterial() == SurfaceMaterial::none);
+    CHECK(rainbowPetBinding->surfaceMaterial() == SurfaceMaterial::rainbow);
+    CHECK(normalPetBinding->asset()->renderImage() ==
+          rainbowPetBinding->asset()->renderImage());
+
+    Image normalPetImage;
+    normalPetImage.setAsset(normalPetBinding->asset());
+    normalPetImage.surfaceMaterial(normalPetBinding->surfaceMaterial());
+    MaterialCaptureRenderer renderer;
+    normalPetImage.draw(&renderer);
+    CHECK(renderer.material == SurfaceMaterial::none);
+}
+
 TEST_CASE("Test data binding images from file assets", "[data binding]")
 {
     auto file = ReadRiveFile("assets/data_binding_images_test.riv");
@@ -75,6 +118,11 @@ TEST_CASE("Test data binding images from file assets", "[data binding]")
     auto sub1Image = nestedArtboardArtboardSub1->find<rive::Image>("sub_1_img")
                          ->as<rive::Image>();
     REQUIRE(sub1Image != nullptr);
+    mainImgProperty->setSurfaceMaterial(SurfaceMaterial::none);
+    sub1ImgProperty->setSurfaceMaterial(SurfaceMaterial::rainbow);
+    artboard->advance(0.0f);
+    CHECK(rootImage->surfaceMaterial() == SurfaceMaterial::none);
+    CHECK(sub1Image->surfaceMaterial() == SurfaceMaterial::rainbow);
     // Validations
     // Ensure view model image asset is the same as the image's image asset
     auto mainAsset = assets[mainImgProperty->propertyValue()].get();
