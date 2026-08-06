@@ -16,6 +16,7 @@
 #include "rive/shapes/paint/image_sampler.hpp"
 #include "rive/shapes/paint/stroke_cap.hpp"
 #include "rive/shapes/paint/stroke_join.hpp"
+#include "rive/surface_material.hpp"
 #include "utils/lite_rtti.hpp"
 #include "rive/math/raw_path.hpp"
 #include <stdio.h>
@@ -206,6 +207,9 @@ public:
     virtual void transform(const Mat2D& transform) = 0;
     virtual void drawPath(RenderPath* path, RenderPaint* paint) = 0;
     virtual void clipPath(RenderPath* path) = 0;
+    // Selects the material for one nested draw. Renderers without surface
+    // material support intentionally ignore it.
+    virtual void setSurfaceMaterialOverride(SurfaceMaterial) {}
     virtual void drawImage(const RenderImage*,
                            ImageSampler,
                            BlendMode,
