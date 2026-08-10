@@ -20,19 +20,16 @@ namespace
 constexpr float kRainbowAxisX = -0.64278761f;
 constexpr float kRainbowAxisY = 0.76604444f;
 constexpr float kRainbowSquish = 2.5f;
-constexpr float kRainbowSheenAxisX = 0.78f;
-constexpr float kRainbowSheenAxisY = 0.62f;
 
 Mat2D rainbowUVProjection(float aspect)
 {
     return Mat2D(-kRainbowAxisX * kRainbowSquish,
-                 kRainbowSheenAxisX,
+                 0.0f,
                  kRainbowAxisY * kRainbowSquish * aspect,
-                 kRainbowSheenAxisY * aspect,
+                 0.0f,
                  0.5f + (kRainbowAxisX - kRainbowAxisY) *
                             kRainbowSquish * 0.5f,
-                 0.5f -
-                     (kRainbowSheenAxisX + kRainbowSheenAxisY) * 0.5f);
+                 0.0f);
 }
 } // namespace
 
