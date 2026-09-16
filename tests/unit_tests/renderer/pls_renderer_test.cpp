@@ -1336,7 +1336,7 @@ TEST_CASE("image draws use scoped materials without caching shared paths",
 
     auto inheritedImagePath = makeRectPath();
     RiveRenderPaint imagePaint;
-    imagePaint.image(nullptr, 1);
+    imagePaint.image(make_rcp<Texture>(100, 100), 1);
     renderer.drawPath(inheritedImagePath.get(), &imagePaint);
     CHECK_FALSE(inheritedImagePath->hasSurfaceMaterialBinding());
 
