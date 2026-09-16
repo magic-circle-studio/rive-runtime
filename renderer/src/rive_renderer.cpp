@@ -338,7 +338,7 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
         -bounds.left() / width,
         -bounds.top() / height);
     Mat2D screenToMaterial;
-    if (draw.paintType() == gpu::PaintType::image)
+    if (draw.imageTexture() != nullptr)
     {
         // drawImage() reuses one unit-rectangle path for every image. Keep
         // image material coordinates in artboard space rather than caching
