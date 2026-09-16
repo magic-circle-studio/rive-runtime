@@ -4,7 +4,11 @@
 
 #pragma once
 
+#include "rive/renderer.hpp"
 #include "rive/renderer/texture.hpp"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 namespace rive
 {

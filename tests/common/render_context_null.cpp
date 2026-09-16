@@ -6,6 +6,9 @@
 
 #include "rive/renderer/rive_render_image.hpp"
 #include "utils/factory_utils.hpp"
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_canvas.hpp"
+#endif
 
 using namespace rive;
 using namespace rive::gpu;
@@ -63,7 +66,12 @@ rive::rcp<rive::RenderBuffer> RenderContextNULL::makeRenderBuffer(
 rcp<Texture> RenderContextNULL::makeImageTexture(uint32_t width,
                                                  uint32_t height,
                                                  uint32_t mipLevelCount,
-                                                 const uint8_t imageDataRGBA[])
+                                                 GPUTextureFormat format,
+                                                 const uint8_t imageData[],
+                                                 uint8_t blockWidth,
+                                                 uint8_t blockHeight,
+                                                 bool srgb,
+                                                 bool generateRemainingMips)
 {
     return make_rcp<Texture>(width, height);
 }
@@ -86,3 +94,15 @@ std::unique_ptr<rive::gpu::BufferRing> RenderContextNULL::makeVertexBufferRing(
 {
     return std::make_unique<BufferRingNULL>(capacityInBytes);
 }
+
+#ifdef RIVE_CANVAS
+void RenderContextNULL::ensureCanvasBacking(rive::gpu::RenderCanvas* canvas)
+{
+    if (canvas->isBacked())
+    {
+        return;
+    }
+    canvas->setBacking(make_rcp<Texture>(canvas->width(), canvas->height()),
+                       makeRenderTarget(canvas->width(), canvas->height()));
+}
+#endif

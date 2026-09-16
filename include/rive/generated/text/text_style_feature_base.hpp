@@ -43,8 +43,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(tagPropertyKey, &m_Tag, &value);
         m_Tag = value;
-        tagChanged();
+        RIVE_EDITOR_CHANGED(tagChanged());
+        notifyPropertyChanged(tagPropertyKey);
     }
 
     inline uint32_t featureValue() const { return m_FeatureValue; }
@@ -54,8 +56,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(featureValuePropertyKey, &m_FeatureValue, &value);
         m_FeatureValue = value;
-        featureValueChanged();
+        RIVE_EDITOR_CHANGED(featureValueChanged());
+        notifyPropertyChanged(featureValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -83,6 +87,9 @@ public:
 protected:
     virtual void tagChanged() {}
     virtual void featureValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/text/text_style_feature_ext.inl"
+#endif
 };
 } // namespace rive
 

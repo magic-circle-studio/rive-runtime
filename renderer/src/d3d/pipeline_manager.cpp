@@ -8,6 +8,7 @@
 
 #include <d3dcompiler.h>
 
+#include "generated/shaders/flush_uniforms.glsl.hpp"
 #include "generated/shaders/advanced_blend.glsl.hpp"
 #include "generated/shaders/atomic_draw.glsl.hpp"
 #include "generated/shaders/constants.glsl.hpp"
@@ -17,6 +18,7 @@
 #include "generated/shaders/draw_path_common.glsl.hpp"
 #include "generated/shaders/draw_path.vert.hpp"
 #include "generated/shaders/draw_raster_order_path.frag.hpp"
+#include "generated/shaders/gradient_packing_common.glsl.hpp"
 #include "generated/shaders/hlsl.glsl.hpp"
 
 namespace rive::gpu::d3d_utils
@@ -31,10 +33,10 @@ static std::string build_shader(DrawType drawType,
 
     std::ostringstream s;
     s << "#define " << shaderTypeDefine << '\n';
-    for (size_t i = 0; i < kShaderFeatureCount; ++i)
+    for (size_t i = 0; i < ShaderFeatureCount; ++i)
     {
-        ShaderFeatures feature = static_cast<ShaderFeatures>(1 << i);
-        if (shaderFeatures & feature)
+        const auto feature = ShaderFeatures(1 << i);
+        if (enums::is_flag_set(shaderFeatures, feature))
         {
             s << "#define " << GetShaderFeatureGLSLName(feature) << " 1\n";
         }
@@ -54,11 +56,13 @@ static std::string build_shader(DrawType drawType,
     {
         s << "#define " << GLSL_ENABLE_MIN_16_PRECISION << '\n';
     }
-    if (shaderMiscFlags & ShaderMiscFlags::fixedFunctionColorOutput)
+    if (enums::is_flag_set(shaderMiscFlags,
+                           ShaderMiscFlags::fixedFunctionColorOutput))
     {
         s << "#define " << GLSL_FIXED_FUNCTION_COLOR_OUTPUT << '\n';
     }
-    if (shaderMiscFlags & ShaderMiscFlags::coalescedResolveAndTransfer)
+    if (enums::is_flag_set(shaderMiscFlags,
+                           ShaderMiscFlags::coalescedResolveAndTransfer))
     {
         s << "#define " << GLSL_COALESCED_PLS_RESOLVE_AND_TRANSFER << '\n';
         if (!d3dCapabilities.allowsUAVSlot0WithColorOutput)
@@ -67,7 +71,7 @@ static std::string build_shader(DrawType drawType,
               << COALESCED_OFFSCREEN_COLOR_PLANE_IDX << '\n';
         }
     }
-    if (shaderMiscFlags & ShaderMiscFlags::clockwiseFill)
+    if (enums::is_flag_set(shaderMiscFlags, ShaderMiscFlags::clockwiseFill))
     {
         s << "#define " << GLSL_CLOCKWISE_FILL << " 1\n";
     }
@@ -81,8 +85,8 @@ static std::string build_shader(DrawType drawType,
         case DrawType::interiorTriangulation:
             s << "#define " << GLSL_DRAW_INTERIOR_TRIANGLES << '\n';
             break;
-        case DrawType::atlasBlit:
-            s << "#define " << GLSL_ATLAS_BLIT << " 1\n";
+        case DrawType::featherAtlasBlit:
+            s << "#define " << GLSL_FEATHER_ATLAS_BLIT << " 1\n";
             break;
         case DrawType::imageRect:
             assert(interlockMode == InterlockMode::atomics);
@@ -98,21 +102,29 @@ static std::string build_shader(DrawType drawType,
             s << "#define " << GLSL_DRAW_RENDER_TARGET_UPDATE_BOUNDS << '\n';
             s << "#define " << GLSL_RESOLVE_PLS << '\n';
             break;
-        case DrawType::msaaStrokes:
-        case DrawType::msaaMidpointFanBorrowedCoverage:
-        case DrawType::msaaMidpointFans:
-        case DrawType::msaaMidpointFanStencilReset:
-        case DrawType::msaaMidpointFanPathsStencil:
-        case DrawType::msaaMidpointFanPathsCover:
-        case DrawType::msaaOuterCubics:
-        case DrawType::msaaStencilClipReset:
+        case DrawType::depthStrokes:
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+        case DrawType::stencilOuterCubics:
+        case DrawType::clipReset:
         case DrawType::renderPassInitialize:
             RIVE_UNREACHABLE();
     }
     s << glsl::constants << '\n';
     s << glsl::hlsl << '\n';
+    s << glsl::flush_uniforms << '\n';
     s << glsl::common << '\n';
-    if (shaderFeatures & ShaderFeatures::ENABLE_ADVANCED_BLEND)
+    if (enums::is_flag_set(shaderFeatures,
+                           ShaderFeatures::ENABLE_ADVANCED_BLEND))
     {
         s << glsl::advanced_blend << '\n';
     }
@@ -125,11 +137,13 @@ static std::string build_shader(DrawType drawType,
             case DrawType::outerCurvePatches:
             case DrawType::interiorTriangulation:
                 s << glsl::draw_path_common << '\n';
+                s << glsl::gradient_packing_common << '\n';
                 s << glsl::draw_path_vert << '\n';
                 s << glsl::draw_raster_order_path_frag << '\n';
                 break;
-            case DrawType::atlasBlit:
+            case DrawType::featherAtlasBlit:
                 s << glsl::draw_path_common << '\n';
+                s << glsl::gradient_packing_common << '\n';
                 s << glsl::draw_path_vert << '\n';
                 s << glsl::draw_mesh_frag << '\n';
                 break;
@@ -139,14 +153,20 @@ static std::string build_shader(DrawType drawType,
                 break;
             case DrawType::imageRect:
             case DrawType::renderPassResolve:
-            case DrawType::msaaStrokes:
-            case DrawType::msaaMidpointFanBorrowedCoverage:
-            case DrawType::msaaMidpointFans:
-            case DrawType::msaaMidpointFanStencilReset:
-            case DrawType::msaaMidpointFanPathsStencil:
-            case DrawType::msaaMidpointFanPathsCover:
-            case DrawType::msaaOuterCubics:
-            case DrawType::msaaStencilClipReset:
+            case DrawType::depthStrokes:
+            case DrawType::stencilMidpointFanBorrowedCoverage:
+            case DrawType::stencilDynamicMidpointFans:
+            case DrawType::stencilDynamicOuterCubics:
+            case DrawType::stencilMidpointFans:
+            case DrawType::stencilMidpointFanReset:
+            case DrawType::stencilMidpointFanWinding:
+            case DrawType::stencilMidpointFanCover:
+            case DrawType::stencilOuterCubicBorrowedCoverage:
+            case DrawType::stencilOuterCubicReset:
+            case DrawType::stencilOuterCubicWinding:
+            case DrawType::stencilOuterCubicCover:
+            case DrawType::stencilOuterCubics:
+            case DrawType::clipReset:
             case DrawType::renderPassInitialize:
                 RIVE_UNREACHABLE();
         }
@@ -155,6 +175,7 @@ static std::string build_shader(DrawType drawType,
     {
         assert(interlockMode == InterlockMode::atomics);
         s << glsl::draw_path_common << '\n';
+        s << glsl::gradient_packing_common << '\n';
         s << glsl::atomic_draw << '\n';
     }
 

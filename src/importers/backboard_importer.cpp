@@ -171,9 +171,27 @@ void BackboardImporter::addInterpolator(KeyFrameInterpolator* interpolator)
     m_interpolators.push_back(interpolator);
 }
 
+void BackboardImporter::seedInterpolator(KeyFrameInterpolator* interpolator)
+{
+    m_interpolators.push_back(interpolator);
+}
+
 void BackboardImporter::addPhysics(ScrollPhysics* physics)
 {
     m_physics.push_back(physics);
+}
+
+void BackboardImporter::addViewModelInstance(ViewModelInstance* instance)
+{
+    if (m_file == nullptr)
+    {
+        return;
+    }
+    auto viewModel = m_file->viewModel((size_t)instance->viewModelId());
+    if (viewModel != nullptr)
+    {
+        viewModel->addInstance(instance);
+    }
 }
 
 void BackboardImporter::file(File* value) { m_file = value; }

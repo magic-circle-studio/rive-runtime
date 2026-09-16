@@ -67,7 +67,7 @@
 // be declared before any code.
 #ifdef @ATLAS_RENDER_TARGET_R32UI_FRAMEBUFFER_FETCH
 #extension GL_EXT_shader_framebuffer_fetch : require
-#elif defined(@ATLAS_RENDER_TARGET_R32UI_PLS_EXT)
+#elif defined(@ATLAS_RENDER_TARGET_R8_PLS_EXT)
 #extension GL_EXT_shader_pixel_local_storage : require
 #elif defined(@ATLAS_RENDER_TARGET_R32UI_PLS_ANGLE)
 #extension GL_ANGLE_shader_pixel_local_storage : require
@@ -81,13 +81,13 @@
 #endif
 
 // clang-format off
-#if defined(@RENDER_MODE_MSAA) && defined(@ENABLE_CLIP_RECT) && defined(GL_ES) && !defined(@DISABLE_CLIP_DISTANCE_FOR_UBERSHADERS)
+#if defined(@RENDER_MODE_DEPTH_STENCIL) && defined(@ENABLE_CLIP_RECT) && defined(GL_ES) && !defined(@DISABLE_CLIP_DISTANCE_FOR_UBERSHADERS)
 #ifdef GL_EXT_clip_cull_distance
 #extension GL_EXT_clip_cull_distance : require
 #elif defined(GL_ANGLE_clip_cull_distance)
 #extension GL_ANGLE_clip_cull_distance : require
 #endif
-#endif // RENDER_MODE_MSAA && ENABLE_CLIP_RECT && GL_ES && !DISABLE_CLIP_DISTANCE_FOR_UBERSHADERS
+#endif // RENDER_MODE_DEPTH_STENCIL && ENABLE_CLIP_RECT && GL_ES && !DISABLE_CLIP_DISTANCE_FOR_UBERSHADERS
 // clang-format on
 
 #if @GLSL_VERSION >= 310
@@ -102,6 +102,16 @@
 // clang-format barrier... Otherwise it tries to merge this #define into the
 // above macro...
 #define UNIFORM_BLOCK_END(NAME)                                                \
+    }                                                                          \
+    NAME;
+
+#define PUSH_CONSTANT_BLOCK_BEGIN(NAME)                                        \
+    layout(push_constant) uniform NAME                                         \
+    {
+
+#define PUSH_CONSTANT(TYPE, NAME) TYPE NAME;
+
+#define PUSH_CONSTANT_BLOCK_END(NAME)                                          \
     }                                                                          \
     NAME;
 
@@ -129,7 +139,7 @@
 #define VARYING_BLOCK_END
 
 // clang-format off
-#ifdef @TARGET_VULKAN
+#ifdef @TARGET_SPIRV
    // Since Vulkan is compiled offline and not all platforms support noperspective, don't use it.
 #  define NO_PERSPECTIVE
 #else
@@ -155,7 +165,7 @@
 #define DYNAMIC_SAMPLER_BLOCK_BEGIN
 #define DYNAMIC_SAMPLER_BLOCK_END
 
-#ifdef @TARGET_VULKAN
+#ifdef @TARGET_SPIRV
 #define TEXTURE_RGBA32UI(SET, IDX, NAME)                                       \
     layout(set = SET, binding = IDX) uniform highp utexture2D NAME
 #define TEXTURE_RGBA32F(SET, IDX, NAME)                                        \
@@ -168,8 +178,8 @@
     layout(binding = IDX) uniform highp itexture2D NAME
 #define TEXTURE_R32UI(SET, IDX, NAME)                                          \
     layout(binding = IDX) uniform highp utexture2D NAME
-#if defined(@FRAGMENT) && defined(@RENDER_MODE_MSAA)
-#endif // @FRAGMENT && @RENDER_MODE_MSAA
+#if defined(@FRAGMENT) && defined(@RENDER_MODE_DEPTH_STENCIL)
+#endif // @FRAGMENT && @RENDER_MODE_DEPTH_STENCIL
 #elif @GLSL_VERSION >= 310
 #define TEXTURE_RGBA32UI(SET, IDX, NAME)                                       \
     layout(binding = IDX) uniform highp usampler2D NAME
@@ -192,15 +202,24 @@
 #define TEXTURE_R32UI(SET, IDX, NAME) uniform highp usampler2D NAME
 #endif
 
-#ifdef @TARGET_VULKAN
-#define SAMPLER_LINEAR(TEXTURE_IDX, NAME)                                      \
-    layout(set = IMMUTABLE_SAMPLER_BINDINGS_SET, binding = TEXTURE_IDX)        \
-        uniform mediump sampler NAME;
-#define SAMPLER_MIPMAP(TEXTURE_IDX, NAME)                                      \
-    layout(set = IMMUTABLE_SAMPLER_BINDINGS_SET, binding = TEXTURE_IDX)        \
-        uniform mediump sampler NAME;
+#ifdef @TARGET_SPIRV
+
 #define SAMPLER_DYNAMIC(SET, IDX, NAME)                                        \
     layout(set = SET, binding = IDX) uniform mediump sampler NAME;
+
+#ifdef @USE_WEBGPU_SAMPLERS
+#define SAMPLER_LINEAR(TEXTURE_IDX, NAME)                                      \
+    layout(set = WEBGPU_SAMPLER_BINDINGS_SET, binding = TEXTURE_IDX)           \
+        uniform mediump sampler NAME;
+#define SAMPLER_DYNAMIC_IMAGE(NAME)                                            \
+    SAMPLER_DYNAMIC(PER_DRAW_BINDINGS_SET, WEBGPU_IMAGE_SAMPLER_IDX, NAME)
+#else
+#define SAMPLER_LINEAR(TEXTURE_IDX, NAME)                                      \
+    layout(set = PER_FLUSH_BINDINGS_SET, binding = TEXTURE_IDX)                \
+        uniform mediump sampler NAME;
+#define SAMPLER_DYNAMIC_IMAGE(NAME)                                            \
+    SAMPLER_DYNAMIC(PER_DRAW_BINDINGS_SET, IMAGE_TEXTURE_IDX, NAME)
+#endif
 #define TEXTURE_SAMPLE(NAME, SAMPLER_NAME, COORD)                              \
     texture(sampler2D(NAME, SAMPLER_NAME), COORD)
 #define TEXTURE_SAMPLE_LOD(NAME, SAMPLER_NAME, COORD, LOD)                     \
@@ -209,15 +228,19 @@
     texture(sampler2D(NAME, SAMPLER_NAME), COORD, LODBIAS)
 #define TEXTURE_SAMPLE_GRAD(NAME, SAMPLER_NAME, COORD, DDX, DDY)               \
     textureGrad(sampler2D(NAME, SAMPLER_NAME), COORD, DDX, DDY)
-#if defined(@FRAGMENT) && defined(@RENDER_MODE_MSAA)
+// Only the multisampled dst read uses gl_SampleMaskIn.
+#if defined(@FRAGMENT) && defined(@RENDER_MODE_DEPTH_STENCIL) &&               \
+    defined(@MSAA_DST_COLOR)
 #extension GL_OES_sample_variables : require
-#endif // @FRAGMENT && @RENDER_MODE_MSAA
-#else  // @TARGET_VULKAN -> !@TARGET_VULKAN
-// SAMPLER_LINEAR and SAMPLER_MIPMAP are no-ops because in GL, sampling
-// parameters are API-level state tied to the texture.
+#endif // @FRAGMENT && @RENDER_MODE_DEPTH_STENCIL && @MSAA_DST_COLOR
+
+#else // @TARGET_SPIRV -> !@TARGET_SPIRV
+
+// SAMPLER_LINEAR is a no-op because in GL, sampling parameters are API-level
+// state tied to the texture.
 #define SAMPLER_LINEAR(TEXTURE_IDX, NAME)
-#define SAMPLER_MIPMAP(TEXTURE_IDX, NAME)
 #define SAMPLER_DYNAMIC(SET, IDX, NAME)
+#define SAMPLER_DYNAMIC_IMAGE(NAME)
 #define TEXTURE_SAMPLE(NAME, SAMPLER_NAME, COORD) texture(NAME, COORD)
 #define TEXTURE_SAMPLE_LOD(NAME, SAMPLER_NAME, COORD, LOD)                     \
     textureLod(NAME, COORD, LOD)
@@ -225,7 +248,7 @@
     texture(NAME, COORD, LODBIAS)
 #define TEXTURE_SAMPLE_GRAD(NAME, SAMPLER_NAME, COORD, DDX, DDY)               \
     textureGrad(NAME, COORD, DDX, DDY)
-#endif // !@TARGET_VULKAN
+#endif // !@TARGET_SPIRV
 
 #define TEXTURE_SAMPLE_DYNAMIC(TEXTURE, SAMPLER_NAME, COORD)                   \
     TEXTURE_SAMPLE(TEXTURE, SAMPLER_NAME, COORD)
@@ -234,10 +257,10 @@
 #define TEXTURE_SAMPLE_DYNAMIC_LODBIAS(TEXTURE, SAMPLER_NAME, COORD, LODBIAS)  \
     TEXTURE_SAMPLE_LODBIAS(TEXTURE, SAMPLER_NAME, COORD, LODBIAS)
 
-// Polyfill the feather texture as a sampler2D since ES doesn't support
-// sampler1DArray. This is why the macro needs "ARRAY_INDEX_NORMALIZED": when
-// polyfilled as a 2D texture, the "array index" needs to be a 0..1 normalized
-// y coordinate instead of the literal array index.
+// Polyfill the gaussian integral texture as a sampler2D since ES doesn't
+// support sampler1DArray. This is why the macro needs "ARRAY_INDEX_NORMALIZED":
+// when polyfilled as a 2D texture, the "array index" needs to be a 0..1
+// normalized y coordinate instead of the literal array index.
 #define TEXTURE_R16F_1D_ARRAY(SET, IDX, NAME) TEXTURE_R16F(SET, IDX, NAME)
 // clang-format off
 // Clang formatting on this line trips up the Qualcomm compiler.
@@ -252,7 +275,7 @@
 #define TEXTURE_CONTEXT_FORWARD
 #define TEXEL_FETCH(NAME, COORD) texelFetch(NAME, COORD, 0)
 
-#ifdef @TARGET_VULKAN
+#ifdef @TARGET_SPIRV
 #define TEXTURE_GATHER(NAME, SAMPLER_NAME, COORD, TEXTURE_INVERSE_SIZE)        \
     textureGather(sampler2D(NAME, SAMPLER_NAME),                               \
                   (COORD) * (TEXTURE_INVERSE_SIZE))
@@ -319,8 +342,114 @@
 #define STORAGE_BUFFER_LOAD(NAME, I) NAME._values[I]
 #define STORAGE_BUFFER_ATOMIC_MAX(NAME, I, X) atomicMax(NAME._values[I], X)
 #define STORAGE_BUFFER_ATOMIC_ADD(NAME, I, X) atomicAdd(NAME._values[I], X)
+#define STORAGE_BUFFER_ATOMIC_OR(NAME, I, X) atomicOr(NAME._values[I], X)
 
 #endif // DISABLE_SHADER_STORAGE_BUFFERS
+
+#ifdef @PLS_IMPL_STORAGE_BUFFER
+
+#define PLS_MAIN(NAME)                                                         \
+    void main()                                                                \
+    {                                                                          \
+        int2 _plsCoord = ivec2(floor(_fragCoord));                             \
+        int _plsIdx = int(swizzle_image_buffer_idx(                            \
+            uvec2(_plsCoord),                                                  \
+            (uniforms.renderTargetWidth + (BUFFER_IMAGE_TILE_SIZE - 1u)) &     \
+                ~(BUFFER_IMAGE_TILE_SIZE - 1u)));
+
+#define EMIT_PLS }
+
+#define PLS_CONTEXT_DECL , int _plsIdx
+#define PLS_CONTEXT_UNPACK , _plsIdx
+
+#ifdef @TARGET_WGSL
+// WGSL has no `coherent` qualifier - naga would propagate it as an invalid
+// `@coherent` attribute that Tint rejects. WGSL's storage memory model
+// already guarantees the visibility we need across the atomic ops below.
+#define PLS_DECLUI_UAV(IDX, NAME)                                              \
+    layout(std430, set = PLS_TEXTURE_BINDINGS_SET, binding = IDX)              \
+        buffer NAME##_struct                                                   \
+    {                                                                          \
+        uint _values[];                                                        \
+    }                                                                          \
+    NAME
+#elif defined(@TARGET_SPIRV)
+#define PLS_DECLUI_UAV(IDX, NAME)                                              \
+    layout(std430, set = PLS_TEXTURE_BINDINGS_SET, binding = IDX)              \
+        coherent buffer NAME##_struct                                          \
+    {                                                                          \
+        uint _values[];                                                        \
+    }                                                                          \
+    NAME
+#else
+#define PLS_DECLUI_UAV(IDX, NAME)                                              \
+    layout(std430, binding = IDX) coherent buffer NAME##_struct                \
+    {                                                                          \
+        uint _values[];                                                        \
+    }                                                                          \
+    NAME
+#endif
+#define PLS_DECL4F_UAV PLS_DECLUI_UAV
+
+#define PLS_LOADUI_UAV(PLANE) PLANE._values[_plsIdx]
+#define PLS_STOREUI_UAV(PLANE, VALUE) PLANE._values[_plsIdx] = VALUE
+#define PLS_LOAD4F_UAV(PLANE) unpackUnorm4x8(PLS_LOADUI_UAV(PLANE))
+#define PLS_STORE4F_UAV(PLANE, VALUE)                                          \
+    PLS_STOREUI_UAV(PLANE, packUnorm4x8(VALUE))
+#define PLS_ATOMIC_MAX(PLANE, X) atomicMax(PLANE._values[_plsIdx], X)
+#define PLS_ATOMIC_ADD(PLANE, X) atomicAdd(PLANE._values[_plsIdx], X)
+
+#elif defined(@PLS_IMPL_STORAGE_TEXTURE) || defined(@USING_PLS_STORAGE_TEXTURES)
+
+#ifdef GL_ARB_shader_image_load_store
+#extension GL_ARB_shader_image_load_store : require
+#endif
+
+#define PLS_MAIN(NAME)                                                         \
+    void main()                                                                \
+    {                                                                          \
+        int2 _plsCoord = ivec2(floor(_fragCoord));
+
+#define EMIT_PLS }
+
+#define PLS_CONTEXT_DECL , int2 _plsCoord
+#define PLS_CONTEXT_UNPACK , _plsCoord
+
+#ifdef @TARGET_SPIRV
+#define PLS_DECL4F_UAV(IDX, NAME)                                              \
+    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, rgba8)               \
+        uniform mediump coherent image2D NAME
+#define PLS_DECLUI_UAV(IDX, NAME)                                              \
+    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, r32ui)               \
+        uniform highp coherent uimage2D NAME
+#define PLS_DECL4F_RGB10_A2_UAV(IDX, NAME)                                     \
+    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, rgb10_a2)            \
+        uniform mediump coherent image2D NAME
+#else
+#define PLS_DECL4F_UAV(IDX, NAME)                                              \
+    layout(binding = IDX, rgba8) uniform mediump coherent image2D NAME
+#define PLS_DECLUI_UAV(IDX, NAME)                                              \
+    layout(binding = IDX, r32ui) uniform highp coherent uimage2D NAME
+#define PLS_DECL4F_RGB10_A2_UAV(IDX, NAME)                                     \
+    layout(binding = IDX, rgb10_a2) uniform mediump coherent image2D NAME;
+#endif
+
+#define PLS_LOADUI_UAV(PLANE) imageLoad(PLANE, _plsCoord).r
+#define PLS_STOREUI_UAV(PLANE, VALUE) imageStore(PLANE, _plsCoord, uvec4(VALUE))
+#define PLS_LOAD4F_UAV(PLANE) imageLoad(PLANE, _plsCoord)
+#define PLS_STORE4F_UAV(PLANE, VALUE) imageStore(PLANE, _plsCoord, VALUE)
+#define PLS_ATOMIC_MAX(PLANE, X) imageAtomicMax(PLANE, _plsCoord, X)
+#define PLS_ATOMIC_ADD(PLANE, X) imageAtomicAdd(PLANE, _plsCoord, X)
+
+#else
+
+#define PLS_MAIN(NAME) void main()
+#define EMIT_PLS
+
+#define PLS_CONTEXT_DECL
+#define PLS_CONTEXT_UNPACK
+
+#endif
 
 // Define macros for implementing pixel local storage based on available
 // extensions.
@@ -330,7 +459,7 @@
 
 #define PLS_BLOCK_BEGIN
 #define PLS_DECL4F(IDX, NAME)                                                  \
-    layout(binding = IDX, rgba8) uniform lowp pixelLocalANGLE NAME
+    layout(binding = IDX, rgba8) uniform mediump pixelLocalANGLE NAME
 #define PLS_DECLUI(IDX, NAME)                                                  \
     layout(binding = IDX, r32ui) uniform highp upixelLocalANGLE NAME
 #define PLS_BLOCK_END
@@ -361,7 +490,7 @@
 #define PLS_BLOCK_BEGIN                                                        \
     __pixel_localEXT PLS                                                       \
     {
-#define PLS_DECL4F(IDX, NAME) layout(rgba8) lowp vec4 NAME
+#define PLS_DECL4F(IDX, NAME) layout(rgba8) mediump vec4 NAME
 #define PLS_DECL4F_RGB10_A2(IDX, NAME) layout(rgb10_a2) mediump vec4 NAME
 #define PLS_DECLUI(IDX, NAME) layout(r32ui) highp uint NAME
 #define PLS_BLOCK_END                                                          \
@@ -385,18 +514,26 @@
 #define PLS_FRAG_COLOR_MAIN(NAME)                                              \
     layout(location = 0, rgba8) out half4 _fragColor;                          \
     PLS_MAIN(NAME)
-
-#define PLS_FRAG_COLOR_MAIN_WITH_IMAGE_UNIFORMS(NAME)                          \
-    layout(location = 0, rgba8) out half4 _fragColor;                          \
-    PLS_MAIN(NAME)
 #endif
 #endif
 
-#ifdef @PLS_IMPL_STORAGE_TEXTURE
+#if defined(@PLS_IMPL_STORAGE_TEXTURE) || defined(@PLS_IMPL_STORAGE_BUFFER)
 
-#ifdef GL_ARB_shader_image_load_store
-#extension GL_ARB_shader_image_load_store : require
-#endif
+#define PLS_BLOCK_BEGIN
+#define PLS_BLOCK_END
+
+#define PLS_DECL4F PLS_DECL4F_UAV
+#define PLS_DECLUI PLS_DECLUI_UAV
+#define PLS_DECL4F_RGB10_A2 PLS_DECL4F_RGB10_A2_UAV
+
+#define PLS_LOAD4F PLS_LOAD4F_UAV
+#define PLS_STORE4F PLS_STORE4F_UAV
+#define PLS_LOADUI PLS_LOADUI_UAV
+#define PLS_STOREUI PLS_STOREUI_UAV
+
+#define PLS_PRESERVE_4F(PLANE)
+#define PLS_PRESERVE_UI(PLANE)
+
 #if defined(GL_ARB_fragment_shader_interlock)
 #extension GL_ARB_fragment_shader_interlock : require
 #define PLS_INTERLOCK_BEGIN beginInvocationInterlockARB()
@@ -410,41 +547,7 @@
 #define PLS_INTERLOCK_END
 #endif
 
-#define PLS_BLOCK_BEGIN
-#ifdef @TARGET_VULKAN
-#define PLS_DECL4F(IDX, NAME)                                                  \
-    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, rgba8)               \
-        uniform lowp coherent image2D NAME
-#define PLS_DECL4F_RGB10_A2(IDX, NAME)                                         \
-    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, rgb10_a2)            \
-        uniform mediump coherent image2D NAME
-#define PLS_DECLUI(IDX, NAME)                                                  \
-    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, r32ui)               \
-        uniform highp coherent uimage2D NAME
-#else
-#define PLS_DECL4F(IDX, NAME)                                                  \
-    layout(binding = IDX, rgba8) uniform lowp coherent image2D NAME
-#define PLS_DECL4F_RGB10_A2(IDX, NAME)                                         \
-    layout(binding = IDX, rgb10_a2) uniform mediump coherent image2D NAME
-#define PLS_DECLUI(IDX, NAME)                                                  \
-    layout(binding = IDX, r32ui) uniform highp coherent uimage2D NAME
-#endif
-#define PLS_BLOCK_END
-
-#define PLS_LOAD4F(PLANE) imageLoad(PLANE, _plsCoord)
-#define PLS_LOADUI(PLANE) imageLoad(PLANE, _plsCoord).r
-#define PLS_STORE4F(PLANE, VALUE) imageStore(PLANE, _plsCoord, VALUE)
-#define PLS_STOREUI(PLANE, VALUE) imageStore(PLANE, _plsCoord, uvec4(VALUE))
-
-#define PLS_PRESERVE_4F(PLANE)
-#define PLS_PRESERVE_UI(PLANE)
-
-#ifndef @USING_PLS_STORAGE_TEXTURES
-#define @USING_PLS_STORAGE_TEXTURES
-
-#endif // PLS_IMPL_STORAGE_TEXTURE
-
-#endif // PLS_IMPL_STORAGE_TEXTURE
+#endif // PLS_IMPL_STORAGE_TEXTURE || PLS_IMPL_STORAGE_BUFFER
 
 #ifdef @PLS_IMPL_SUBPASS_LOAD
 
@@ -453,10 +556,12 @@
     layout(input_attachment_index = IDX,                                       \
            binding = IDX,                                                      \
            set = PLS_TEXTURE_BINDINGS_SET)                                     \
-        uniform lowp subpassInput _in_##NAME;
+        uniform mediump subpassInput _in_##NAME
+#define PLS_DECL4F_WRITEONLY(IDX, NAME)                                        \
+    layout(location = IDX) out mediump vec4 NAME
 #define PLS_DECL4F(IDX, NAME)                                                  \
     PLS_DECL4F_READONLY(IDX, NAME);                                            \
-    layout(location = IDX) out lowp vec4 NAME
+    PLS_DECL4F_WRITEONLY(IDX, NAME)
 #define PLS_DECLUI(IDX, NAME)                                                  \
     layout(input_attachment_index = IDX,                                       \
            binding = IDX,                                                      \
@@ -481,7 +586,7 @@
 #ifdef @PLS_IMPL_NONE
 
 #define PLS_BLOCK_BEGIN
-#define PLS_DECL4F(IDX, NAME) layout(location = IDX) out lowp vec4 NAME
+#define PLS_DECL4F(IDX, NAME) layout(location = IDX) out mediump vec4 NAME
 #define PLS_DECLUI(IDX, NAME) layout(location = IDX) out highp uvec4 NAME
 #define PLS_BLOCK_END
 
@@ -502,13 +607,13 @@
 #define PLS_DECL4F_READONLY PLS_DECL4F
 #endif
 
-#ifdef @TARGET_VULKAN
+#ifdef @TARGET_SPIRV
 #define gl_VertexID gl_VertexIndex
 #endif
 
 // clang-format off
 #ifdef @ENABLE_INSTANCE_INDEX
-#  ifdef @TARGET_VULKAN
+#  ifdef @TARGET_SPIRV
 #    define INSTANCE_INDEX gl_InstanceIndex
 #  else
 #    ifdef @BASE_INSTANCE_UNIFORM_NAME
@@ -537,10 +642,10 @@
         int _vertexID = gl_VertexID;                                           \
         int _instanceID = INSTANCE_INDEX;
 
-#define IMAGE_RECT_VERTEX_MAIN VERTEX_MAIN
-
 // clang-format off
-#define IMAGE_MESH_VERTEX_MAIN(NAME, PositionAttr, position, UVAttr, uv, _vertexID) \
+#define IMAGE_RECT_VERTEX_MAIN(NAME, Attrs, attrs, ImageDrawAttrs, imageDrawAttrs, _vertexID, _instanceID)                                    \
+    VERTEX_MAIN(NAME, Attrs, attrs, _vertexID, _instanceID)
+#define IMAGE_MESH_VERTEX_MAIN(NAME, PositionAttr, position, UVAttr, uv, ImageDrawAttrs,  imageDrawAttrs, _vertexID)                                      \
     VERTEX_MAIN(NAME, PositionAttr, position, _vertexID, _instanceID)
 // clang-format on
 
@@ -556,7 +661,8 @@
     layout(location = 0) out DATA_TYPE _fd;                                    \
     void main()
 
-#define FRAG_DATA_MAIN_WITH_CLOCKWISE FRAG_DATA_MAIN
+#define FRAG_DATA_MAIN_WITH_CLOCKWISE(DATA_TYPE, NAME)                         \
+    FRAG_DATA_MAIN(DATA_TYPE, NAME)
 
 #define _clockwise gl_FrontFacing
 
@@ -567,33 +673,8 @@
 #define FRAGMENT_CONTEXT_DECL
 #define FRAGMENT_CONTEXT_UNPACK
 
-#ifdef @USING_PLS_STORAGE_TEXTURES
-
-#ifdef @TARGET_VULKAN
-#define PLS_DECLUI_ATOMIC(IDX, NAME)                                           \
-    layout(set = PLS_TEXTURE_BINDINGS_SET, binding = IDX, r32ui)               \
-        uniform highp coherent uimage2D NAME
-#else
-#define PLS_DECLUI_ATOMIC(IDX, NAME)                                           \
-    layout(binding = IDX, r32ui) uniform highp coherent uimage2D NAME
-#endif
-#define PLS_LOADUI_ATOMIC(PLANE) imageLoad(PLANE, _plsCoord).r
-#define PLS_STOREUI_ATOMIC(PLANE, VALUE)                                       \
-    imageStore(PLANE, _plsCoord, uvec4(VALUE))
-#define PLS_ATOMIC_MAX(PLANE, X) imageAtomicMax(PLANE, _plsCoord, X)
-#define PLS_ATOMIC_ADD(PLANE, X) imageAtomicAdd(PLANE, _plsCoord, X)
-
-#define PLS_CONTEXT_DECL , int2 _plsCoord
-#define PLS_CONTEXT_UNPACK , _plsCoord
-
-#define PLS_MAIN(NAME)                                                         \
-    void main()                                                                \
-    {                                                                          \
-        int2 _plsCoord = ivec2(floor(_fragCoord));
-
-#define EMIT_PLS }
-
-// Storage textures are expensive to update. It's faster to conditionally update
+#if defined(@PLS_IMPL_STORAGE_TEXTURE) || defined(@PLS_IMPL_STORAGE_BUFFER)
+// Global storage is expensive to update. It's faster to conditionally update
 // them when possible.
 #define PLS_STORE4F_OPTIONAL_IF(CONDITION, PLANE, VALUE)                       \
     if (!(CONDITION))                                                          \
@@ -605,25 +686,14 @@
     {                                                                          \
         PLS_STOREUI(PLANE, VALUE);                                             \
     }
-
-#else // !USING_PLS_STORAGE_TEXTURES
-
-#define PLS_CONTEXT_DECL
-#define PLS_CONTEXT_UNPACK
-
-#define PLS_MAIN(NAME) void main()
-#define EMIT_PLS
-
+#else
 // Cheap forms of PLS do better to update unconditionally, even if it might be a
 // no-op. (Especially since we otherwise would have had to preserve anyway.)
 #define PLS_STORE4F_OPTIONAL_IF(CONDITION, PLANE, VALUE)                       \
     PLS_STORE4F(PLANE, VALUE);
 #define PLS_STOREUI_OPTIONAL_IF(CONDITION, PLANE, VALUE)                       \
     PLS_STOREUI(PLANE, VALUE);
-
-#endif // !USING_PLS_STORAGE_TEXTURES
-
-#define PLS_MAIN_WITH_IMAGE_UNIFORMS(NAME) PLS_MAIN(NAME)
+#endif
 
 #ifndef PLS_FRAG_COLOR_MAIN
 #define PLS_FRAG_COLOR_MAIN(NAME)                                              \
@@ -631,25 +701,30 @@
     PLS_MAIN(NAME)
 #endif
 
-#ifndef PLS_FRAG_COLOR_MAIN_WITH_IMAGE_UNIFORMS
-#define PLS_FRAG_COLOR_MAIN_WITH_IMAGE_UNIFORMS(NAME)                          \
-    layout(location = 0) out half4 _fragColor;                                 \
-    PLS_MAIN(NAME)
-#endif
-
 #define EMIT_PLS_AND_FRAG_COLOR EMIT_PLS
 
-#if defined(@TARGET_VULKAN) && !defined(@INPUT_ATTACHMENT_NONE)
+#if defined(@TARGET_SPIRV) && !defined(@TARGET_WGSL)
+#ifdef @MSAA_DST_COLOR
+// The color attachment is multisampled, so the read has to average the samples
+// this fragment actually covers.
 #define DST_COLOR_TEXTURE(NAME)                                                \
     layout(input_attachment_index = 0,                                         \
            binding = COLOR_PLANE_IDX,                                          \
-           set = PLS_TEXTURE_BINDINGS_SET) uniform lowp subpassInputMS NAME
+           set = PLS_TEXTURE_BINDINGS_SET) uniform mediump subpassInputMS NAME
 #define DST_COLOR_FETCH(NAME)                                                  \
     dst_color_fetch(mat4(subpassLoad(NAME, 0),                                 \
                          subpassLoad(NAME, 1),                                 \
                          subpassLoad(NAME, 2),                                 \
                          subpassLoad(NAME, 3)),                                \
                     gl_SampleMaskIn[0])
+#else
+// The color attachment is single-sampled, so fetch it directly.
+#define DST_COLOR_TEXTURE(NAME)                                                \
+    layout(input_attachment_index = 0,                                         \
+           binding = COLOR_PLANE_IDX,                                          \
+           set = PLS_TEXTURE_BINDINGS_SET) uniform mediump subpassInput NAME
+#define DST_COLOR_FETCH(NAME) subpassLoad(NAME)
+#endif // @MSAA_DST_COLOR
 #else
 #define DST_COLOR_TEXTURE(NAME)                                                \
     TEXTURE_RGBA8(PER_FLUSH_BINDINGS_SET, DST_COLOR_TEXTURE_IDX, NAME)

@@ -43,7 +43,11 @@ void DataBindContext::resolvePath()
             auto dataResolver = m_file->dataResolver();
             if (dataResolver)
             {
-                m_SourcePathIdsBuffer = dataResolver->resolvePath(pathId);
+                auto resolvedPath = dataResolver->resolvePath(pathId);
+                if (!resolvedPath.empty())
+                {
+                    m_SourcePathIdsBuffer = resolvedPath;
+                }
             }
         }
     }
@@ -60,12 +64,12 @@ void DataBindContext::bindFromContext(DataContext* dataContext)
                       m_SourcePathIdsBuffer,
                       file()->dataResolver())
                 : dataContext->getViewModelProperty(m_SourcePathIdsBuffer);
-        if (vmSource != m_Source)
+        if (m_Source == nullptr || vmSource != m_Source.get())
         {
             if (vmSource != nullptr)
             {
                 clearSource();
-                source(vmSource);
+                source(ref_rcp(vmSource));
                 bind();
             }
             else
@@ -75,7 +79,9 @@ void DataBindContext::bindFromContext(DataContext* dataContext)
         }
         else
         {
-            addDirt(ComponentDirt::Bindings, true);
+            // Source unchanged — re-sync both supported directions in favor
+            // order (a reconcile, not a one-sided change). See bind().
+            addDirt(reconcileDirt(), true);
         }
         if (m_dataConverter != nullptr)
         {

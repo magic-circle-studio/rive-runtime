@@ -1,9 +1,8 @@
 #ifndef _RIVE_STATE_MACHINE_LISTENER_BASE_HPP_
 #define _RIVE_STATE_MACHINE_LISTENER_BASE_HPP_
 #include "rive/animation/state_machine_component.hpp"
-#include "rive/core/field_types/core_bytes_type.hpp"
-#include "rive/core/field_types/core_uint_type.hpp"
-#include "rive/span.hpp"
+#include "rive/core/field_types/core_id_type.hpp"
+#include "rive/core/id.hpp"
 namespace rive
 {
 class StateMachineListenerBase : public StateMachineComponent
@@ -12,7 +11,7 @@ protected:
     typedef StateMachineComponent Super;
 
 public:
-    static const uint16_t typeKey = 114;
+    static const uint16_t typeKey = 654;
 
     /// Helper to quickly determine if a core object extends another without
     /// RTTI at runtime.
@@ -31,60 +30,28 @@ public:
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t targetIdPropertyKey = 224;
-    static const uint16_t listenerTypeValuePropertyKey = 225;
-    static const uint16_t eventIdPropertyKey = 399;
-    static const uint16_t viewModelPathIdsPropertyKey = 868;
 
 protected:
-    uint32_t m_TargetId = -1;
-    uint32_t m_ListenerTypeValue = 0;
-    uint32_t m_EventId = -1;
+    Id m_TargetId = kEmptyId;
 
 public:
-    inline uint32_t targetId() const { return m_TargetId; }
-    void targetId(uint32_t value)
+    inline Id targetId() const { return m_TargetId; }
+    void targetId(Id value)
     {
         if (m_TargetId == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(targetIdPropertyKey, &m_TargetId, &value);
         m_TargetId = value;
-        targetIdChanged();
+        RIVE_EDITOR_CHANGED(targetIdChanged());
+        notifyPropertyChanged(targetIdPropertyKey);
     }
-
-    inline uint32_t listenerTypeValue() const { return m_ListenerTypeValue; }
-    void listenerTypeValue(uint32_t value)
-    {
-        if (m_ListenerTypeValue == value)
-        {
-            return;
-        }
-        m_ListenerTypeValue = value;
-        listenerTypeValueChanged();
-    }
-
-    inline uint32_t eventId() const { return m_EventId; }
-    void eventId(uint32_t value)
-    {
-        if (m_EventId == value)
-        {
-            return;
-        }
-        m_EventId = value;
-        eventIdChanged();
-    }
-
-    virtual void decodeViewModelPathIds(Span<const uint8_t> value) = 0;
-    virtual void copyViewModelPathIds(
-        const StateMachineListenerBase& object) = 0;
 
     Core* clone() const override;
     void copy(const StateMachineListenerBase& object)
     {
         m_TargetId = object.m_TargetId;
-        m_ListenerTypeValue = object.m_ListenerTypeValue;
-        m_EventId = object.m_EventId;
-        copyViewModelPathIds(object);
         StateMachineComponent::copy(object);
     }
 
@@ -93,16 +60,7 @@ public:
         switch (propertyKey)
         {
             case targetIdPropertyKey:
-                m_TargetId = CoreUintType::deserialize(reader);
-                return true;
-            case listenerTypeValuePropertyKey:
-                m_ListenerTypeValue = CoreUintType::deserialize(reader);
-                return true;
-            case eventIdPropertyKey:
-                m_EventId = CoreUintType::deserialize(reader);
-                return true;
-            case viewModelPathIdsPropertyKey:
-                decodeViewModelPathIds(CoreBytesType::deserialize(reader));
+                m_TargetId = CoreIdType::runtimeDeserialize(reader);
                 return true;
         }
         return StateMachineComponent::deserialize(propertyKey, reader);
@@ -110,9 +68,9 @@ public:
 
 protected:
     virtual void targetIdChanged() {}
-    virtual void listenerTypeValueChanged() {}
-    virtual void eventIdChanged() {}
-    virtual void viewModelPathIdsChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/state_machine_listener_ext.inl"
+#endif
 };
 } // namespace rive
 

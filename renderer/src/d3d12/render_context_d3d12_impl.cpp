@@ -4,16 +4,22 @@
 
 #include "rive/renderer/d3d12/render_context_d3d12_impl.hpp"
 #include "rive/renderer/d3d/d3d_constants.hpp"
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_canvas.hpp"
+#include "rive/renderer/ore/ore_context_d3d12.hpp"
+#endif
 #include "rive/profiler/profiler_macros.h"
+#include "rive/renderer/d3d/d3d_utils.hpp"
 
 // needed for root sig and heap constants
 #include "shaders/d3d/root.sig"
 
 #include <sstream>
+#include <vector>
 #include <D3DCompiler.h>
 
 // this is defined here instead of root_sig becaise the gpu does not care about
-// the number of rtvs this is gradient, tess, atlas and color
+// the number of rtvs. This is gradient, tess, feather atlas, and color
 static constexpr UINT NUM_RTV_HEAP_DESCRIPTORS = 4;
 namespace rive::gpu
 {
@@ -23,13 +29,13 @@ static constexpr D3D12_FILTER filter_for_sampler_options(ImageFilter option)
     switch (option)
     {
         case ImageFilter::nearest:
-            return D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
+            return D3D12_FILTER_MIN_MAG_MIP_POINT;
         case ImageFilter::bilinear:
-            return D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
+            return D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     }
 
     RIVE_UNREACHABLE();
-    return D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
+    return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
 };
 
 static constexpr D3D12_TEXTURE_ADDRESS_MODE address_mode_for_sampler_option(
@@ -102,51 +108,115 @@ public:
                      UINT width,
                      UINT height,
                      UINT mipLevel,
-                     const uint8_t imageDataRGBA[],
+                     GPUTextureFormat format,
+                     const uint8_t imageData[],
                      bool usesCommandList) :
-        Texture(width, height),
-        m_gpuTexture(manager->make2DTexture(
-            width,
-            height,
-            mipLevel,
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            D3D12_RESOURCE_FLAG_NONE,
-            usesCommandList ? D3D12_RESOURCE_STATE_COMMON
-                            : D3D12_RESOURCE_STATE_COPY_DEST))
+        Texture(width, height)
+
     {
-        D3D12_SUBRESOURCE_DATA srcData;
-        srcData.pData = imageDataRGBA;
-        srcData.RowPitch = width * 4;
-        srcData.SlicePitch = srcData.RowPitch * height;
+        DXGI_FORMAT d3dFormat = d3d_utils::convert_format(format);
 
-        UINT numRows;
-        UINT64 rowSizeInBtes;
-        UINT64 totalBytes;
-        auto desc = m_gpuTexture->resource()->GetDesc();
-        SNAME_D3D12_OBJECT(m_gpuTexture, "riveImage");
-        manager->device()->GetCopyableFootprints(&desc,
-                                                 0,
-                                                 1,
-                                                 0,
-                                                 &m_uploadFootprint,
-                                                 &numRows,
-                                                 &rowSizeInBtes,
-                                                 &totalBytes);
+        // Always create in COMMON. Both upload paths drive the texture
+        // through the copy command list which uses enhanced barriers, and
+        // enhanced barriers require COMMON layout (LEGACY_COPY_DEST is
+        // rejected as INCOMPATIBLE_BARRIER_LAYOUT). The copy itself
+        // promotes COMMON→COPY_DEST implicitly.
+        std::ignore = usesCommandList;
+        m_gpuTexture = manager->make2DTexture(width,
+                                              height,
+                                              mipLevel,
+                                              d3dFormat,
+                                              D3D12_RESOURCE_FLAG_NONE,
+                                              D3D12_RESOURCE_STATE_COMMON);
 
-        m_uploadBuffer = manager->makeUploadBuffer(
-            static_cast<UINT>(totalBytes) +
-            D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+        if (format == GPUTextureFormat::bc7)
+        {
+            // imageData contains pre-compressed BC7 blocks, level 0 first,
+            // levels packed tight (no inter-level padding). Copy each level
+            // into its placed-subresource slot in the upload buffer.
+            auto desc = m_gpuTexture->resource()->GetDesc();
 
-        D3D12_MEMCPY_DEST DestData = {
-            m_uploadBuffer->map(),
-            m_uploadFootprint.Footprint.RowPitch,
-            SIZE_T(m_uploadFootprint.Footprint.RowPitch * numRows)};
+            m_subresourceFootprints.resize(mipLevel);
+            std::vector<UINT> numRows(mipLevel);
+            std::vector<UINT64> rowSizeInBytes(mipLevel);
+            UINT64 totalBytes = 0;
 
-        MemcpySubresource(&DestData,
-                          &srcData,
-                          static_cast<SIZE_T>(rowSizeInBtes),
-                          numRows,
-                          m_uploadFootprint.Footprint.Depth);
+            manager->device()->GetCopyableFootprints(
+                &desc,
+                0,                              // First subresource
+                mipLevel,                       // Number of mips
+                0,                              // Base offset
+                m_subresourceFootprints.data(), // One footprint per mip
+                numRows.data(),
+                rowSizeInBytes.data(),
+                &totalBytes);
+
+            m_uploadBuffer = manager->makeUploadBuffer(
+                static_cast<UINT>(totalBytes) +
+                D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+
+            uint8_t* dst = reinterpret_cast<uint8_t*>(m_uploadBuffer->map());
+            const uint8_t* src = imageData;
+
+            for (UINT mip = 0; mip < mipLevel; ++mip)
+            {
+                const auto& fp = m_subresourceFootprints[mip].Footprint;
+                // RowPitch is padded to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+                // (256). Source rows are tight (rowSizeInBytes). Copy one
+                // block-row at a time so we don't overflow the upload slot
+                // and don't read past the source mip.
+                uint8_t* dstMip = dst + m_subresourceFootprints[mip].Offset;
+                const UINT64 srcRowBytes = rowSizeInBytes[mip];
+                const UINT rows = numRows[mip];
+                for (UINT row = 0; row < rows; ++row)
+                {
+                    memcpy(dstMip + row * fp.RowPitch,
+                           src + row * srcRowBytes,
+                           srcRowBytes);
+                }
+                src += srcRowBytes * rows;
+            }
+        }
+        else if (format == GPUTextureFormat::rgba32)
+        {
+            D3D12_SUBRESOURCE_DATA srcData;
+            srcData.pData = imageData;
+            srcData.RowPitch = width * 4;
+            srcData.SlicePitch = srcData.RowPitch * height;
+
+            UINT numRows;
+            UINT64 rowSizeInBtes;
+            UINT64 totalBytes;
+            auto desc = m_gpuTexture->resource()->GetDesc();
+            SNAME_D3D12_OBJECT(m_gpuTexture, "riveImage");
+            manager->device()->GetCopyableFootprints(&desc,
+                                                     0,
+                                                     1,
+                                                     0,
+                                                     &m_uploadFootprint,
+                                                     &numRows,
+                                                     &rowSizeInBtes,
+                                                     &totalBytes);
+
+            m_uploadBuffer = manager->makeUploadBuffer(
+                static_cast<UINT>(totalBytes) +
+                D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT);
+
+            D3D12_MEMCPY_DEST DestData = {
+                m_uploadBuffer->map(),
+                m_uploadFootprint.Footprint.RowPitch,
+                SIZE_T(m_uploadFootprint.Footprint.RowPitch * numRows)};
+
+            MemcpySubresource(&DestData,
+                              &srcData,
+                              static_cast<SIZE_T>(rowSizeInBtes),
+                              numRows,
+                              m_uploadFootprint.Footprint.Depth);
+        }
+        else
+        {
+            assert(!"unsupported format");
+        }
     }
 
     D3D12Texture* synchronize(ID3D12GraphicsCommandList* copyList,
@@ -155,17 +225,37 @@ public:
     {
         if (m_uploadBuffer)
         {
-            const CD3DX12_TEXTURE_COPY_LOCATION dst(m_gpuTexture->resource(),
-                                                    0);
-            const CD3DX12_TEXTURE_COPY_LOCATION src(m_uploadBuffer->resource(),
-                                                    m_uploadFootprint);
-
-            copyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            if (!m_subresourceFootprints.empty())
+            {
+                // BC7: copy each mip level to its own subresource.
+                for (UINT mip = 0;
+                     mip < static_cast<UINT>(m_subresourceFootprints.size());
+                     ++mip)
+                {
+                    const CD3DX12_TEXTURE_COPY_LOCATION dst(
+                        m_gpuTexture->resource(),
+                        mip);
+                    const CD3DX12_TEXTURE_COPY_LOCATION src(
+                        m_uploadBuffer->resource(),
+                        m_subresourceFootprints[mip]);
+                    copyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                }
+            }
+            else
+            {
+                // RGBA: single subresource copy.
+                const CD3DX12_TEXTURE_COPY_LOCATION dst(
+                    m_gpuTexture->resource(),
+                    0);
+                const CD3DX12_TEXTURE_COPY_LOCATION src(
+                    m_uploadBuffer->resource(),
+                    m_uploadFootprint);
+                copyList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
 
             manager->transition(cmdList,
                                 m_gpuTexture.get(),
                                 D3D12_RESOURCE_STATE_GENERIC_READ);
-
             m_uploadBuffer = nullptr;
         }
 
@@ -173,11 +263,18 @@ public:
     }
 
     D3D12Texture* resource() const { return m_gpuTexture.get(); }
+    void* nativeHandle() const override
+    {
+        return static_cast<void*>(m_gpuTexture.get());
+    }
 
 private:
     mutable rcp<D3D12Buffer> m_uploadBuffer;
-    const rcp<D3D12Texture> m_gpuTexture;
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT m_uploadFootprint;
+    rcp<D3D12Texture> m_gpuTexture;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT
+    m_uploadFootprint; // RGBA path (single subresource)
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>
+        m_subresourceFootprints; // BC7 path (per-mip)
 };
 
 class RenderBufferD3D12Impl
@@ -196,7 +293,8 @@ public:
         m_uploadBuffer =
             manager->makeUploadBuffer(static_cast<UINT>(sizeInBytes));
 
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             mappedOnceMempry = m_uploadBuffer->map();
         }
@@ -220,7 +318,9 @@ public:
                 D3D12_RESOURCE_STATE_COMMON);
 
             cmdList->ResourceBarrier(1, &barrier);
-            if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+            if (enums::is_flag_set(
+                    flags(),
+                    RenderBufferFlags::mappedOnceAtInitialization))
             {
                 m_uploadBuffer = nullptr;
             }
@@ -234,7 +334,8 @@ protected:
     {
         assert(m_uploadBuffer);
         needsUpload = true;
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             assert(mappedOnceMempry);
             return mappedOnceMempry;
@@ -248,7 +349,8 @@ protected:
     void onUnmap() override
     {
         assert(m_uploadBuffer);
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             assert(mappedOnceMempry);
             m_uploadBuffer->unmap();
@@ -530,7 +632,6 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
     m_pipelineManager(device, capabilities, shaderCompilationMode),
     m_resourceManager(make_rcp<D3D12ResourceManager>(device)),
     m_flushUniformBufferPool(m_resourceManager, sizeof(FlushUniforms)),
-    m_imageDrawUniformBufferPool(m_resourceManager, sizeof(ImageDrawUniforms)),
     m_pathBufferPool(m_resourceManager),
     m_paintBufferPool(m_resourceManager),
     m_paintAuxBufferPool(m_resourceManager),
@@ -538,6 +639,8 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
     m_gradSpanBufferPool(m_resourceManager),
     m_tessSpanBufferPool(m_resourceManager),
     m_triangleBufferPool(m_resourceManager),
+    m_imageRectInstanceBufferPool(m_resourceManager, sizeof(ImageRectInstance)),
+    m_imageMeshInstanceBufferPool(m_resourceManager, sizeof(ImageMeshInstance)),
     // this is 64kb which is the smallest heap that can be sent to gpu
     m_srvUavCbvHeapPool(m_resourceManager,
                         MAX_DESCRIPTOR_HEAPS_PER_FLUSH,
@@ -560,13 +663,18 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
     m_platformFeatures.supportsAtomicMode = true;
     m_platformFeatures.maxTextureSize = D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 
+    m_platformFeatures.supportsClipScissor = true;
+
+    // BC1–BC7 are required at D3D feature level 11.0+.
+    m_platformFeatures.supportsTextureCompressionBC = true;
+
     m_rtvHeap = m_resourceManager->makeHeap(NUM_RTV_HEAP_DESCRIPTORS,
                                             D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                                             D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
 
     m_pipelineManager.compileGradientPipeline();
     m_pipelineManager.compileTesselationPipeline();
-    m_pipelineManager.compileAtlasPipeline();
+    m_pipelineManager.compileFeatherAtlasPipeline();
 
     m_linearSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     m_linearSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -624,14 +732,14 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
         m_resourceManager->makeImmutableBuffer<>(copyCommandList,
                                                  kImageRectIndices);
     NAME_D3D12_OBJECT(m_imageRectIndexBuffer);
-    m_featherTexture =
-        m_resourceManager->make1DTextureArray(GAUSSIAN_TABLE_SIZE,
-                                              FEATHER_TEXTURE_1D_ARRAY_LENGTH,
-                                              1,
-                                              DXGI_FORMAT_R16_FLOAT,
-                                              D3D12_RESOURCE_FLAG_NONE,
-                                              D3D12_RESOURCE_STATE_COMMON);
-    NAME_D3D12_OBJECT(m_featherTexture);
+    m_gaussianIntegralTexture = m_resourceManager->make1DTextureArray(
+        GAUSSIAN_TABLE_SIZE,
+        GAUSSIAN_INTEGRAL_TEXTURE_1D_ARRAY_LENGTH,
+        1,
+        DXGI_FORMAT_R16_FLOAT,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COMMON);
+    NAME_D3D12_OBJECT(m_gaussianIntegralTexture);
     auto featherUploadBuffer = m_resourceManager->makeUploadBuffer(
         sizeof(gpu::g_inverseGaussianIntegralTableF16) * 2);
 
@@ -641,7 +749,7 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
     updateData.SlicePitch = updateData.RowPitch;
 
     UpdateSubresources(copyCommandList,
-                       m_featherTexture->resource(),
+                       m_gaussianIntegralTexture->resource(),
                        featherUploadBuffer->resource(),
                        0,
                        0,
@@ -654,7 +762,7 @@ RenderContextD3D12Impl::RenderContextD3D12Impl(
     updateData2.SlicePitch = updateData.RowPitch;
 
     UpdateSubresources(copyCommandList,
-                       m_featherTexture->resource(),
+                       m_gaussianIntegralTexture->resource(),
                        featherUploadBuffer->resource(),
                        sizeof(gpu::g_gaussianIntegralTableF16),
                        1,
@@ -677,12 +785,18 @@ rcp<Texture> RenderContextD3D12Impl::makeImageTexture(
     uint32_t width,
     uint32_t height,
     uint32_t mipLevelCount,
-    const uint8_t imageDataRGBAPremul[])
+    GPUTextureFormat format,
+    const uint8_t imageDataRGBAPremul[],
+    uint8_t /*blockWidth*/,
+    uint8_t /*blockHeight*/,
+    bool /*srgb*/,
+    bool /*generateRemainingMips*/)
 {
     return make_rcp<TextureD3D12Impl>(m_resourceManager.get(),
                                       width,
                                       height,
                                       mipLevelCount,
+                                      format,
                                       imageDataRGBAPremul,
                                       m_usesCopyCommandList);
 }
@@ -692,6 +806,57 @@ rcp<Texture> RenderContextD3D12Impl::adoptImageTexture(
 {
     return make_rcp<TextureD3D12Impl>(std::move(imageTexture));
 }
+
+rcp<Texture> RenderContextD3D12Impl::adoptImageTexture(ID3D12Resource* resource,
+                                                       uint32_t width,
+                                                       uint32_t height,
+                                                       DXGI_FORMAT viewFormat)
+{
+    if (resource == nullptr || width == 0 || height == 0)
+    {
+        return nullptr;
+    }
+    // ComPtr adds a transient ref dropped when our wrapper destructs; the
+    // real lifetime stays with the original owner (e.g. Unity).
+    ComPtr<ID3D12Resource> comResource(resource);
+    auto d3dTex =
+        make_rcp<D3D12Texture>(m_resourceManager,
+                               std::move(comResource),
+                               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    d3dTex->setSrvViewFormat(viewFormat);
+    return adoptImageTexture(std::move(d3dTex));
+}
+
+#ifdef RIVE_CANVAS
+void RenderContextD3D12Impl::ensureCanvasBacking(gpu::RenderCanvas* canvas)
+{
+    if (canvas->isBacked())
+    {
+        return;
+    }
+
+    uint32_t width = canvas->width(), height = canvas->height();
+    auto texture =
+        manager()->make2DTexture(width,
+                                 height,
+                                 1,
+                                 DXGI_FORMAT_R8G8B8A8_UNORM,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                                 D3D12_RESOURCE_STATE_COMMON);
+
+    auto renderTarget = make_rcp<RenderTargetD3D12>(this, width, height);
+    renderTarget->setTargetTexture(texture);
+
+    canvas->setBacking(adoptImageTexture(std::move(texture)),
+                       std::move(renderTarget));
+}
+
+std::unique_ptr<rive::ore::Context> RenderContextD3D12Impl::makeOreContext()
+{
+    return rive::ore::ContextD3D12::Make(m_resourceManager, m_device.Get());
+}
+#endif
 
 void rive::gpu::RenderContextD3D12Impl::resizeGradientTexture(uint32_t width,
                                                               uint32_t height)
@@ -741,19 +906,20 @@ void rive::gpu::RenderContextD3D12Impl::resizeTessellationTexture(
     }
 }
 
-void rive::gpu::RenderContextD3D12Impl::resizeAtlasTexture(uint32_t width,
-                                                           uint32_t height)
+void rive::gpu::RenderContextD3D12Impl::resizeFeatherAtlasTexture(
+    uint32_t width,
+    uint32_t height)
 {
     if (width == 0 || height == 0)
     {
-        m_atlasTexture = nullptr;
+        m_featherAtlasTexture = nullptr;
     }
     else
     {
 
         D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R16_FLOAT, {}};
 
-        m_atlasTexture = m_resourceManager->make2DTexture(
+        m_featherAtlasTexture = m_resourceManager->make2DTexture(
             width,
             height,
             1,
@@ -764,10 +930,77 @@ void rive::gpu::RenderContextD3D12Impl::resizeAtlasTexture(uint32_t width,
             &clear);
         // these can be done here since they arent recycled every frame
         m_rtvHeap->markRtvToIndex(m_device.Get(),
-                                  m_atlasTexture.get(),
-                                  ATLAS_RTV_HEAP_OFFSET);
-        SNAME_D3D12_OBJECT(m_atlasTexture, "atlas");
+                                  m_featherAtlasTexture.get(),
+                                  FEATHER_ATLAS_RTV_HEAP_OFFSET);
+        SNAME_D3D12_OBJECT(m_featherAtlasTexture, "featherAtlas");
     }
+}
+
+// Internal struct to hold D3D12 canvas command buffer resources.
+// Allocated by makeCommandBuffer(), freed by commitCommandBuffer().
+struct CanvasCommandBuffer
+{
+    RenderContextD3D12Impl::CommandLists lists;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+};
+
+void* RenderContextD3D12Impl::makeCommandBuffer()
+{
+    if (m_canvasQueue == nullptr)
+    {
+        return nullptr;
+    }
+    auto* cb = new CanvasCommandBuffer();
+    HRESULT hr =
+        m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         IID_PPV_ARGS(&cb->allocator));
+    if (FAILED(hr))
+    {
+        delete cb;
+        return nullptr;
+    }
+    hr = m_device->CreateCommandList(0,
+                                     D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                     cb->allocator.Get(),
+                                     nullptr,
+                                     IID_PPV_ARGS(&cb->commandList));
+    if (FAILED(hr))
+    {
+        delete cb;
+        return nullptr;
+    }
+    cb->lists.copyComandList = nullptr; // use direct list for everything
+    cb->lists.directComandList = cb->commandList.Get();
+    return &cb->lists;
+}
+
+void RenderContextD3D12Impl::commitCommandBuffer(void* commandBuffer)
+{
+    if (commandBuffer == nullptr)
+    {
+        return;
+    }
+    // Recover the CanvasCommandBuffer from the CommandLists pointer.
+    auto* lists = static_cast<CommandLists*>(commandBuffer);
+    auto* cb = reinterpret_cast<CanvasCommandBuffer*>(
+        reinterpret_cast<char*>(lists) - offsetof(CanvasCommandBuffer, lists));
+    cb->commandList->Close();
+    ID3D12CommandList* ppCommandLists[] = {cb->commandList.Get()};
+    m_canvasQueue->ExecuteCommandLists(1, ppCommandLists);
+
+    // Wait for completion so the canvas texture is ready for compositing.
+    ComPtr<ID3D12Fence> fence;
+    m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    m_canvasQueue->Signal(fence.Get(), 1);
+    if (fence->GetCompletedValue() < 1)
+    {
+        HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        fence->SetEventOnCompletion(1, event);
+        WaitForSingleObject(event, INFINITE);
+        CloseHandle(event);
+    }
+    delete cb;
 }
 
 void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
@@ -775,7 +1008,6 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
 {
     // These should all have gotten recycled at the end of the last frame.
     assert(m_flushUniformBuffer == nullptr);
-    assert(m_imageDrawUniformBuffer == nullptr);
     assert(m_pathBuffer == nullptr);
     assert(m_paintBuffer == nullptr);
     assert(m_paintAuxBuffer == nullptr);
@@ -783,6 +1015,8 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
     assert(m_gradSpanBuffer == nullptr);
     assert(m_tessSpanBuffer == nullptr);
     assert(m_triangleBuffer == nullptr);
+    assert(m_imageRectInstanceBuffer == nullptr);
+    assert(m_imageMeshInstanceBuffer == nullptr);
 
     assert(m_srvUavCbvHeap == nullptr);
     assert(m_cpuSrvUavCbvHeap == nullptr);
@@ -790,11 +1024,17 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
 
     // Advance the context frame and delete resources that are no longer
     // referenced by in-flight command buffers.
-    m_resourceManager->advanceFrameNumber(nextFrameNumber, safeFrameNumber);
+    // When nextFrameNumber is 0 this is a canvas pre-pass flush that uses its
+    // own command buffer (via makeCommandBuffer/commitCommandBuffer). Skip
+    // advancing the frame number because the pre-pass executes synchronously
+    // and doesn't participate in frame lifetime tracking.
+    if (nextFrameNumber != 0)
+    {
+        m_resourceManager->advanceFrameNumber(nextFrameNumber, safeFrameNumber);
+    }
 
     // Acquire buffers for the flush.
     m_flushUniformBuffer = m_flushUniformBufferPool.acquire();
-    m_imageDrawUniformBuffer = m_imageDrawUniformBufferPool.acquire();
     m_pathBuffer = m_pathBufferPool.acquire();
     m_paintBuffer = m_paintBufferPool.acquire();
     m_paintAuxBuffer = m_paintAuxBufferPool.acquire();
@@ -802,13 +1042,14 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
     m_gradSpanBuffer = m_gradSpanBufferPool.acquire();
     m_tessSpanBuffer = m_tessSpanBufferPool.acquire();
     m_triangleBuffer = m_triangleBufferPool.acquire();
+    m_imageRectInstanceBuffer = m_imageRectInstanceBufferPool.acquire();
+    m_imageMeshInstanceBuffer = m_imageMeshInstanceBufferPool.acquire();
 
     m_srvUavCbvHeap = m_srvUavCbvHeapPool.acquire();
     m_cpuSrvUavCbvHeap = m_cpuSrvUavCbvHeapPool.acquire();
     m_samplerHeap = m_samplerHeapPool.acquire();
 
     VNAME_D3D12_OBJECT(m_flushUniformBuffer);
-    VNAME_D3D12_OBJECT(m_imageDrawUniformBuffer);
     VNAME_D3D12_OBJECT(m_pathBuffer);
     VNAME_D3D12_OBJECT(m_paintBuffer);
     VNAME_D3D12_OBJECT(m_paintAuxBuffer);
@@ -816,6 +1057,8 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
     VNAME_D3D12_OBJECT(m_gradSpanBuffer);
     VNAME_D3D12_OBJECT(m_tessSpanBuffer);
     VNAME_D3D12_OBJECT(m_triangleBuffer);
+    VNAME_D3D12_OBJECT(m_imageRectInstanceBuffer);
+    VNAME_D3D12_OBJECT(m_imageMeshInstanceBuffer);
 
     m_isFirstFlushOfFrame = true;
 
@@ -826,6 +1069,7 @@ void RenderContextD3D12Impl::prepareToFlush(uint64_t nextFrameNumber,
 
 void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
 {
+    RIVE_PROF_GPUNAME_L(0, "RiveFlush");
     CommandLists* commandLists =
         static_cast<CommandLists*>(desc.externalCommandBuffer);
     assert(commandLists);
@@ -884,7 +1128,6 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
         // sync everything first logical flush,
         // copies are slow, so do it all at once
         m_flushUniformBuffer->sync(copyCmdList, 0);
-        m_imageDrawUniformBuffer->sync(copyCmdList, 0);
         if (desc.pathCount > 0)
         {
             m_pathBuffer->sync(copyCmdList, 0);
@@ -911,6 +1154,9 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             m_triangleBuffer->sync(copyCmdList, 0);
         }
 
+        m_imageRectInstanceBuffer->sync(copyCmdList, 0);
+        m_imageMeshInstanceBuffer->sync(copyCmdList, 0);
+
         // mark all UAVS, thse only need to happen the fist time since they
         // won't change per logical flush
 
@@ -922,12 +1168,23 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                                   targetTexture,
                                   TARGET_RTV_HEAP_OFFSET);
         // mark all the texture srvs, these also only need to be done once per
-        // flush since the texture aren't re created per logical flush
+        // flush since the texture aren't re created per logical flush. When
+        // the source texture is not currently allocated we still need to write
+        // a valid (null) descriptor — the cpu heap is acquired from a pool and
+        // can retain stale descriptors from prior frames, which would trip
+        // GPU-Based Validation (id=1042) when STATIC_SRV is bound.
         if (m_gradientTexture)
         {
             m_cpuSrvUavCbvHeap->markSrvToIndex(m_device.Get(),
                                                m_gradientTexture.get(),
                                                GRAD_IMAGE_HEAP_OFFSET);
+        }
+        else
+        {
+            m_cpuSrvUavCbvHeap->markNullTexture2DSrvToIndex(
+                m_device.Get(),
+                GRAD_IMAGE_HEAP_OFFSET,
+                DXGI_FORMAT_R8G8B8A8_UNORM);
         }
         if (m_tesselationTexture)
         {
@@ -935,16 +1192,30 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                                                m_tesselationTexture.get(),
                                                TESS_IMAGE_HEAP_OFFSET);
         }
-        if (m_atlasTexture)
+        else
+        {
+            m_cpuSrvUavCbvHeap->markNullTexture2DSrvToIndex(
+                m_device.Get(),
+                TESS_IMAGE_HEAP_OFFSET,
+                DXGI_FORMAT_R32G32B32A32_UINT);
+        }
+        if (m_featherAtlasTexture)
         {
             m_cpuSrvUavCbvHeap->markSrvToIndex(m_device.Get(),
-                                               m_atlasTexture.get(),
-                                               ATLAS_IMAGE_HEAP_OFFSET);
+                                               m_featherAtlasTexture.get(),
+                                               FEATHER_ATLAS_IMAGE_HEAP_OFFSET);
         }
-        assert(m_featherTexture);
+        else
+        {
+            m_cpuSrvUavCbvHeap->markNullTexture2DSrvToIndex(
+                m_device.Get(),
+                FEATHER_ATLAS_IMAGE_HEAP_OFFSET,
+                DXGI_FORMAT_R16_FLOAT);
+        }
+        assert(m_gaussianIntegralTexture);
         m_cpuSrvUavCbvHeap->markSrvToIndex(m_device.Get(),
-                                           m_featherTexture.get(),
-                                           FEATHER_IMAGE_HEAP_OFFSET);
+                                           m_gaussianIntegralTexture.get(),
+                                           GAUSSIAN_INTEGRAL_IMAGE_HEAP_OFFSET);
 
         // do this only once.
         m_pipelineManager.setRootSig(cmdList);
@@ -975,12 +1246,13 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
         m_samplerHeap->markSamplerToIndex(m_device.Get(),
                                           m_linearSampler,
                                           GRAD_SAMPLER_HEAP_OFFSET);
+        m_samplerHeap->markSamplerToIndex(
+            m_device.Get(),
+            m_linearSampler,
+            GAUSSIAN_INTEGRAL_SAMPLER_HEAP_OFFSET);
         m_samplerHeap->markSamplerToIndex(m_device.Get(),
                                           m_linearSampler,
-                                          FEATHER_SAMPLER_HEAP_OFFSET);
-        m_samplerHeap->markSamplerToIndex(m_device.Get(),
-                                          m_linearSampler,
-                                          ATLAS_SAMPLER_HEAP_OFFSET);
+                                          FEATHER_ATLAS_SAMPLER_HEAP_OFFSET);
 
         // this SHOULD be m_mipSampler but we don't currently generate mips
         m_samplerHeap->markSamplerToIndex(m_device.Get(),
@@ -1042,6 +1314,23 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             StorageBufferElementSizeInBytes(PaintAuxData::kBufferStructure),
             desc.firstPaintAux);
     }
+    else
+    {
+        // Same reason as the texture-SRV null-fallback above — recycled cpu
+        // heap slots may retain stale buffer descriptors.
+        m_cpuSrvUavCbvHeap->markNullStructuredBufferSrvToIndex(
+            m_device.Get(),
+            PATH_BUFFER_HEAP_OFFSET,
+            StorageBufferElementSizeInBytes(PathData::kBufferStructure));
+        m_cpuSrvUavCbvHeap->markNullStructuredBufferSrvToIndex(
+            m_device.Get(),
+            PAINT_BUFFER_HEAP_OFFSET,
+            StorageBufferElementSizeInBytes(PaintData::kBufferStructure));
+        m_cpuSrvUavCbvHeap->markNullStructuredBufferSrvToIndex(
+            m_device.Get(),
+            PAINT_AUX_BUFFER_HEAP_OFFSET,
+            StorageBufferElementSizeInBytes(PaintAuxData::kBufferStructure));
+    }
 
     if (desc.contourCount > 0)
     {
@@ -1054,20 +1343,27 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             StorageBufferElementSizeInBytes(ContourData::kBufferStructure),
             desc.firstContour);
     }
+    else
+    {
+        m_cpuSrvUavCbvHeap->markNullStructuredBufferSrvToIndex(
+            m_device.Get(),
+            CONTOUR_BUFFER_HEAP_OFFSET,
+            StorageBufferElementSizeInBytes(ContourData::kBufferStructure));
+    }
 
     // copy to gpu heap
+    const UINT dynamicSrvHeapIndex =
+        m_heapDescriptorOffset + DYNAMIC_SRV_UAV_HEAP_DESCRIPTOPR_START;
     m_device->CopyDescriptorsSimple(
         NUM_DYNAMIC_SRV_HEAP_DESCRIPTORS,
-        m_srvUavCbvHeap->cpuHandleForUpload(
-            m_heapDescriptorOffset + DYNAMIC_SRV_UAV_HEAP_DESCRIPTOPR_START),
+        m_srvUavCbvHeap->cpuHandleForUpload(dynamicSrvHeapIndex),
         m_cpuSrvUavCbvHeap->cpuHandleForIndex(
             DYNAMIC_SRV_UAV_HEAP_DESCRIPTOPR_START),
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
     cmdList->SetGraphicsRootDescriptorTable(
         DYNAMIC_SRV_SIG_INDEX,
-        m_srvUavCbvHeap->gpuHandleForIndex(
-            m_heapDescriptorOffset + DYNAMIC_SRV_UAV_HEAP_DESCRIPTOPR_START));
+        m_srvUavCbvHeap->gpuHandleForIndex(dynamicSrvHeapIndex));
 
     if (desc.gradSpanCount)
     {
@@ -1122,7 +1418,7 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
 
     if (desc.tessVertexSpanCount)
     {
-        RIVE_PROF_GPUNAME("Tessellate Curves");
+        RIVE_PROF_GPUNAME_L(1, "Tessellate Curves");
 
         m_resourceManager->transition(cmdList,
                                       m_tesselationTexture.get(),
@@ -1204,35 +1500,39 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
     static_assert(IMAGE_RECT_VERTEX_DATA_SLOT == 2);
     cmdList->IASetVertexBuffers(0, 3, vertexBuffers);
 
-    if ((desc.atlasFillBatchCount | desc.atlasStrokeBatchCount) != 0)
+    if ((desc.featherAtlasFillBatchCount | desc.featherAtlasStrokeBatchCount) !=
+        0)
     {
-        RIVE_PROF_GPUNAME("atlasRender");
+        RIVE_PROF_GPUNAME_L(1, "featherAtlasRender");
         m_resourceManager->transition(cmdList,
-                                      m_atlasTexture.get(),
+                                      m_featherAtlasTexture.get(),
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
 
-        auto rtvHandle = m_rtvHeap->cpuHandleForIndex(ATLAS_RTV_HEAP_OFFSET);
+        auto rtvHandle =
+            m_rtvHeap->cpuHandleForIndex(FEATHER_ATLAS_RTV_HEAP_OFFSET);
         cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
         float clearZero[4]{};
         cmdList->ClearRenderTargetView(rtvHandle, clearZero, 0, nullptr);
 
-        CD3DX12_VIEWPORT viewport(0.0f,
-                                  0.0f,
-                                  static_cast<float>(desc.atlasContentWidth),
-                                  static_cast<float>(desc.atlasContentHeight));
+        CD3DX12_VIEWPORT viewport(
+            0.0f,
+            0.0f,
+            static_cast<float>(desc.featherAtlasContentWidth),
+            static_cast<float>(desc.featherAtlasContentHeight));
 
         cmdList->RSSetViewports(1, &viewport);
         cmdList->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         auto IBV = m_pathPatchIndexBuffer->indexBufferView();
         cmdList->IASetIndexBuffer(&IBV);
-        if (desc.atlasFillBatchCount != 0)
+        if (desc.featherAtlasFillBatchCount != 0)
         {
-            m_pipelineManager.setAtlasFillPipeline(cmdList);
+            m_pipelineManager.setFeatherAtlasFillPipeline(cmdList);
 
-            for (size_t i = 0; i < desc.atlasFillBatchCount; ++i)
+            for (size_t i = 0; i < desc.featherAtlasFillBatchCount; ++i)
             {
-                const gpu::AtlasDrawBatch& fillBatch = desc.atlasFillBatches[i];
+                const gpu::AtlasDrawBatch& fillBatch =
+                    desc.featherAtlasFillBatches[i];
                 CD3DX12_RECT scissorRect(fillBatch.scissor.left,
                                          fillBatch.scissor.top,
                                          fillBatch.scissor.right,
@@ -1251,14 +1551,14 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             }
         }
 
-        if (desc.atlasStrokeBatchCount != 0)
+        if (desc.featherAtlasStrokeBatchCount != 0)
         {
-            m_pipelineManager.setAtlasStrokePipeline(cmdList);
+            m_pipelineManager.setFeatherAtlasStrokePipeline(cmdList);
 
-            for (size_t i = 0; i < desc.atlasStrokeBatchCount; ++i)
+            for (size_t i = 0; i < desc.featherAtlasStrokeBatchCount; ++i)
             {
                 const gpu::AtlasDrawBatch& strokeBatch =
-                    desc.atlasStrokeBatches[i];
+                    desc.featherAtlasStrokeBatches[i];
                 CD3DX12_RECT scissorRect(strokeBatch.scissor.left,
                                          strokeBatch.scissor.top,
                                          strokeBatch.scissor.right,
@@ -1277,7 +1577,7 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             }
         }
         m_resourceManager->transition(cmdList,
-                                      m_atlasTexture.get(),
+                                      m_featherAtlasTexture.get(),
                                       D3D12_RESOURCE_STATE_GENERIC_READ);
 
         cmdList->OMSetRenderTargets(0, nullptr, FALSE, nullptr);
@@ -1287,16 +1587,11 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                               0.0f,
                               static_cast<float>(width),
                               static_cast<float>(height));
-    CD3DX12_RECT scissorRect(desc.renderTargetUpdateBounds.left,
-                             desc.renderTargetUpdateBounds.top,
-                             desc.renderTargetUpdateBounds.right,
-                             desc.renderTargetUpdateBounds.bottom);
     cmdList->RSSetViewports(1, &viewport);
-    cmdList->RSSetScissorRects(1, &scissorRect);
 
     // Setup and clear the PLS textures.
     {
-        RIVE_PROF_GPUNAME("clearPLSTextures");
+        RIVE_PROF_GPUNAME_L(1, "clearPLSTextures");
         if (desc.fixedFunctionColorOutput)
         {
             m_resourceManager->transition(cmdList,
@@ -1392,7 +1687,8 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
         !desc.fixedFunctionColorOutput &&
         !renderTarget->targetTextureSupportsUAV();
 
-    if (desc.combinedShaderFeatures & gpu::ShaderFeatures::ENABLE_CLIPPING)
+    if (enums::is_flag_set(desc.combinedShaderFeatures,
+                           gpu::ShaderFeatures::ENABLE_CLIPPING))
     {
         constexpr static UINT kZero[4]{};
         auto gpuHandle =
@@ -1436,7 +1732,16 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
 
     m_heapDescriptorOffset += imageDescriptorOffset;
 
-    RIVE_PROF_GPUNAME("DrawList");
+    const auto fullUpdateScissorRect =
+        desc.renderTargetUpdateBounds.lossless_numeric_cast<uint16_t>();
+
+    // Start the current scissor rect out inside-out to guarantee that the first
+    //  rectangle we get doesn't match it.
+    auto currentScissorRect = AABBu16{0xffff, 0xffff, 0, 0};
+
+    RIVE_PROF_GPUNAME_L(1, "DrawList");
+
+    auto boundVertexInstanceType = BoundVertexInstanceType::none;
     for (const DrawBatch& batch : *desc.drawList)
     {
         assert(batch.elementCount != 0);
@@ -1454,12 +1759,42 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                 gpu::ShaderMiscFlags::coalescedResolveAndTransfer;
         }
 
+        if (drawType == gpu::DrawType::imageRect &&
+            boundVertexInstanceType != BoundVertexInstanceType::imageRect)
+        {
+            // Bind the image-draw-attribute records as a per-instance vertex
+            // buffer once; each image draw selects its record via the draw
+            // call's base instance (batch.baseElement).
+            D3D12_VERTEX_BUFFER_VIEW imageRectInstanceVBV =
+                m_imageRectInstanceBuffer->resource()->vertexBufferView(
+                    sizeof(gpu::ImageRectInstance));
+            cmdList->IASetVertexBuffers(IMAGE_DRAW_INSTANCE_DATA_SLOT,
+                                        1,
+                                        &imageRectInstanceVBV);
+            boundVertexInstanceType = BoundVertexInstanceType::imageRect;
+        }
+        else if (drawType == gpu::DrawType::imageMesh &&
+                 boundVertexInstanceType != BoundVertexInstanceType::imageMesh)
+        {
+            // Bind the image-draw-attribute records as a per-instance vertex
+            // buffer once; each image draw selects its record via the draw
+            // call's base instance (batch.baseElement).
+            D3D12_VERTEX_BUFFER_VIEW imageMeshInstanceVBV =
+                m_imageMeshInstanceBuffer->resource()->vertexBufferView(
+                    sizeof(gpu::ImageMeshInstance));
+            cmdList->IASetVertexBuffers(IMAGE_DRAW_INSTANCE_DATA_SLOT,
+                                        1,
+                                        &imageMeshInstanceVBV);
+            boundVertexInstanceType = BoundVertexInstanceType::imageMesh;
+        }
+
         auto* pipeline = m_pipelineManager.tryGetPipeline(
             {
                 .drawType = drawType,
                 .shaderFeatures = shaderFeatures,
                 .interlockMode = desc.interlockMode,
                 .shaderMiscFlags = shaderMiscFlags,
+                .wireframe = desc.wireframe,
 #ifdef WITH_RIVE_TOOLS
                 .synthesizedFailureType = desc.synthesizedFailureType,
 #endif
@@ -1467,8 +1802,9 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             m_platformFeatures);
 
         // all atomic barriers are the same for dx12
-        if (batch.barriers &
-            (BarrierFlags::plsAtomicPreResolve | BarrierFlags::plsAtomic))
+        if (enums::any_flag_set(batch.barriers,
+                                BarrierFlags::plsAtomicPreResolve |
+                                    BarrierFlags::plsAtomic))
         {
             assert(desc.interlockMode == gpu::InterlockMode::atomics);
             auto target = renderTarget->targetTextureSupportsUAV()
@@ -1483,8 +1819,8 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                     renderTarget->clip()->resource())};
 
             cmdList->ResourceBarrier(
-                desc.combinedShaderFeatures &
-                        gpu::ShaderFeatures::ENABLE_CLIPPING
+                enums::is_flag_set(desc.combinedShaderFeatures,
+                                   gpu::ShaderFeatures::ENABLE_CLIPPING)
                     ? 3
                     : 2,
                 barriers);
@@ -1495,6 +1831,24 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             // There was an issue getting either the requested pipeline state or
             // its ubershader counterpart so we cannot draw anything.
             continue;
+        }
+
+        {
+            auto desiredScissorRect =
+                batch.scissorRect.has_value()
+                    ? fullUpdateScissorRect.intersectOrEmpty(
+                          batch.scissorRect.value())
+                    : fullUpdateScissorRect;
+
+            if (desiredScissorRect != currentScissorRect)
+            {
+                currentScissorRect = desiredScissorRect;
+                CD3DX12_RECT scissorRect{currentScissorRect.left,
+                                         currentScissorRect.top,
+                                         currentScissorRect.right,
+                                         currentScissorRect.bottom};
+                cmdList->RSSetScissorRects(1, &scissorRect);
+            }
         }
 
         cmdList->SetPipelineState(pipeline->m_d3dPipelineState.Get());
@@ -1533,20 +1887,61 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                 if (++m_samplerHeapDescriptorOffset >=
                     MAX_DESCRIPTOR_SAMPLER_HEAPS_PER_FLUSH)
                 {
-                    auto oldHeap = m_samplerHeap;
                     m_samplerHeap = m_samplerHeapPool.acquire();
                     m_samplerHeapDescriptorOffset = IMAGE_SAMPLER_HEAP_OFFSET;
-                    // copy the imutable sampelrs to the new heap
-                    m_device->CopyDescriptorsSimple(
-                        IMAGE_SAMPLER_HEAP_OFFSET,
-                        m_samplerHeap->cpuHandleForUpload(0),
-                        oldHeap->cpuHandleForUpload(0),
-                        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                    // Re-create the immutable samplers in the new heap.
+                    // CopyDescriptorsSimple from the old heap is invalid:
+                    // shader-visible heaps are CPU-write-only per D3D12
+                    // spec, and reading from one as a copy source produces
+                    // garbage descriptors (validation fires id=654, GPU
+                    // eventually TDRs). Mirror the initial-flush block that
+                    // creates these from m_linearSampler directly.
+                    m_samplerHeap->markSamplerToIndex(m_device.Get(),
+                                                      m_linearSampler,
+                                                      TESS_SAMPLER_HEAP_OFFSET);
+                    m_samplerHeap->markSamplerToIndex(m_device.Get(),
+                                                      m_linearSampler,
+                                                      GRAD_SAMPLER_HEAP_OFFSET);
+                    m_samplerHeap->markSamplerToIndex(
+                        m_device.Get(),
+                        m_linearSampler,
+                        GAUSSIAN_INTEGRAL_SAMPLER_HEAP_OFFSET);
+                    m_samplerHeap->markSamplerToIndex(
+                        m_device.Get(),
+                        m_linearSampler,
+                        FEATHER_ATLAS_SAMPLER_HEAP_OFFSET);
 
                     ID3D12DescriptorHeap* ppHeaps[] = {m_srvUavCbvHeap->heap(),
                                                        m_samplerHeap->heap()};
 
                     cmdList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+                    // SetDescriptorHeaps invalidates every previously-bound
+                    // root descriptor table. Re-bind every table that was
+                    // set up earlier in this flush, otherwise GPU-Based
+                    // Validation fires id=554 on every subsequent draw and
+                    // the runtime eventually TDRs the device.
+                    cmdList->SetGraphicsRootDescriptorTable(
+                        STATIC_SRV_SIG_INDEX,
+                        m_srvUavCbvHeap->gpuHandleForIndex(
+                            STATIC_SRV_UAV_HEAP_DESCRIPTOPR_START));
+                    cmdList->SetGraphicsRootDescriptorTable(
+                        UAV_SIG_INDEX,
+                        m_srvUavCbvHeap->gpuHandleForIndex(
+                            UAV_START_HEAP_INDEX));
+                    cmdList->SetGraphicsRootDescriptorTable(
+                        SAMPLER_SIG_INDEX,
+                        m_samplerHeap->gpuHandleForIndex(0));
+                    cmdList->SetGraphicsRootDescriptorTable(
+                        DYNAMIC_SRV_SIG_INDEX,
+                        m_srvUavCbvHeap->gpuHandleForIndex(
+                            dynamicSrvHeapIndex));
+                    cmdList->SetGraphicsRootDescriptorTable(
+                        IMAGE_SIG_INDEX,
+                        m_srvUavCbvHeap->gpuHandleForIndex(
+                            m_heapDescriptorOffset - 1));
+                    // DYNAMIC_SAMPLER_SIG_INDEX is rebound by the existing
+                    // call below.
                 }
 
                 m_samplerHeap->markSamplerToIndex(
@@ -1569,7 +1964,7 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             case DrawType::midpointFanCenterAAPatches:
             case DrawType::outerCurvePatches:
             {
-                RIVE_PROF_GPUNAME("Patches");
+                RIVE_PROF_GPUNAME_L(2, "Patches");
                 cmdList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 auto IBV = m_pathPatchIndexBuffer->indexBufferView();
@@ -1578,17 +1973,18 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                     VERTEX_DRAW_UNIFORM_SIG_INDEX,
                     batch.baseElement,
                     0);
-                cmdList->DrawIndexedInstanced(PatchIndexCount(drawType),
+                cmdList->DrawIndexedInstanced(batch.indexCountPerInstance,
                                               batch.elementCount,
-                                              PatchBaseIndex(drawType),
+                                              batch.baseIndex,
                                               0,
                                               batch.baseElement);
                 break;
             }
             case DrawType::interiorTriangulation:
-            case DrawType::atlasBlit:
+            case DrawType::featherAtlasBlit:
             {
-                RIVE_PROF_GPUNAME("interiorTriangulation||atlasBlit");
+                RIVE_PROF_GPUNAME_L(2,
+                                    "interiorTriangulation||featherAtlasBlit");
                 cmdList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 cmdList->DrawInstanced(batch.elementCount,
@@ -1599,29 +1995,23 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
             }
             case DrawType::imageRect:
             {
-                RIVE_PROF_GPUNAME("imageRect");
+                RIVE_PROF_GPUNAME_L(2, "imageRect");
 
                 cmdList->IASetPrimitiveTopology(
                     D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 auto IBV = m_imageRectIndexBuffer->indexBufferView();
                 cmdList->IASetIndexBuffer(&IBV);
 
-                cmdList->SetGraphicsRootConstantBufferView(
-                    IMAGE_UNIFORM_BUFFFER_SIG_INDEX,
-                    m_imageDrawUniformBuffer->resource()
-                            ->getGPUVirtualAddress() +
-                        batch.imageDrawDataOffset);
-
-                cmdList->DrawIndexedInstanced(std::size(gpu::kImageRectIndices),
-                                              1,
+                cmdList->DrawIndexedInstanced(batch.indexCountPerInstance,
+                                              batch.elementCount,
+                                              batch.baseIndex,
                                               0,
-                                              0,
-                                              0);
+                                              batch.baseElement);
                 break;
             }
             case DrawType::imageMesh:
             {
-                RIVE_PROF_GPUNAME("imageMesh");
+                RIVE_PROF_GPUNAME_L(2, "imageMesh");
 
                 LITE_RTTI_CAST_OR_BREAK(vertexBuffer,
                                         RenderBufferD3D12Impl*,
@@ -1650,22 +2040,16 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                 auto IBV = iBuffer->indexBufferView();
                 cmdList->IASetIndexBuffer(&IBV);
 
-                cmdList->SetGraphicsRootConstantBufferView(
-                    IMAGE_UNIFORM_BUFFFER_SIG_INDEX,
-                    m_imageDrawUniformBuffer->resource()
-                            ->getGPUVirtualAddress() +
-                        batch.imageDrawDataOffset);
-
-                cmdList->DrawIndexedInstanced(batch.elementCount,
-                                              1,
-                                              batch.baseElement,
+                cmdList->DrawIndexedInstanced(batch.indexCountPerInstance,
+                                              batch.elementCount,
+                                              batch.baseIndex,
                                               0,
-                                              0);
+                                              batch.baseElement);
                 break;
             }
             case DrawType::renderPassResolve:
             {
-                RIVE_PROF_GPUNAME("renderPassResolve");
+                RIVE_PROF_GPUNAME_L(1, "renderPassResolve");
 
                 assert(desc.interlockMode == gpu::InterlockMode::atomics);
                 cmdList->IASetPrimitiveTopology(
@@ -1674,14 +2058,20 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
                 break;
             }
 
-            case DrawType::msaaStrokes:
-            case DrawType::msaaMidpointFanBorrowedCoverage:
-            case DrawType::msaaMidpointFans:
-            case DrawType::msaaMidpointFanStencilReset:
-            case DrawType::msaaMidpointFanPathsStencil:
-            case DrawType::msaaMidpointFanPathsCover:
-            case DrawType::msaaOuterCubics:
-            case DrawType::msaaStencilClipReset:
+            case DrawType::depthStrokes:
+            case DrawType::stencilMidpointFanBorrowedCoverage:
+            case DrawType::stencilDynamicMidpointFans:
+            case DrawType::stencilDynamicOuterCubics:
+            case DrawType::stencilMidpointFans:
+            case DrawType::stencilMidpointFanReset:
+            case DrawType::stencilMidpointFanWinding:
+            case DrawType::stencilMidpointFanCover:
+            case DrawType::stencilOuterCubicBorrowedCoverage:
+            case DrawType::stencilOuterCubicReset:
+            case DrawType::stencilOuterCubicWinding:
+            case DrawType::stencilOuterCubicCover:
+            case DrawType::stencilOuterCubics:
+            case DrawType::clipReset:
             case DrawType::renderPassInitialize:
                 RIVE_UNREACHABLE();
         }
@@ -1690,7 +2080,7 @@ void RenderContextD3D12Impl::flush(const FlushDescriptor& desc)
     if (desc.interlockMode == gpu::InterlockMode::rasterOrdering &&
         !renderTarget->targetTextureSupportsUAV())
     {
-        RIVE_PROF_GPUNAME("blit_sub_rect");
+        RIVE_PROF_GPUNAME_L(1, "blit_sub_rect");
 
         // We rendered to an offscreen UAV and did not resolve to the
         // renderTarget. Copy back to the main target.
@@ -1727,7 +2117,6 @@ void RenderContextD3D12Impl::postFlush(const RenderContext::FlushResources&)
 {
     // Recycle buffers.
     m_flushUniformBufferPool.recycle(std::move(m_flushUniformBuffer));
-    m_imageDrawUniformBufferPool.recycle(std::move(m_imageDrawUniformBuffer));
     m_pathBufferPool.recycle(std::move(m_pathBuffer));
     m_paintBufferPool.recycle(std::move(m_paintBuffer));
     m_paintAuxBufferPool.recycle(std::move(m_paintAuxBuffer));
@@ -1735,6 +2124,8 @@ void RenderContextD3D12Impl::postFlush(const RenderContext::FlushResources&)
     m_gradSpanBufferPool.recycle(std::move(m_gradSpanBuffer));
     m_tessSpanBufferPool.recycle(std::move(m_tessSpanBuffer));
     m_triangleBufferPool.recycle(std::move(m_triangleBuffer));
+    m_imageRectInstanceBufferPool.recycle(std::move(m_imageRectInstanceBuffer));
+    m_imageMeshInstanceBufferPool.recycle(std::move(m_imageMeshInstanceBuffer));
 
     m_srvUavCbvHeapPool.recycle(std::move(m_srvUavCbvHeap));
     m_cpuSrvUavCbvHeapPool.recycle(std::move(m_cpuSrvUavCbvHeap));

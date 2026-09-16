@@ -3,6 +3,9 @@
 #include "scripting_test_utilities.hpp"
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/lua/rive_lua_libs.hpp"
+#include "rive/scripted/scripted_data_converter.hpp"
+#include "rive/data_bind/data_values/data_value_number.hpp"
+#include "rive/data_bind/data_values/data_value_string.hpp"
 #include "rive/viewmodel/viewmodel_instance_string.hpp"
 #include "rive_file_reader.hpp"
 
@@ -346,6 +349,62 @@ end
     }
 }
 
+TEST_CASE("scripted converter survives Number<->String direction flips",
+          "[scripting]")
+{
+    ScriptingTest vm(
+        R"(type NumberToStringConverter = {}
+
+function convert(self: NumberToStringConverter, input: DataValueNumber): DataValueString
+  local result = DataValue.string()
+  result.value = tostring(math.round(input.value))
+  return result
+end
+
+function reverseConvert(self: NumberToStringConverter, input: DataValueString): DataValueNumber
+  local result = DataValue.number()
+  result.value = tonumber(input.value) or 0
+  return result
+end
+
+return function(): Converter<NumberToStringConverter, DataValueNumber, DataValueString>
+  return {
+    convert = convert,
+    reverseConvert = reverseConvert,
+  }
+end
+)");
+
+    // ScriptingTest leaves the factory function on top of the stack;
+    // ensureScriptInitialized consumes it to build m_self.
+    ScriptedDataConverter converter;
+    // Enable convert() (bit 10) and reverseConvert() (bit 11).
+    converter.implementedMethods((1 << 10) | (1 << 11));
+    REQUIRE(converter.dataConverts());
+    REQUIRE(converter.dataReverseConverts());
+    REQUIRE(
+        converter.ensureScriptInitialized(vm.vm(), refTopFunction(vm.state())));
+
+    // Flip directions repeatedly on the same converter instance. Each flip
+    // changes the type storeData<T> must produce; the buggy version crashed
+    // on the second call.
+    for (int i = 0; i < 3; i++)
+    {
+        DataValueNumber number(20000 + i);
+        auto forward = converter.convert(&number, nullptr);
+        REQUIRE(forward != nullptr);
+        REQUIRE(forward->is<DataValueString>());
+        CHECK(forward->as<DataValueString>()->value() ==
+              std::to_string(20000 + i));
+
+        DataValueString text(std::to_string(12345 + i));
+        auto reverse = converter.reverseConvert(&text, nullptr);
+        REQUIRE(reverse != nullptr);
+        REQUIRE(reverse->is<DataValueNumber>());
+        CHECK(reverse->as<DataValueNumber>()->value() == (float)(12345 + i));
+    }
+}
+
 TEST_CASE("scripted string converter", "[silver]")
 {
     rive::SerializingFactory silver;
@@ -404,4 +463,34 @@ TEST_CASE("scripted string converter", "[silver]")
     artboard->draw(renderer.get());
 
     CHECK(silver.matches("script_string_converter"));
+}
+
+TEST_CASE("Data converter with bound inputs in artboard and state machine",
+          "[silver]")
+{
+    SerializingFactory silver;
+    auto file =
+        ReadRiveFile("assets/scripted_data_converter_bound_input.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+
+    auto vmi = file->createDefaultViewModelInstance(artboard.get());
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+
+    silver.addFrame();
+
+    stateMachine->advanceAndApply(0.1f);
+
+    artboard->draw(renderer.get());
+
+    CHECK(silver.matches("scripted_data_converter_bound_input"));
 }

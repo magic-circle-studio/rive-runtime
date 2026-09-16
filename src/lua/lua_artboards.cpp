@@ -2,13 +2,16 @@
 #include "rive/lua/rive_lua_libs.hpp"
 #include "rive/file.hpp"
 #include "rive/artboard.hpp"
+#include "rive/animation/listener_invocation.hpp"
 #include "rive/animation/state_machine_instance.hpp"
+#include "rive/input/focus_manager.hpp"
 #include "rive/viewmodel/viewmodel_property_number.hpp"
 #include "rive/viewmodel/viewmodel_property_trigger.hpp"
 #include "rive/node.hpp"
 #include "rive/bones/root_bone.hpp"
 #include "rive/constraints/constraint.hpp"
 #include "rive/math/transform_components.hpp"
+#include "rive/shapes/path.hpp"
 
 #include <math.h>
 #include <stdio.h>
@@ -16,14 +19,27 @@
 using namespace rive;
 
 ScriptReffedArtboard::ScriptReffedArtboard(
-    rcp<File> file,
+    File* file,
     std::unique_ptr<ArtboardInstance>&& artboardInstance,
     rcp<ViewModelInstance> viewModelInstance,
-    rcp<DataContext> parentDataContext) :
+    rcp<DataContext> parentDataContext,
+    ScriptingContext* scriptingContext
+#ifdef WITH_RIVE_TOOLS
+    ,
+    rcp<File> filePin
+#endif
+    ) :
     m_file(file),
+#ifdef WITH_RIVE_TOOLS
+    m_filePin(std::move(filePin)),
+#endif
     m_artboard(std::move(artboardInstance)),
-    m_stateMachine(m_artboard->defaultStateMachine())
+    m_stateMachine(m_artboard->defaultStateMachine()),
+    m_scriptingContext(scriptingContext)
 {
+    // A scripted artboard is a root: nothing hosts it in another artboard's
+    // focus tree, so it owns its FocusManager and builds its own focus tree.
+    m_artboard->buildFocusTree(m_artboard->ensureFocusManager(), nullptr);
     if (viewModelInstance)
     {
         m_viewModelInstance = viewModelInstance;
@@ -45,10 +61,21 @@ ScriptReffedArtboard::ScriptReffedArtboard(
             m_stateMachine->bindViewModelInstance(m_viewModelInstance);
         }
     }
+    // Keep the bound instance tracked for end-of-frame advance for as long as
+    // this artboard uses it — even if the script drops its ScriptedViewModel
+    // wrapper. Covers both the passed-in and the auto-created instance.
+    if (m_scriptingContext != nullptr)
+    {
+        m_scriptingContext->trackViewModelInstance(m_viewModelInstance);
+    }
 }
 
 ScriptReffedArtboard::~ScriptReffedArtboard()
 {
+    if (m_scriptingContext != nullptr)
+    {
+        m_scriptingContext->untrackViewModelInstance(m_viewModelInstance.get());
+    }
     // Make sure state machine is deleted before artboard since
     // StateMachineInstance destructor accesses the artboard.
     m_stateMachine = nullptr;
@@ -57,7 +84,7 @@ ScriptReffedArtboard::~ScriptReffedArtboard()
     m_file = nullptr;
 }
 
-rive::rcp<rive::File> ScriptReffedArtboard::file() { return m_file; }
+rive::File* ScriptReffedArtboard::file() { return m_file; }
 
 Artboard* ScriptReffedArtboard::artboard() { return m_artboard.get(); }
 
@@ -72,7 +99,7 @@ static int artboard_draw(lua_State* L)
     auto scriptedRenderer = lua_torive<ScriptedRenderer>(L, 2);
 
     auto renderer = scriptedRenderer->validate(L);
-    scriptedArtboard->artboard()->draw(renderer);
+    scriptedArtboard->artboard()->drawInternal(renderer);
 
     return 0;
 }
@@ -82,7 +109,9 @@ bool ScriptedArtboard::advance(float seconds)
     auto machine = stateMachine();
     if (machine)
     {
-        return machine->advanceAndApply(seconds);
+        // A scripted artboard's view models are advanced/reset by the host
+        // frame, not by this script-driven advance, so skip the VM consume.
+        return machine->advanceAndApply(seconds, false);
     }
     else
     {
@@ -120,6 +149,52 @@ static int apply_pointer_event(lua_State* L, int atom)
                     pointerEvent->m_position,
                     pointerEvent->m_id);
                 break;
+        }
+    }
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+static int apply_gamepad_event(lua_State* L, int atom)
+{
+    auto scriptedArtboard = lua_torive<ScriptedArtboard>(L, 1);
+    auto result = 0;
+    auto stateMachine = scriptedArtboard->stateMachine();
+    if (stateMachine)
+    {
+        auto dispatch = [&](const ListenerInvocation& invocation) {
+            ScriptedDrawable* dispatched = nullptr;
+            if (auto* fm = stateMachine->focusManager())
+            {
+                (void)fm->gamepadDispatch(invocation, &dispatched);
+            }
+            result = (int)stateMachine->broadcastGamepadToScriptedDrawables(
+                invocation,
+                dispatched);
+        };
+        switch (atom)
+        {
+            case (int)LuaAtoms::gamepadConnected:
+            {
+                auto* connected = lua_torive<ScriptedGamepadConnected>(L, 2);
+                dispatch(ListenerInvocation::gamepadConnected(
+                    connected->m_snapshot));
+                break;
+            }
+            case (int)LuaAtoms::gamepadEvent:
+            {
+                auto* event = lua_torive<ScriptedGamepadEvent>(L, 2);
+                dispatch(ListenerInvocation::gamepadEvent(event->m_data));
+                break;
+            }
+            case (int)LuaAtoms::gamepadDisconnected:
+            {
+                auto* disconnected =
+                    lua_torive<ScriptedGamepadDisconnected>(L, 2);
+                dispatch(ListenerInvocation::gamepadDisconnected(
+                    disconnected->m_deviceId));
+                break;
+            }
         }
     }
     lua_pushinteger(L, result);
@@ -223,6 +298,12 @@ static int artboard_namecall(lua_State* L)
             {
                 return apply_pointer_event(L, atom);
             }
+            case (int)LuaAtoms::gamepadEvent:
+            case (int)LuaAtoms::gamepadConnected:
+            case (int)LuaAtoms::gamepadDisconnected:
+            {
+                return apply_gamepad_event(L, atom);
+            }
         }
     }
 
@@ -259,12 +340,18 @@ int ScriptedArtboard::instance(lua_State* L,
 {
     auto artboardInstance = artboard()->instance();
     artboardInstance->frameOrigin(false);
+    // Clones share the source's dependency on a cross-lifetime host file.
     lua_newrive<ScriptedArtboard>(L,
                                   L,
                                   m_scriptReffedArtboard->file(),
                                   std::move(artboardInstance),
                                   viewModelInstance,
-                                  m_dataContext);
+                                  m_dataContext
+#ifdef WITH_RIVE_TOOLS
+                                  ,
+                                  m_scriptReffedArtboard->filePin()
+#endif
+    );
     return 1;
 }
 
@@ -300,6 +387,32 @@ const ShapePaint* ScriptedNode::shapePaint()
         return m_component->as<ShapePaint>();
     }
     return nullptr;
+}
+
+// Direct field getters bypass the __index Lua frame. They are dispatched by
+// LOP_GETTABLEKS via global_State::udatadirectfields[tag]. Only fields that
+// read a primitive without allocation or side effects belong here; the
+// __index slow path still handles every other key.
+
+static void artboard_direct_width(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedArtboard*)udata)->artboard()->width());
+}
+
+static void artboard_direct_height(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedArtboard*)udata)->artboard()->height());
+}
+
+static void artboard_direct_frameOrigin(void* udata, void* result)
+{
+    lua_userdatadirectfield_setboolean(
+        result,
+        ((ScriptedArtboard*)udata)->artboard()->frameOrigin() ? 1 : 0);
 }
 
 static int artboard_index(lua_State* L)
@@ -378,16 +491,27 @@ static int artboard_newindex(lua_State* L)
 
 ScriptedArtboard::ScriptedArtboard(
     lua_State* L,
-    rcp<File> file,
+    File* file,
     std::unique_ptr<ArtboardInstance>&& artboardInstance,
     rcp<ViewModelInstance> viewModelInstance,
-    rcp<DataContext> dataContext) :
+    rcp<DataContext> dataContext
+#ifdef WITH_RIVE_TOOLS
+    ,
+    rcp<File> filePin
+#endif
+    ) :
     m_state(L),
-    m_scriptReffedArtboard(
-        make_rcp<ScriptReffedArtboard>(file,
-                                       std::move(artboardInstance),
-                                       viewModelInstance,
-                                       dataContext)),
+    m_scriptReffedArtboard(make_rcp<ScriptReffedArtboard>(
+        file,
+        std::move(artboardInstance),
+        viewModelInstance,
+        dataContext,
+        static_cast<ScriptingContext*>(lua_getthreaddata(L))
+#ifdef WITH_RIVE_TOOLS
+            ,
+        std::move(filePin)
+#endif
+            )),
     m_dataContext(dataContext)
 {}
 
@@ -442,6 +566,67 @@ int ScriptedAnimation::setTime(std::string mode)
     m_animation->time(m_animation->animation()->globalToLocalSeconds(seconds));
     m_animation->apply();
     return 0;
+}
+
+static void node_direct_x(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(result,
+                                      ((ScriptedNode*)udata)->component()->x());
+}
+
+static void node_direct_y(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(result,
+                                      ((ScriptedNode*)udata)->component()->y());
+}
+
+static void node_direct_rotation(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedNode*)udata)->component()->rotation());
+}
+
+static void node_direct_scaleX(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedNode*)udata)->component()->scaleX());
+}
+
+static void node_direct_scaleY(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedNode*)udata)->component()->scaleY());
+}
+
+static void node_direct_position(void* udata, void* result)
+{
+    auto component = ((ScriptedNode*)udata)->component();
+    lua_userdatadirectfield_setvector(result,
+                                      component->x(),
+                                      component->y(),
+                                      0.0f
+#if LUA_VECTOR_SIZE == 4
+                                      ,
+                                      0.0f
+#endif
+    );
+}
+
+static void node_direct_scale(void* udata, void* result)
+{
+    auto component = ((ScriptedNode*)udata)->component();
+    lua_userdatadirectfield_setvector(result,
+                                      component->scaleX(),
+                                      component->scaleY(),
+                                      0.0f
+#if LUA_VECTOR_SIZE == 4
+                                      ,
+                                      0.0f
+#endif
+    );
 }
 
 static int node_index(lua_State* L)
@@ -730,6 +915,12 @@ static int node_namecall(lua_State* L)
     return 0;
 }
 
+static void animation_direct_duration(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(result,
+                                      ((ScriptedAnimation*)udata)->duration());
+}
+
 static int animation_index(lua_State* L)
 {
     int atom;
@@ -803,6 +994,19 @@ int luaopen_rive_artboards(lua_State* L)
     lua_setreadonly(L, -1, true);
     lua_pop(L, 1); // pop the metatable
 
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedArtboard::luaTag,
+                                       "width",
+                                       artboard_direct_width);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedArtboard::luaTag,
+                                       "height",
+                                       artboard_direct_height);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedArtboard::luaTag,
+                                       "frameOrigin",
+                                       artboard_direct_frameOrigin);
+
     lua_register_rive<ScriptedNode>(L);
 
     lua_pushcfunction(L, node_index, nullptr);
@@ -817,6 +1021,35 @@ int luaopen_rive_artboards(lua_State* L)
     lua_setreadonly(L, -1, true);
     lua_pop(L, 1); // pop the metatable
 
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "x",
+                                       node_direct_x);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "y",
+                                       node_direct_y);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "rotation",
+                                       node_direct_rotation);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "scaleX",
+                                       node_direct_scaleX);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "scaleY",
+                                       node_direct_scaleY);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "position",
+                                       node_direct_position);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedNode::luaTag,
+                                       "scale",
+                                       node_direct_scale);
+
     lua_register_rive<ScriptedAnimation>(L);
     lua_pushcfunction(L, animation_index, nullptr);
     lua_setfield(L, -2, "__index");
@@ -824,6 +1057,11 @@ int luaopen_rive_artboards(lua_State* L)
     lua_pushcfunction(L, animation_namecall, nullptr);
     lua_setfield(L, -2, "__namecall");
     lua_pop(L, 1); // pop the metatable
+
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedAnimation::luaTag,
+                                       "duration",
+                                       animation_direct_duration);
 
     return 0;
 }

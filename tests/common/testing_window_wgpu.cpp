@@ -12,8 +12,9 @@ TestingWindow* TestingWindow::MakeWGPU(const BackendParams&) { return nullptr; }
 
 #include "common/offscreen_render_target.hpp"
 #include "rive/renderer/rive_renderer.hpp"
-#include "rive/renderer/rive_render_image.hpp"
 #include "rive/renderer/webgpu/render_context_webgpu_impl.hpp"
+
+#include <algorithm>
 
 #ifdef RIVE_WAGYU
 #include <webgpu/webgpu_wagyu.h>
@@ -80,8 +81,28 @@ public:
         m_instance = wgpu::CreateInstance(nullptr);
         assert(m_instance);
 
+        wgpu::RequestAdapterOptions requestAdapterOptions = {
+            .powerPreference =
+                backendParams.gpuNameFilter == "i" ||
+                        backendParams.gpuNameFilter == "integrated"
+                    ? wgpu::PowerPreference::LowPower
+                    : wgpu::PowerPreference::HighPerformance,
+        };
+
+#ifdef RIVE_WAGYU
+        // Wagyu's OpenGL ES backend requires WebGPU compatibility mode.
+        const bool compatibilityMode =
+            wgpuWagyuInstanceGetBackend(m_instance.Get()) ==
+            WGPUBackendType_OpenGLES;
+        if (compatibilityMode)
+        {
+            requestAdapterOptions.featureLevel =
+                wgpu::FeatureLevel::Compatibility;
+        }
+#endif
+
         m_instance.RequestAdapter(
-            {},
+            &requestAdapterOptions,
             wgpu::CallbackMode::AllowSpontaneous,
             [](wgpu::RequestAdapterStatus status,
                wgpu::Adapter adapter,
@@ -96,8 +117,56 @@ public:
             emscripten_sleep(1);
         }
 
+        wgpu::DeviceDescriptor deviceDesc = {};
+#ifdef RIVE_WAGYU
+        wgpu::Limits requiredLimits = {};
+        wgpu::CompatibilityModeLimits compatLimits = {};
+        if (compatibilityMode)
+        {
+            // Rive uses storage buffers in the vertex shader. In compatibility
+            // mode this isn't allowed by default, so explicitly request it if
+            // supported. Otherwise, the renderer can fall back to polyfilling
+            // vertex storage buffers via textures.
+            wgpu::Limits adapterLimits = {};
+            wgpu::CompatibilityModeLimits adapterCompatLimits = {};
+            adapterLimits.nextInChain = &adapterCompatLimits;
+            m_adapter.GetLimits(&adapterLimits);
+
+            if (adapterCompatLimits.maxStorageBuffersInVertexStage !=
+                wgpu::kLimitU32Undefined)
+            {
+                compatLimits.maxStorageBuffersInVertexStage =
+                    std::min<uint32_t>(
+                        gpu::kMaxStorageBuffers,
+                        adapterCompatLimits.maxStorageBuffersInVertexStage);
+                requiredLimits.nextInChain = &compatLimits;
+                deviceDesc.requiredLimits = &requiredLimits;
+            }
+        }
+#endif
+
+        std::vector<wgpu::FeatureName> requiredFeatures;
+#ifdef RIVE_WAGYU
+        // Request coherent advanced blend when the adapter advertises it. This
+        // enables Rive to take the "supportsBlendAdvancedCoherentKHR" path on
+        // MSAA, and skip the framebuffer copies and renderPass interruptions
+        // for advanced blend.
+        if (m_adapter.HasFeature(static_cast<wgpu::FeatureName>(
+                WGPUFeatureName_WagyuBlendEquationAdvancedCoherent)))
+        {
+            requiredFeatures.push_back(static_cast<wgpu::FeatureName>(
+                WGPUFeatureName_WagyuBlendEquationAdvancedCoherent));
+        }
+#endif
+        if (m_adapter.HasFeature(wgpu::FeatureName::ClipDistances))
+        {
+            requiredFeatures.push_back(wgpu::FeatureName::ClipDistances);
+        }
+        deviceDesc.requiredFeatureCount = requiredFeatures.size();
+        deviceDesc.requiredFeatures = requiredFeatures.data();
+
         m_adapter.RequestDevice(
-            {},
+            &deviceDesc,
             wgpu::CallbackMode::AllowSpontaneous,
             [](wgpu::RequestDeviceStatus status,
                wgpu::Device device,
@@ -149,11 +218,26 @@ public:
             wgpu::SurfaceConfiguration conf = {
                 .device = m_device,
                 .format = m_format,
+#ifndef RIVE_WAGYU
+                // CopySrc so endFrame can read pixels back from the canvas
+                // texture; CopyDst so the overflow texture can be blitted in.
+                .usage = wgpu::TextureUsage::RenderAttachment |
+                         wgpu::TextureUsage::CopySrc |
+                         wgpu::TextureUsage::CopyDst,
+                .width = static_cast<uint32_t>(m_width),
+                .height = static_cast<uint32_t>(m_height),
+                // Opaque so that pixels with alpha are more obvious, rather
+                // than being composited into the browser below.
+                .alphaMode = wgpu::CompositeAlphaMode::Opaque,
+#endif
             };
             m_surface.Configure(&conf);
         }
 
         RenderContextWebGPUImpl::ContextOptions contextOptions;
+#ifdef RIVE_WAGYU
+        contextOptions.compatibilityMode = compatibilityMode;
+#endif
         m_renderContext = RenderContextWebGPUImpl::MakeContext(m_adapter,
                                                                m_device,
                                                                m_queue,
@@ -161,12 +245,39 @@ public:
 
         wgpu::AdapterInfo adapterInfo;
         m_adapter.GetInfo(&adapterInfo);
-        printf("==== WGPU device: %s %s %s (%s, %s) ====\n",
+        printf("==== WGPU device: %.*s %.*s %.*s (%s",
+               static_cast<int>(adapterInfo.vendor.length),
                adapterInfo.vendor.data,
+               static_cast<int>(adapterInfo.device.length),
                adapterInfo.device.data,
+               static_cast<int>(adapterInfo.description.length),
                adapterInfo.description.data,
-               wgpu_backend_name(impl()->capabilities().backendType),
-               pls_impl_name(impl()->capabilities()));
+               wgpu_backend_name(impl()->capabilities().backendType));
+#ifdef RIVE_WAGYU
+        switch (impl()->capabilities().plsType)
+        {
+            case RenderContextWebGPUImpl::PixelLocalStorageType::
+                GL_EXT_shader_pixel_local_storage:
+                printf(", GL_EXT_shader_pixel_local_storage");
+                break;
+            case RenderContextWebGPUImpl::PixelLocalStorageType::
+                VK_EXT_rasterization_order_attachment_access:
+                printf(", VK_EXT_rasterization_order_attachment_access");
+                break;
+            case RenderContextWebGPUImpl::PixelLocalStorageType::none:
+                break;
+        }
+#endif
+        if (m_renderContext->platformFeatures()
+                .supportsBlendAdvancedCoherentKHR)
+        {
+            printf(", WagyuBlendEquationAdvancedCoherent");
+        }
+        if (m_renderContext->platformFeatures().supportsClipPlanes)
+        {
+            printf(", WGPUFeatureName_ClipDistances");
+        }
+        printf(") ====\n");
     }
 
     rive::Factory* factory() override { return m_renderContext.get(); }
@@ -194,6 +305,25 @@ public:
             m_overflowTextureView = {};
             m_pixelReadBuff = {};
             TestingWindow::resize(width, height);
+
+#ifndef RIVE_WAGYU
+            // Match the canvas drawing buffer to the new size and
+            // reconfigure the surface. Without this the canvas keeps its
+            // default backing size and only a corner is ever presented.
+            emscripten_set_canvas_element_size("#canvas", width, height);
+            wgpu::SurfaceConfiguration conf = {
+                .device = m_device,
+                .format = m_format,
+                .usage = wgpu::TextureUsage::RenderAttachment |
+                         wgpu::TextureUsage::CopySrc |
+                         wgpu::TextureUsage::CopyDst |
+                         wgpu::TextureUsage::TextureBinding,
+                .width = static_cast<uint32_t>(width),
+                .height = static_cast<uint32_t>(height),
+                .alphaMode = wgpu::CompositeAlphaMode::Opaque,
+            };
+            m_surface.Configure(&conf);
+#endif
         }
     }
 
@@ -223,7 +353,8 @@ public:
             {
                 wgpu::TextureDescriptor overflowTextureDesc = {
                     .usage = wgpu::TextureUsage::RenderAttachment |
-                             wgpu::TextureUsage::CopySrc,
+                             wgpu::TextureUsage::CopySrc |
+                             wgpu::TextureUsage::TextureBinding,
                     .dimension = wgpu::TextureDimension::e2D,
                     .size = {m_width, m_height},
                     .format = m_format,
@@ -258,8 +389,9 @@ public:
                               ? rive::gpu::LoadAction::clear
                               : rive::gpu::LoadAction::preserveRenderTarget,
             .clearColor = options.clearColor,
-            .msaaSampleCount = m_backendParams.msaa ? 4u : 0u,
+            .msaaSampleCount = m_backendParams.msaaSampleCount,
             .disableRasterOrdering = options.disableRasterOrdering,
+            .triangulationThresholds = options.triangulationThresholds,
             .wireframe = options.wireframe,
             .fillsDisabled = options.fillsDisabled,
             .strokesDisabled = options.strokesDisabled,
@@ -275,7 +407,9 @@ public:
     {
         wgpu::CommandEncoder encoder = m_device.CreateCommandEncoder();
         m_renderContext->flush({
-            .renderTarget = m_renderTarget.get(),
+            .renderTarget = offscreenRenderTarget != nullptr
+                                ? offscreenRenderTarget
+                                : m_renderTarget.get(),
             .externalCommandBuffer = encoder.Get(),
         });
         wgpu::CommandBuffer commands = encoder.Finish();
@@ -436,6 +570,35 @@ public:
         m_currentCanvasTexture = {};
     }
 
+    void* getCurrentCommandBuffer() const override { return &m_oreEncoder; }
+
+    void* getOreContext() const override
+    {
+        return m_renderContext->getOreContext();
+    }
+
+    void beginOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+        m_oreEncoder = m_device.CreateCommandEncoder();
+
+        // Ore move-takes the encoder, pass a copy so we retain our ref.
+        wgpu::CommandEncoder borrowed = m_oreEncoder;
+        oreContext->beginFrame({.externalCommandBuffer = &borrowed});
+    }
+
+    void endOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+        oreContext->endFrame();
+
+        wgpu::CommandBuffer commands = m_oreEncoder.Finish();
+        m_queue.Submit(1, &commands);
+        m_oreEncoder = nullptr;
+    }
+
 private:
     RenderContextWebGPUImpl* impl() const
     {
@@ -455,10 +618,11 @@ private:
     wgpu::Texture m_overflowTexture;
     wgpu::TextureView m_overflowTextureView;
     wgpu::Buffer m_pixelReadBuff;
+    mutable wgpu::CommandEncoder m_oreEncoder;
 
     std::unique_ptr<RenderContext> m_renderContext;
     rcp<RenderTargetWebGPU> m_renderTarget;
-};
+}; // namespace rive::gpu
 }; // namespace rive::gpu
 
 TestingWindow* TestingWindow::MakeWGPU(const BackendParams& backendParams)

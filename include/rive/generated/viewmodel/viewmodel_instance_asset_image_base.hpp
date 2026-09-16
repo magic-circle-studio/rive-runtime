@@ -20,6 +20,7 @@ public:
             case ViewModelInstanceAssetImageBase::typeKey:
             case ViewModelInstanceAssetBase::typeKey:
             case ViewModelInstanceValueBase::typeKey:
+            case ComponentBase::typeKey:
                 return true;
             default:
                 return false;
@@ -29,8 +30,6 @@ public:
     uint16_t coreType() const override { return typeKey; }
 
     Core* clone() const override;
-
-protected:
 };
 } // namespace rive
 

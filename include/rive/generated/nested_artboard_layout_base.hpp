@@ -58,8 +58,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceWidthPropertyKey,
+                             &m_InstanceWidth,
+                             &value);
         m_InstanceWidth = value;
-        instanceWidthChanged();
+        RIVE_EDITOR_CHANGED(instanceWidthChanged());
+        notifyPropertyChanged(instanceWidthPropertyKey);
     }
 
     inline float instanceHeight() const { return m_InstanceHeight; }
@@ -69,8 +73,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceHeightPropertyKey,
+                             &m_InstanceHeight,
+                             &value);
         m_InstanceHeight = value;
-        instanceHeightChanged();
+        RIVE_EDITOR_CHANGED(instanceHeightChanged());
+        notifyPropertyChanged(instanceHeightPropertyKey);
     }
 
     inline uint32_t instanceWidthUnitsValue() const
@@ -83,8 +91,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceWidthUnitsValuePropertyKey,
+                             &m_InstanceWidthUnitsValue,
+                             &value);
         m_InstanceWidthUnitsValue = value;
-        instanceWidthUnitsValueChanged();
+        RIVE_EDITOR_CHANGED(instanceWidthUnitsValueChanged());
+        notifyPropertyChanged(instanceWidthUnitsValuePropertyKey);
     }
 
     inline uint32_t instanceHeightUnitsValue() const
@@ -97,8 +109,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceHeightUnitsValuePropertyKey,
+                             &m_InstanceHeightUnitsValue,
+                             &value);
         m_InstanceHeightUnitsValue = value;
-        instanceHeightUnitsValueChanged();
+        RIVE_EDITOR_CHANGED(instanceHeightUnitsValueChanged());
+        notifyPropertyChanged(instanceHeightUnitsValuePropertyKey);
     }
 
     inline uint32_t instanceWidthScaleType() const
@@ -111,8 +127,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceWidthScaleTypePropertyKey,
+                             &m_InstanceWidthScaleType,
+                             &value);
         m_InstanceWidthScaleType = value;
-        instanceWidthScaleTypeChanged();
+        RIVE_EDITOR_CHANGED(instanceWidthScaleTypeChanged());
+        notifyPropertyChanged(instanceWidthScaleTypePropertyKey);
     }
 
     inline uint32_t instanceHeightScaleType() const
@@ -125,8 +145,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(instanceHeightScaleTypePropertyKey,
+                             &m_InstanceHeightScaleType,
+                             &value);
         m_InstanceHeightScaleType = value;
-        instanceHeightScaleTypeChanged();
+        RIVE_EDITOR_CHANGED(instanceHeightScaleTypeChanged());
+        notifyPropertyChanged(instanceHeightScaleTypePropertyKey);
     }
 
     Core* clone() const override;
@@ -174,6 +198,9 @@ protected:
     virtual void instanceHeightUnitsValueChanged() {}
     virtual void instanceWidthScaleTypeChanged() {}
     virtual void instanceHeightScaleTypeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/nested_artboard_layout_ext.inl"
+#endif
 };
 } // namespace rive
 

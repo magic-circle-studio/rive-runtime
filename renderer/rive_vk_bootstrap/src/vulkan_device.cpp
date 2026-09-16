@@ -2,6 +2,7 @@
  * Copyright 2025 Rive
  */
 
+#include <algorithm>
 #include <string>
 #include <sstream>
 #include "rive/renderer/vulkan/vkutil.hpp"
@@ -36,7 +37,7 @@ static const char* physicalDeviceTypeName(VkPhysicalDeviceType type)
 VulkanDevice::DriverVersion unpackDriverVersion(
     const VkPhysicalDeviceProperties& props)
 {
-    if (props.vendorID == VULKAN_VENDOR_NVIDIA)
+    if (props.vendorID == rive::gpu::vkutil::vendors::NVIDIA)
     {
         // NVidia uses 10|8|8|6 encoding for driver version. We'll ignore the
         // fourth version section.
@@ -47,7 +48,7 @@ VulkanDevice::DriverVersion unpackDriverVersion(
         };
     }
 #ifdef _WIN32
-    else if (props.vendorID == VULKAN_VENDOR_INTEL)
+    else if (props.vendorID == rive::gpu::vkutil::vendors::Intel)
     {
         return {
             .major = props.driverVersion >> 14,
@@ -121,6 +122,13 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
         // We use wireframe for debugging, so enable it even in core mode
         .fillModeNonSolid = supportedFeatures.fillModeNonSolid,
 
+        // VkPhysicalDeviceFeatures field order: textureCompression* must
+        // come before fragmentStoresAndAtomics (-Wreorder-init-list).
+        .textureCompressionETC2 = supportedFeatures.textureCompressionETC2,
+        .textureCompressionASTC_LDR =
+            supportedFeatures.textureCompressionASTC_LDR,
+        .textureCompressionBC = supportedFeatures.textureCompressionBC,
+
         // Always enable this
         .fragmentStoresAndAtomics = supportedFeatures.fragmentStoresAndAtomics,
 
@@ -129,12 +137,24 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
     };
 
     m_riveVulkanFeatures = {
-        .apiVersion = findResult->deviceAPIVersion,
+        // The version actually in effect, not the device's ceiling: core
+        // features are only usable when the instance asked for them too, and
+        // the effective version is the lesser of the two.
+        // NOTE: instance.apiVersion() is "opts.idealAPIVersion" verbatim --
+        // clamped only if the loader itself is pre-1.1, never against the
+        // physical device.
+        .apiVersion =
+            std::min(instance.apiVersion(), findResult->deviceAPIVersion),
         .independentBlend = bool(requestedFeatures.independentBlend),
         .fillModeNonSolid = bool(requestedFeatures.fillModeNonSolid),
         .fragmentStoresAndAtomics =
             bool(requestedFeatures.fragmentStoresAndAtomics),
         .shaderClipDistance = bool(requestedFeatures.shaderClipDistance),
+        .textureCompressionBC = bool(requestedFeatures.textureCompressionBC),
+        .textureCompressionASTC_LDR =
+            bool(requestedFeatures.textureCompressionASTC_LDR),
+        .textureCompressionETC2 =
+            bool(requestedFeatures.textureCompressionETC2),
     };
 
     DEFINE_AND_LOAD_INSTANCE_FUNC_OR_RETURN(
@@ -181,6 +201,8 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
         rasterOrderFeatures;
     std::optional<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT>
         interlockFeatures;
+    std::optional<VkPhysicalDeviceColorWriteEnableFeaturesEXT>
+        colorWriteEnableFeatures;
 
     if (!opts.coreFeaturesOnly)
     {
@@ -190,6 +212,10 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
         interlockFeatures = tryEnableInterlockFeatures(instance,
                                                        supportedExtensions,
                                                        addedExtensions);
+        colorWriteEnableFeatures =
+            tryEnableColorWriteEnableFeatures(instance,
+                                              supportedExtensions,
+                                              addedExtensions);
     }
 
     // Get our list of queue family properties.
@@ -255,6 +281,12 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
         interlockFeatures.value().pNext =
             const_cast<void*>(deviceCreateInfo.pNext);
         deviceCreateInfo.pNext = &interlockFeatures.value();
+    }
+    if (colorWriteEnableFeatures.has_value())
+    {
+        colorWriteEnableFeatures.value().pNext =
+            const_cast<void*>(deviceCreateInfo.pNext);
+        deviceCreateInfo.pNext = &colorWriteEnableFeatures.value();
     }
 
     DEFINE_AND_LOAD_INSTANCE_FUNC_OR_RETURN(vkCreateDevice, instance);
@@ -337,6 +369,8 @@ VulkanDevice::VulkanDevice(VulkanInstance& instance,
                    *commaSeparator);
         if (m_riveVulkanFeatures.fragmentShaderPixelInterlock)
             printf("%sfragmentShaderPixelInterlock", *commaSeparator);
+        if (m_riveVulkanFeatures.colorWriteEnable)
+            printf("%scolorWriteEnable", *commaSeparator);
         if (m_riveVulkanFeatures.VK_KHR_portability_subset)
             printf("%sVK_KHR_portability_subset", *commaSeparator);
         printf(" ] ====\n");
@@ -687,6 +721,45 @@ std::optional<VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT> VulkanDevice::
             // feature set we want, it's supported!
             m_riveVulkanFeatures.fragmentShaderPixelInterlock = true;
             return requestedInterlockFeatures;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<VkPhysicalDeviceColorWriteEnableFeaturesEXT> VulkanDevice::
+    tryEnableColorWriteEnableFeatures(
+        VulkanInstance& instance,
+        const std::vector<VkExtensionProperties>& supportedExtensions,
+        std::vector<const char*>& extensions)
+{
+    if (addExtensionIfSupported(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
+                                supportedExtensions,
+                                extensions))
+    {
+        constexpr static VkPhysicalDeviceColorWriteEnableFeaturesEXT
+            requestedColorWriteEnableFeatures = {
+                .sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COLOR_WRITE_ENABLE_FEATURES_EXT,
+                .colorWriteEnable = VK_TRUE,
+            };
+
+        auto testedColorWriteEnableFeatures = requestedColorWriteEnableFeatures;
+
+        // Test to see if this is supported
+        VkPhysicalDeviceFeatures2 features = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &testedColorWriteEnableFeatures,
+        };
+
+        if (instance.tryGetPhysicalDeviceFeatures2(m_physicalDevice,
+                                                   &features) &&
+            testedColorWriteEnableFeatures.colorWriteEnable)
+        {
+            // The query came back with the requested flag set so return the
+            // feature set we want, it's supported!
+            m_riveVulkanFeatures.colorWriteEnable = true;
+            return requestedColorWriteEnableFeatures;
         }
     }
 

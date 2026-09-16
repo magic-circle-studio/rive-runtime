@@ -43,8 +43,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_STRING_CHANGING(valuePropertyKey, m_Value, value);
         m_Value = value;
-        valueChanged();
+        RIVE_EDITOR_CHANGED(valueChanged());
+        notifyPropertyChanged(valuePropertyKey);
     }
 
     Core* clone() const override;
@@ -67,6 +69,9 @@ public:
 
 protected:
     virtual void valueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/transition_value_string_comparator_ext.inl"
+#endif
 };
 } // namespace rive
 

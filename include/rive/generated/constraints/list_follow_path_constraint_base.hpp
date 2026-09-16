@@ -47,8 +47,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distanceEndPropertyKey, &m_DistanceEnd, &value);
         m_DistanceEnd = value;
-        distanceEndChanged();
+        RIVE_EDITOR_CHANGED(distanceEndChanged());
+        notifyPropertyChanged(distanceEndPropertyKey);
     }
 
     inline float distanceOffset() const { return m_DistanceOffset; }
@@ -58,8 +60,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distanceOffsetPropertyKey,
+                             &m_DistanceOffset,
+                             &value);
         m_DistanceOffset = value;
-        distanceOffsetChanged();
+        RIVE_EDITOR_CHANGED(distanceOffsetChanged());
+        notifyPropertyChanged(distanceOffsetPropertyKey);
     }
 
     Core* clone() const override;
@@ -87,6 +93,9 @@ public:
 protected:
     virtual void distanceEndChanged() {}
     virtual void distanceOffsetChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/list_follow_path_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

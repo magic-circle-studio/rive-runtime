@@ -43,8 +43,10 @@ public:
     };
 
     Draw(IAABB pixelBounds,
-         const Mat2D&,
+         const Mat2D& paintMatrix,
+         const Mat2D* imageMatrix,
          BlendMode,
+         float additiveness,
          rcp<Texture> imageTexture,
          ImageSampler imageSampler,
          Type);
@@ -52,15 +54,42 @@ public:
     Texture* imageTexture() const { return m_imageTextureRef; }
     ImageSampler imageSampler() const { return m_imageSampler; }
     const IAABB& pixelBounds() const { return m_pixelBounds; }
-    const Mat2D& matrix() const { return m_matrix; }
+    const IAABB& clippedPixelBounds() const { return m_clippedPixelBounds; }
+    const std::optional<IAABB>& clippingPixelBounds() const
+    {
+        return m_clippingPixelBounds;
+    }
+    const Mat2D& paintMatrix() const { return m_paintMatrix; }
+    const Mat2D& imageMatrix() const { return m_imageMatrix; }
     BlendMode blendMode() const { return m_blendMode; }
+    float additiveness() const { return m_additiveness; }
     Type type() const { return m_type; }
     gpu::DrawContents drawContents() const { return m_drawContents; }
     bool isOpaque() const
     {
-        return m_drawContents & gpu::DrawContents::opaquePaint;
+        return enums::is_flag_set(m_drawContents,
+                                  gpu::DrawContents::opaquePaint);
     }
+    bool isClipUpdate() const
+    {
+        return enums::is_flag_set(m_drawContents,
+                                  gpu::DrawContents::clipUpdate);
+    }
+    bool hasActiveClip() const
+    {
+        return enums::is_flag_set(m_drawContents,
+                                  gpu::DrawContents::activeClip);
+    }
+    bool hasAdvancedBlend() const
+    {
+        return enums::is_flag_set(m_drawContents,
+                                  gpu::DrawContents::advancedBlend);
+    }
+
+    bool hasImageTexture() const { return m_imageTextureRef != nullptr; }
+
     uint32_t clipID() const { return m_clipID; }
+    std::optional<AABBu16> scissorRect() const { return m_scissorRect; }
     bool hasClipRect() const { return m_clipRectInverseMatrix != nullptr; }
     const gpu::ClipRectInverseMatrix* clipRectInverseMatrix() const
     {
@@ -73,10 +102,16 @@ public:
 
     // Clipping setup.
     void setClipID(uint32_t clipID);
-    void setClipRect(const gpu::ClipRectInverseMatrix* m)
+    void setClipRect(const gpu::ClipRectInverseMatrix* m,
+                     IAABB clippingPixelBounds)
     {
         m_clipRectInverseMatrix = m;
+        m_clippingPixelBounds = clippingPixelBounds;
+        m_clippedPixelBounds =
+            m_clippedPixelBounds.intersect(clippingPixelBounds);
     }
+
+    void setScissorRect(AABBu16 rect) { m_scissorRect = rect; }
 
     // Used to allocate GPU resources for a collection of draws.
     using ResourceCounters = RenderContext::LogicalFlush::ResourceCounters;
@@ -106,7 +141,7 @@ public:
     const Draw* nextDstRead() const { return m_nextDstRead; }
 
     // Finalizes m_prepassCount and m_subpassCount.
-    virtual void countSubpasses()
+    virtual void countSubpasses(const gpu::PlatformFeatures&)
     {
         // The subclass must set m_prepassCount and m_subpassCount in this call
         // if they are not 0 & 1.
@@ -130,8 +165,8 @@ public:
     //
     // NOTE: Subpasses are not necessarily rendered one after the other.
     // Separate, non-overlapping draws may have gotten sorted between subpasses.
-    virtual void pushToRenderContext(RenderContext::LogicalFlush*,
-                                     int subpassIndex) = 0;
+    virtual gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
+                                                int subpassIndex) = 0;
 
     // We can't have a destructor because we're block-allocated. Instead, the
     // client calls this method before clearing the drawList to release all our
@@ -142,12 +177,17 @@ protected:
     Texture* const m_imageTextureRef;
     const ImageSampler m_imageSampler;
     const IAABB m_pixelBounds;
-    const Mat2D m_matrix;
+    const Mat2D m_paintMatrix;
+    const Mat2D m_imageMatrix;
     const BlendMode m_blendMode;
+    const float m_additiveness;
     const Type m_type;
+    IAABB m_clippedPixelBounds;
+    std::optional<IAABB> m_clippingPixelBounds;
 
     uint32_t m_clipID = 0;
     const gpu::ClipRectInverseMatrix* m_clipRectInverseMatrix = nullptr;
+    std::optional<AABBu16> m_scissorRect;
 
     gpu::DrawContents m_drawContents = gpu::DrawContents::none;
 
@@ -176,6 +216,7 @@ protected:
     // WebGL msaa), this is a linked list of all the draws from a single batch
     // whose bounding boxes needs to be blitted to the "dstRead" texture before
     // drawing.
+public:
     const Draw mutable* m_nextDstRead = nullptr;
 };
 
@@ -191,12 +232,13 @@ public:
     // Creates either a normal path draw or an interior triangulation if the
     // path is large enough.
     static DrawUniquePtr Make(RenderContext*,
-                              const Mat2D&,
+                              const Mat2D& paintMatrix,
+                              const Mat2D* imageMatrix,
                               rcp<const RiveRenderPath>,
                               FillRule,
                               const RiveRenderPaint*,
                               float modulatedOpacity,
-                              RawPath* scratchPath);
+                              std::optional<IAABB> pixelBounds = {});
 
     // Determines how coverage is calculated for antialiasing and feathers.
     // CoverageType is mostly decided by the InterlockMode, but we keep these
@@ -207,13 +249,15 @@ public:
         pixelLocalStorage, // InterlockMode::rasterOrdering and atomics
         clockwise,         // InterlockMode::clockwise
         clockwiseAtomic,   // InterlockMode::clockwiseAtomic
-        msaa,              // InterlockMode::msaa
-        atlas, // Any InterlockMode may opt to use atlas coverage for large
-               // feathers; msaa always has to use an atlas for feathers.
+        depthStencil,      // InterlockMode::depthStencil
+        featherAtlas, // Any InterlockMode may opt to use atlas coverage for
+                      // large feathers; depthStencil always has to use an
+                      // atlas for feathers.
     };
 
     PathDraw(IAABB pixelBounds,
-             const Mat2D&,
+             const Mat2D& paintMatrix,
+             const Mat2D* imageMatrix,
              rcp<const RiveRenderPath>,
              FillRule,
              const RiveRenderPaint*,
@@ -221,8 +265,22 @@ public:
              CoverageType,
              const RenderContext::FrameDescriptor&);
 
+    const gpu::SurfaceMaterialData* surfaceMaterialData() const
+    {
+        return hasSurfaceMaterial() ? &m_surfaceMaterialData : nullptr;
+    }
+    bool hasSurfaceMaterial() const
+    {
+        return m_surfaceMaterialData.material != gpu::SurfaceMaterial::none;
+    }
+    void setSurfaceMaterial(const gpu::SurfaceMaterialData& data)
+    {
+        m_surfaceMaterialData = data;
+    }
+
     CoverageType coverageType() const { return m_coverageType; }
 
+    FillRule pathFillRule() const { return m_pathFillRule; }
     const Gradient* gradient() const { return m_gradientRef; }
     gpu::PaintType paintType() const { return m_paintType; }
     bool isFeatheredFill() const
@@ -242,36 +300,77 @@ public:
         return m_contourDirections;
     }
 
-    // Only used when rendering coverage via the atlas.
-    const gpu::AtlasTransform& atlasTransform() const
+    // Is the draw an "outermost" (i.e., non-nested) clip update?
+    // Outermost clip updates reset the clip buffer entirely, rather than
+    // subtracting coverage from what's already there.
+    bool isOutermostClipUpdate() const
     {
-        return m_atlasTransform;
+        return (m_drawContents & (gpu::DrawContents::clipUpdate |
+                                  gpu::DrawContents::activeClip)) ==
+               gpu::DrawContents::clipUpdate;
     }
-    const TAABB<uint16_t>& atlasScissor() const { return m_atlasScissor; }
-    bool atlasScissorEnabled() const { return m_atlasScissorEnabled; }
+
+    // Only used when rendering coverage via the atlas.
+    const gpu::AtlasTransform& featherAtlasTransform() const
+    {
+        return m_featherAtlasTransform;
+    }
+    const AABBu16& featherAtlasScissor() const { return m_featherAtlasScissor; }
+    bool featherAtlasScissorEnabled() const
+    {
+        return m_featherAtlasScissorEnabled;
+    }
 
     // clockwiseAtomic only.
     const gpu::CoverageBufferRange& coverageBufferRange() const
     {
         return m_coverageBufferRange;
     }
+    // Returns true if this path will need borrowed coverage prepass(es) in
+    // clockwiseAtomic mode.
+    // NOTE: Since the interlock mode isn't known at this level, the
+    // responsibility is on the caller to only use this method in
+    // clockwiseAtomic mode. Otherwise, there are never borrowed coverage
+    // prepasses.
+    bool needsBorrowedCoveragePrepass() const
+    {
+        assert(m_coverageType == CoverageType::clockwiseAtomic);
+        return !isStroke() && // Strokes don't have negative coverage.
+               !isOutermostClipUpdate(); // Outermost (i.e., non-nested)
+                                         // clockwiseAtomic clips render
+                                         // directly to the clip buffer in a
+                                         // single pass.
+    }
 
     GrInnerFanTriangulator* triangulator() const { return m_triangulator; }
+    // True if we should output the triangulator's triangles in the opposite
+    // winding direction because the view matrix is left-handed.
+    bool triangulatorReverseTriangles() const
+    {
+        return m_triangulatorReverseTriangles;
+    }
+    // True if the triangulator should negate the Rive winding number when
+    // outputting triangle vertices (because of a left-handed view matrix or
+    // NEGATE_PATH_FILL_COVERAGE_FLAG).
+    bool triangulatorNegateWinding() const
+    {
+        return m_triangulatorNegateWinding;
+    }
 
     bool allocateResources(RenderContext::LogicalFlush*) override;
-    void countSubpasses() override;
+    void countSubpasses(const gpu::PlatformFeatures&) override;
 
-    void pushToRenderContext(RenderContext::LogicalFlush*,
-                             int subpassIndex) override;
+    gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
+                                        int subpassIndex) override;
 
     // Called after pushToRenderContext(), and only when this draw uses an atlas
     // for tessellation. In the CoverageType::atlas case, pushToRenderContext()
     // is where we emit the rectangle that reads the atlas (and writes to the
     // main render target). So this method is where we push the tessellation
     // that gets rendered separately to the offscreen atlas.
-    void pushAtlasTessellation(RenderContext::LogicalFlush*,
-                               uint32_t* tessVertexCount,
-                               uint32_t* tessBaseVertex);
+    void pushFeatherAtlasTessellation(RenderContext::LogicalFlush*,
+                                      uint32_t* tessVertexCount,
+                                      uint32_t* tessBaseVertex);
 
     void releaseRefs() override;
 
@@ -281,21 +380,13 @@ protected:
                                            const gpu::PlatformFeatures&,
                                            gpu::InterlockMode);
 
-    // Prepares to draw the path by tessellating a fan around its midpoint.
+    // Prepares to draw the path as a fan tessellated around the midpoint.
     void initForMidpointFan(RenderContext*, const RiveRenderPaint*);
 
-    enum class TriangulatorAxis
-    {
-        horizontal,
-        vertical,
-        dontCare,
-    };
-
-    // Prepares to draw the path by triangulating the interior into
-    // non-overlapping triangles and tessellating the outer cubics.
-    void initForInteriorTriangulation(RenderContext*,
-                                      RawPath*,
-                                      TriangulatorAxis);
+    // Prepares to draw the path as a triangulated interior with tessellated
+    // outer cubics. The (already-built) inner-fan triangulator is supplied by
+    // the caller.
+    void initForInteriorTriangulation(RenderContext*, GrInnerFanTriangulator*);
 
     uint32_t allocateTessellationVertices(RenderContext::LogicalFlush* flush,
                                           uint32_t tessVertexCount)
@@ -308,7 +399,7 @@ protected:
 
     // Calls LogicalFlush::pushOuterCubicsDraw() or
     // LogicalFlush::pushMidpointFanDraw() for this PathDraw.
-    void pushTessellationDraw(
+    gpu::DrawBatch& pushTessellationDraw(
         RenderContext::LogicalFlush*,
         uint32_t tessVertexCount,
         uint32_t tessLocation,
@@ -333,48 +424,35 @@ protected:
         uint32_t strokeCapSegmentCount,
         uint32_t contourIDWithFlags);
 
-    enum class InteriorTriangulationOp : bool
-    {
-        // Fills in m_resourceCounts and runs a GrInnerFanTriangulator on the
-        // path's interior polygon.
-        countDataAndTriangulate,
-
-        // Pushes the contours and cubics to the renderContext for an
-        // "outerCurvePatches" draw.
-        pushOuterCubicTessellationData,
-    };
-
-    // Called to processes the interior triangulation both during initialization
-    // and submission. For now, we just iterate and subdivide the path twice
-    // (once for each enum in InteriorTriangulationOp). Since we only do this
-    // for large paths, and since we're triangulating the path interior anyway,
-    // adding complexity to only run Wang's formula and chop once would save
-    // about ~5% of the total CPU time. (And large paths are GPU-bound anyway.)
-    void iterateInteriorTriangulation(InteriorTriangulationOp op,
-                                      TrivialBlockAllocator*,
-                                      RawPath* scratchPath,
-                                      TriangulatorAxis,
-                                      RenderContext::TessellationWriter*);
+    // Iterates the path's verbs as outer-cubic patches (the interior itself was
+    // triangulated up front by the given GrInnerFanTriangulator). Runs twice
+    // per path. When tessWriter is null (first pass) it fills in
+    // m_resourceCounts; once resources are allocated, it runs again with a
+    // non-null tessWriter and emits "outerCurvePatches" to render.
+    void iterateOuterCubics(RenderContext::TessellationWriter*);
 
     const RiveRenderPath* const m_pathRef;
     const FillRule m_pathFillRule; // Fill rule can mutate on RenderPath.
     const Gradient* m_gradientRef; // Already modulated if opacity != 1.0
     const gpu::PaintType m_paintType;
     const CoverageType m_coverageType;
+    gpu::SurfaceMaterialData m_surfaceMaterialData;
     float m_strokeRadius = 0;
     float m_featherRadius = 0;
     gpu::ContourDirections m_contourDirections;
     uint32_t m_contourFlags = 0;
 
-    // Only used when rendering coverage via the atlas.
-    gpu::AtlasTransform m_atlasTransform;
-    TAABB<uint16_t> m_atlasScissor; // Scissor rect when rendering to the atlas.
-    bool m_atlasScissorEnabled;
+    // Only used when rendering coverage via the feather atlas.
+    gpu::AtlasTransform m_featherAtlasTransform;
+    AABBu16 m_featherAtlasScissor; // Scissor rect when rendering to the atlas.
+    bool m_featherAtlasScissorEnabled;
 
     // clockwiseAtomic only.
     gpu::CoverageBufferRange m_coverageBufferRange;
 
     GrInnerFanTriangulator* m_triangulator = nullptr;
+    bool m_triangulatorReverseTriangles = false;
+    bool m_triangulatorNegateWinding = false;
 
     StrokeJoin m_strokeJoin;
     StrokeCap m_strokeCap;
@@ -415,9 +493,9 @@ protected:
         // before the main subpass pushes the path to the renderContext.
         uint32_t m_prepassTessLocation = 0;
 
-        // Used in msaa mode. Multiple msaa subpasses use the same tesellation
-        // data.
-        uint32_t m_msaaTessLocation;
+        // Used in depthStencil mode. Multiple subpasses use the same
+        // tessellation data.
+        uint32_t m_depthStencilTessLocation;
     };
 
     // Used to guarantee m_pathRef doesn't change for the entire time we hold
@@ -444,19 +522,34 @@ class ImageRectDraw : public Draw
 public:
     ImageRectDraw(RenderContext*,
                   IAABB pixelBounds,
-                  const Mat2D&,
+                  const Mat2D& renderMatrix,
                   BlendMode,
+                  float additiveness,
                   rcp<Texture>,
+                  rcp<const Gradient>,
                   const ImageSampler imageSampler,
-                  float opacity);
+                  ColorInt modulatedColor,
+                  const Mat2D& imageMatrix,
+                  const Mat2D& gradientMatrix);
 
-    float opacity() const { return m_opacity; }
+    ColorInt modulatedColor() const { return m_modulatedColor; }
+    const Mat2D& gradientMatrix() const { return m_gradientMatrix; }
 
-    void pushToRenderContext(RenderContext::LogicalFlush*,
-                             int subpassIndex) override;
+    gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
+                                        int subpassIndex) override;
+
+    bool allocateResources(RenderContext::LogicalFlush*) override;
+    void releaseRefs() override;
+
+    const Gradient* gradient() const { return m_gradientRef; }
+    const ColorRampLocation& rampLocation() const { return m_rampLocation; }
 
 protected:
-    const float m_opacity;
+    const ColorInt m_modulatedColor;
+    const Mat2D m_imageMatrix;
+    const Mat2D m_gradientMatrix;
+    const Gradient* m_gradientRef;
+    ColorRampLocation m_rampLocation;
 };
 
 // Pushes an imageMesh to the render context.
@@ -466,6 +559,7 @@ public:
     ImageMeshDraw(IAABB pixelBounds,
                   const Mat2D&,
                   BlendMode,
+                  float additiveness,
                   rcp<Texture>,
                   const ImageSampler imageSampler,
                   rcp<RenderBuffer> vertexBuffer,
@@ -480,8 +574,8 @@ public:
     uint32_t indexCount() const { return m_indexCount; }
     float opacity() const { return m_opacity; }
 
-    void pushToRenderContext(RenderContext::LogicalFlush*,
-                             int subpassIndex) override;
+    gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
+                                        int subpassIndex) override;
 
     void releaseRefs() override;
 
@@ -493,10 +587,9 @@ protected:
     const float m_opacity;
 };
 
-// Resets the stencil clip by either entirely erasing the existing clip, or
-// intersecting it with a nested clip (i.e., erasing the region outside the
-// nested clip).
-class StencilClipReset : public Draw
+// Resets the clip by either entirely erasing the existing clip, or intersecting
+// it with a nested clip (i.e., erasing the region outside the nested clip).
+class ClipReset : public Draw
 {
 public:
     enum class ResetAction
@@ -505,15 +598,15 @@ public:
         intersectPreviousClip,
     };
 
-    StencilClipReset(RenderContext*,
-                     uint32_t previousClipID,
-                     gpu::DrawContents previousClipDrawContents,
-                     ResetAction);
+    ClipReset(RenderContext*,
+              uint32_t previousClipID,
+              gpu::DrawContents previousClipDrawContents,
+              ResetAction);
 
     uint32_t previousClipID() const { return m_previousClipID; }
 
-    void pushToRenderContext(RenderContext::LogicalFlush*,
-                             int subpassIndex) override;
+    gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
+                                        int subpassIndex) override;
 
 protected:
     const uint32_t m_previousClipID;

@@ -105,9 +105,29 @@ public:
         uint32_t width,
         uint32_t height,
         uint32_t mipLevelCount,
-        const uint8_t imageDataRGBAPremul[]) override;
+        GPUTextureFormat format,
+        const uint8_t imageData[],
+        uint8_t blockWidth = 1,
+        uint8_t blockHeight = 1,
+        bool srgb = false,
+        bool generateRemainingMips = false) override;
 
     rcp<Texture> adoptImageTexture(rcp<D3D12Texture> imageTexture);
+
+    // Wraps an externally-owned ID3D12Resource as a Rive Texture. Initial
+    // state is PIXEL_SHADER_RESOURCE; viewFormat overrides the SRV view
+    // format (UNKNOWN = auto-infer from the resource desc).
+    rcp<Texture> adoptImageTexture(
+        ID3D12Resource* resource,
+        uint32_t width,
+        uint32_t height,
+        DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN);
+
+#ifdef RIVE_CANVAS
+    void ensureCanvasBacking(gpu::RenderCanvas* canvas) override;
+
+    std::unique_ptr<rive::ore::Context> makeOreContext() override;
+#endif
 
 #define IMPLEMENT_RIVE_BUFFER(Name, m_buffer)                                  \
     void resize##Name(size_t sizeInBytes) override                             \
@@ -145,7 +165,6 @@ public:
     }
 
     IMPLEMENT_RIVE_BUFFER(FlushUniformBuffer, m_flushUniformBuffer)
-    IMPLEMENT_RIVE_BUFFER(ImageDrawUniformBuffer, m_imageDrawUniformBuffer)
     IMPLEMENT_RIVE_STRUCTURED_BUFFER(PathBuffer, m_pathBuffer)
     IMPLEMENT_RIVE_STRUCTURED_BUFFER(PaintBuffer, m_paintBuffer)
     IMPLEMENT_RIVE_STRUCTURED_BUFFER(PaintAuxBuffer, m_paintAuxBuffer)
@@ -153,13 +172,15 @@ public:
     IMPLEMENT_RIVE_BUFFER(GradSpanBuffer, m_gradSpanBuffer)
     IMPLEMENT_RIVE_BUFFER(TessVertexSpanBuffer, m_tessSpanBuffer)
     IMPLEMENT_RIVE_BUFFER(TriangleVertexBuffer, m_triangleBuffer)
+    IMPLEMENT_RIVE_BUFFER(ImageRectInstanceBuffer, m_imageRectInstanceBuffer)
+    IMPLEMENT_RIVE_BUFFER(ImageMeshInstanceBuffer, m_imageMeshInstanceBuffer)
 
 #undef IMPLEMENT_RIVE_BUFFER
 #undef IMPLEMENT_RIVE_STRUCTURED_BUFFER
 
     void resizeGradientTexture(uint32_t width, uint32_t height) override;
     void resizeTessellationTexture(uint32_t width, uint32_t height) override;
-    void resizeAtlasTexture(uint32_t width, uint32_t height) override;
+    void resizeFeatherAtlasTexture(uint32_t width, uint32_t height) override;
 
     void flush(const FlushDescriptor&) override;
 
@@ -169,6 +190,14 @@ public:
     }
 
     ComPtr<ID3D12Device> device() const { return m_device; }
+
+    // Set the command queue used by makeCommandBuffer(). Must be called
+    // before any ScriptedCanvas flush if canvas support is needed.
+    void setCommandQueue(ID3D12CommandQueue* queue) { m_canvasQueue = queue; }
+    ID3D12CommandQueue* commandQueue() const { return m_canvasQueue; }
+
+    void* makeCommandBuffer() override;
+    void commitCommandBuffer(void* commandBuffer) override;
 
     rcp<D3D12ResourceManager> manager() const { return m_resourceManager; }
 
@@ -197,20 +226,28 @@ private:
                      const IAABB& rect);
 
     ComPtr<ID3D12Device> m_device;
+    ID3D12CommandQueue* m_canvasQueue = nullptr;
     const D3DCapabilities m_capabilities;
 
     rcp<D3D12Texture> m_gradientTexture;
     rcp<D3D12Texture> m_tesselationTexture;
-    rcp<D3D12Texture> m_atlasTexture;
-    rcp<D3D12TextureArray> m_featherTexture;
+    rcp<D3D12Texture> m_featherAtlasTexture;
+    rcp<D3D12TextureArray> m_gaussianIntegralTexture;
 
     D3D12PipelineManager m_pipelineManager;
     rcp<D3D12ResourceManager> m_resourceManager;
 
+#ifdef WITH_RIVE_TOOLS
+    ShaderCompilationMode testingOnly_setShaderCompilationMode(
+        ShaderCompilationMode mode) override
+    {
+        return m_pipelineManager.testingOnly_setShaderCompilationMode(mode);
+    }
+#endif
+
     // Rive buffer pools. These don't need to be rcp<> because the destructor of
     // RenderContextVulkanImpl is already synchronized.
     D3D12VolatileBufferPool m_flushUniformBufferPool;
-    D3D12VolatileBufferPool m_imageDrawUniformBufferPool;
     D3D12VolatileBufferPool m_pathBufferPool;
     D3D12VolatileBufferPool m_paintBufferPool;
     D3D12VolatileBufferPool m_paintAuxBufferPool;
@@ -218,6 +255,8 @@ private:
     D3D12VolatileBufferPool m_gradSpanBufferPool;
     D3D12VolatileBufferPool m_tessSpanBufferPool;
     D3D12VolatileBufferPool m_triangleBufferPool;
+    D3D12VolatileBufferPool m_imageRectInstanceBufferPool;
+    D3D12VolatileBufferPool m_imageMeshInstanceBufferPool;
 
     // this have to be re created every frame, rtv heaps do not
     D3D12DescriptorHeapPool m_srvUavCbvHeapPool;
@@ -226,7 +265,6 @@ private:
     // Specific Rive buffers that have been acquired for the current frame.
     // When the frame ends, these get recycled back in their respective pools.
     rcp<D3D12VolatileBuffer> m_flushUniformBuffer;
-    rcp<D3D12VolatileBuffer> m_imageDrawUniformBuffer;
     rcp<D3D12VolatileBuffer> m_pathBuffer;
     rcp<D3D12VolatileBuffer> m_paintBuffer;
     rcp<D3D12VolatileBuffer> m_paintAuxBuffer;
@@ -234,6 +272,8 @@ private:
     rcp<D3D12VolatileBuffer> m_gradSpanBuffer;
     rcp<D3D12VolatileBuffer> m_tessSpanBuffer;
     rcp<D3D12VolatileBuffer> m_triangleBuffer;
+    rcp<D3D12VolatileBuffer> m_imageRectInstanceBuffer;
+    rcp<D3D12VolatileBuffer> m_imageMeshInstanceBuffer;
 
     rcp<D3D12DescriptorHeap> m_srvUavCbvHeap;
     // mirrors m_srvUavCbvHeap, needed for clearing resourcess via ClearUAV

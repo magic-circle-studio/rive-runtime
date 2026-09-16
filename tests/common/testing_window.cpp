@@ -31,39 +31,61 @@ extern "C"
 
 // Call TestingWindow::Destroy if you want to delete the window singleton
 TestingWindow* s_TestingWindow = nullptr;
+TestingWindow::Backend TestingWindow::s_Backend = TestingWindow::Backend::null;
+TestingWindow::Target TestingWindow::s_Target =
+#if defined(__EMSCRIPTEN__)
+    TestingWindow::Target::webbrowser;
+#elif defined(RIVE_ANDROID)
+    TestingWindow::Target::android;
+#elif defined(RIVE_IOS_SIMULATOR)
+    TestingWindow::Target::iossim;
+#elif defined(RIVE_IOS)
+    TestingWindow::Target::ios;
+#else
+    TestingWindow::Target::host;
+#endif
+
+// Use 4x MSAA when the user requests an "msaa" config.
+constexpr static uint32_t MSAASampleCount = 4;
 
 const char* TestingWindow::BackendName(Backend backend)
 {
     switch (backend)
     {
-        case TestingWindow::Backend::gl:
+        case Backend::gl:
             return "gl";
-        case TestingWindow::Backend::d3d:
+        case Backend::d3d:
             return "d3d";
-        case TestingWindow::Backend::d3d12:
+        case Backend::d3d12:
             return "d3d12";
-        case TestingWindow::Backend::metal:
+        case Backend::metal:
             return "metal";
-        case TestingWindow::Backend::vk:
+        case Backend::vk:
             return "vk";
-        case TestingWindow::Backend::moltenvk:
+        case Backend::moltenvk:
             return "moltenvk";
-        case TestingWindow::Backend::swiftshader:
+        case Backend::swiftshader:
             return "swiftshader";
-        case TestingWindow::Backend::angle:
+        case Backend::angle:
             return "angle";
-        case TestingWindow::Backend::dawn:
+        case Backend::dawn:
             return "dawn";
-        case TestingWindow::Backend::wgpu:
+        case Backend::wgpu:
             return "wgpu";
-        case Backend::rhi:
-            return "rhi";
-        case TestingWindow::Backend::coregraphics:
+        case Backend::external:
+            return "external";
+        case Backend::coregraphics:
             return "coregraphics";
-        case TestingWindow::Backend::skia:
+        case Backend::skia:
             return "skia";
-        case TestingWindow::Backend::null:
+        case Backend::canvas2d:
+            return "canvas2d";
+        case Backend::svg:
+            return "svg";
+        case Backend::null:
             return "null";
+        case Backend::invalid:
+            return "invalid";
     }
     RIVE_UNREACHABLE();
 }
@@ -80,8 +102,8 @@ static std::vector<std::string> split(const char* str, char delimiter)
     return tokens;
 }
 
-TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
-                                                   BackendParams* params)
+TestingWindow::Backend TestingWindow::TryParseBackend(const char* name,
+                                                      BackendParams* params)
 {
     *params = {};
     // Backends can come in the form <backendName>, or
@@ -102,7 +124,7 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     if (nameStartsWith("angle"))
     {
         if (nameStartsWith("anglemsaa"))
-            params->msaa = true;
+            params->msaaSampleCount = MSAASampleCount;
         if (nameEndsWith("_mtl") || nameEndsWith("_metal"))
             params->angleRenderer = ANGLERenderer::metal;
         else if (nameEndsWith("_d3d") || nameEndsWith("_d3d11"))
@@ -129,9 +151,15 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
         params->clockwise = true;
         return Backend::gl;
     }
+    if (nameStr == "glcwmsaa1")
+    {
+        params->clockwise = true;
+        params->msaaSampleCount = 1;
+        return Backend::gl;
+    }
     if (nameStr == "glmsaa")
     {
-        params->msaa = true;
+        params->msaaSampleCount = MSAASampleCount;
         return Backend::gl;
     }
     if (nameStr == "d3d")
@@ -143,6 +171,11 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
         params->atomic = true;
         return Backend::d3d;
     }
+    if (nameStr == "d3dmsaa")
+    {
+        params->msaaSampleCount = MSAASampleCount;
+        return Backend::d3d;
+    }
     if (nameStr == "d3d12")
     {
         return Backend::d3d12;
@@ -150,6 +183,11 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     if (nameStr == "d3d12atomic")
     {
         params->atomic = true;
+        return Backend::d3d12;
+    }
+    if (nameStr == "d3d12msaa")
+    {
+        params->msaaSampleCount = MSAASampleCount;
         return Backend::d3d12;
     }
     if (nameStr == "metal")
@@ -166,6 +204,11 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
         params->atomic = true;
         return Backend::metal;
     }
+    if (nameStr == "metalmsaa")
+    {
+        params->msaaSampleCount = MSAASampleCount;
+        return Backend::metal;
+    }
     if (nameStr == "vulkan" || nameStr == "vk")
     {
         return Backend::vk;
@@ -177,7 +220,7 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     }
     if (nameStr == "vulkanmsaa" || nameStr == "vkmsaa")
     {
-        params->msaa = true;
+        params->msaaSampleCount = MSAASampleCount;
         return Backend::vk;
     }
     if (nameStr == "vulkancore" || nameStr == "vkcore")
@@ -188,7 +231,7 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     if (nameStr == "vulkanmsaacore" || nameStr == "vkmsaacore")
     {
         params->core = true;
-        params->msaa = true;
+        params->msaaSampleCount = MSAASampleCount;
         return Backend::vk;
     }
     if (nameStr == "vulkansrgb" || nameStr == "vksrgb")
@@ -207,6 +250,12 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
         params->atomic = true;
         return Backend::vk;
     }
+    if (nameStr == "vkcwmsaa1")
+    {
+        params->clockwise = true;
+        params->msaaSampleCount = 1;
+        return Backend::vk;
+    }
     if (nameStr == "moltenvk" || nameStr == "mvk")
     {
         return Backend::moltenvk;
@@ -214,6 +263,12 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     if (nameStr == "moltenvkcore" || nameStr == "mvkcore")
     {
         params->core = true;
+        return Backend::moltenvk;
+    }
+    if (nameStr == "mvkcwmsaa1")
+    {
+        params->clockwise = true;
+        params->msaaSampleCount = 1;
         return Backend::moltenvk;
     }
     if (nameStr == "swiftshader" || nameStr == "sw")
@@ -229,6 +284,17 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     {
         return Backend::dawn;
     }
+    if (nameStr == "dawnmsaa")
+    {
+        params->msaaSampleCount = MSAASampleCount;
+        return Backend::dawn;
+    }
+    if (nameStr == "dawncwmsaa1")
+    {
+        params->clockwise = true;
+        params->msaaSampleCount = 1;
+        return Backend::dawn;
+    }
     if (nameStr == "wgpu")
     {
         return Backend::wgpu;
@@ -240,12 +306,14 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     }
     if (nameStr == "wgpumsaa")
     {
-        params->msaa = true;
+        params->msaaSampleCount = MSAASampleCount;
         return Backend::wgpu;
     }
-    if (nameStr == "rhi")
+    if (nameStr == "wgpucwmsaa1")
     {
-        return Backend::rhi;
+        params->clockwise = true;
+        params->msaaSampleCount = 1;
+        return Backend::wgpu;
     }
     if (nameStr == "coregraphics")
     {
@@ -255,12 +323,46 @@ TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
     {
         return Backend::skia;
     }
+    if (nameStr == "external" || nameStr == "ext" || nameStr == "x")
+    {
+        return Backend::external;
+    }
+    if (nameStr == "externalatomic" || nameStr == "extatomic" ||
+        nameStr == "xatomic")
+    {
+        params->atomic = true;
+        return Backend::external;
+    }
+    if (nameStr == "externalmsaa" || nameStr == "extmsaa" || nameStr == "xmsaa")
+    {
+        params->msaaSampleCount = MSAASampleCount;
+        return Backend::external;
+    }
+    if (nameStr == "canvas2d" || nameStr == "c2d")
+    {
+        return Backend::canvas2d;
+    }
+    if (nameStr == "svg")
+    {
+        return Backend::svg;
+    }
     if (nameStr == "null")
     {
         return Backend::null;
     }
-    fprintf(stderr, "'%s': invalid TestingWindow::Backend\n", name);
-    abort();
+    return Backend::invalid;
+}
+
+TestingWindow::Backend TestingWindow::ParseBackend(const char* name,
+                                                   BackendParams* params)
+{
+    Backend backend = TryParseBackend(name, params);
+    if (backend == Backend::invalid)
+    {
+        fprintf(stderr, "'%s': invalid TestingWindow::Backend\n", name);
+        abort();
+    }
+    return backend;
 }
 
 static void set_environment_variable(const char* name, const char* value)
@@ -287,7 +389,11 @@ TestingWindow* TestingWindow::Init(Backend backend,
                                    Visibility visibility,
                                    void* platformWindow)
 {
-    assert((backend == Backend::rhi) == (s_TestingWindow != nullptr));
+    if (s_TestingWindow != nullptr)
+    {
+        s_Backend = backend;
+        return s_TestingWindow;
+    }
 
 #if defined(_WIN32) && !defined(RIVE_UNREAL)
     // Set our backdoor GPU selection variables in case the API doesn't
@@ -365,6 +471,13 @@ TestingWindow* TestingWindow::Init(Backend backend,
                 break;
             }
 #endif
+            // Hook for platforms without rive_vk_bootstrap.
+            if (auto* platformVulkanWindow =
+                    TestingWindow::MakePlatformVulkan(backendParams))
+            {
+                s_TestingWindow = platformVulkanWindow;
+                break;
+            }
             if (visibility == Visibility::headless)
             {
                 s_TestingWindow =
@@ -404,7 +517,7 @@ TestingWindow* TestingWindow::Init(Backend backend,
         case Backend::wgpu:
             s_TestingWindow = TestingWindow::MakeWGPU(backendParams);
             break;
-        case Backend::rhi:
+        case Backend::external:
             break;
         case Backend::coregraphics:
             s_TestingWindow = MakeCoreGraphics();
@@ -412,8 +525,16 @@ TestingWindow* TestingWindow::Init(Backend backend,
         case Backend::skia:
             s_TestingWindow = MakeSkia();
             break;
+        case Backend::canvas2d:
+            s_TestingWindow = MakeCanvas2D();
+            break;
+        case Backend::svg:
+            s_TestingWindow = MakeSVG();
+            break;
         case Backend::null:
             s_TestingWindow = MakeNULL();
+            break;
+        case Backend::invalid:
             break;
     }
     if (!s_TestingWindow)
@@ -424,6 +545,7 @@ TestingWindow* TestingWindow::Init(Backend backend,
         abort();
     }
 
+    s_Backend = backend;
     return s_TestingWindow;
 }
 
@@ -445,3 +567,12 @@ void TestingWindow::Destroy()
     delete s_TestingWindow;
     s_TestingWindow = nullptr;
 }
+
+// Default no-op; platforms with their own impl define
+// RIVE_PLATFORM_TESTING_WINDOW.
+#ifndef RIVE_PLATFORM_TESTING_WINDOW
+TestingWindow* TestingWindow::MakePlatformVulkan(const BackendParams&)
+{
+    return nullptr;
+}
+#endif

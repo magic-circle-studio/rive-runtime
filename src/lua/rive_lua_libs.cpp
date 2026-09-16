@@ -1,13 +1,21 @@
 #ifdef WITH_RIVE_SCRIPTING
 #include "rive/lua/rive_lua_libs.hpp"
 #include "rive/assets/script_asset.hpp"
+#include "rive/viewmodel/viewmodel_instance.hpp"
+#include "rive/async/work_pool.hpp"
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_context.hpp"
+#endif
 #include "lualib.h"
-#include <unordered_map>
+#include <stdio.h>
 #include <unordered_set>
 #include <string>
+#include <string_view>
 #include <queue>
 #include <vector>
 #include <algorithm>
+#include <array>
+#include <iterator>
 
 using namespace rive;
 
@@ -21,159 +29,7 @@ int luaopen_rive_data_context(lua_State* L);
 int luaopen_rive_input(lua_State* L);
 int luaopen_rive_contex(lua_State* L);
 int luaopen_rive_audio(lua_State* L);
-
-std::unordered_map<std::string, int16_t> atoms = {
-    {"length", (int16_t)LuaAtoms::length},
-    {"lengthSquared", (int16_t)LuaAtoms::lengthSquared},
-    {"normalized", (int16_t)LuaAtoms::normalized},
-    {"distance", (int16_t)LuaAtoms::distance},
-    {"distanceSquared", (int16_t)LuaAtoms::distanceSquared},
-    {"dot", (int16_t)LuaAtoms::dot},
-    {"lerp", (int16_t)LuaAtoms::lerp},
-    {"moveTo", (int16_t)LuaAtoms::moveTo},
-    {"lineTo", (int16_t)LuaAtoms::lineTo},
-    {"quadTo", (int16_t)LuaAtoms::quadTo},
-    {"cubicTo", (int16_t)LuaAtoms::cubicTo},
-    {"close", (int16_t)LuaAtoms::close},
-    {"type", (int16_t)LuaAtoms::type},
-    {"reset", (int16_t)LuaAtoms::reset},
-    {"add", (int16_t)LuaAtoms::add},
-    {"contours", (int16_t)LuaAtoms::contours},
-    {"measure", (int16_t)LuaAtoms::measure},
-    {"invert", (int16_t)LuaAtoms::invert},
-    {"isIdentity", (int16_t)LuaAtoms::isIdentity},
-    {"width", (int16_t)LuaAtoms::width},
-    {"height", (int16_t)LuaAtoms::height},
-    {"clamp", (int16_t)LuaAtoms::clamp},
-    {"repeat", (int16_t)LuaAtoms::repeat},
-    {"mirror", (int16_t)LuaAtoms::mirror},
-    {"bilinear", (int16_t)LuaAtoms::bilinear},
-    {"nearest", (int16_t)LuaAtoms::nearest},
-    {"style", (int16_t)LuaAtoms::style},
-    {"join", (int16_t)LuaAtoms::join},
-    {"cap", (int16_t)LuaAtoms::cap},
-    {"thickness", (int16_t)LuaAtoms::thickness},
-    {"blendMode", (int16_t)LuaAtoms::blendMode},
-    {"feather", (int16_t)LuaAtoms::feather},
-    {"gradient", (int16_t)LuaAtoms::gradient},
-    {"color", (int16_t)LuaAtoms::color},
-    {"stroke", (int16_t)LuaAtoms::stroke},
-    {"fill", (int16_t)LuaAtoms::fill},
-    {"miter", (int16_t)LuaAtoms::miter},
-    {"round", (int16_t)LuaAtoms::round},
-    {"bevel", (int16_t)LuaAtoms::bevel},
-    {"butt", (int16_t)LuaAtoms::butt},
-    {"square", (int16_t)LuaAtoms::square},
-    {"srcOver", (int16_t)LuaAtoms::srcOver},
-    {"screen", (int16_t)LuaAtoms::screen},
-    {"overlay", (int16_t)LuaAtoms::overlay},
-    {"darken", (int16_t)LuaAtoms::darken},
-    {"lighten", (int16_t)LuaAtoms::lighten},
-    {"colorDodge", (int16_t)LuaAtoms::colorDodge},
-    {"colorBurn", (int16_t)LuaAtoms::colorBurn},
-    {"hardLight", (int16_t)LuaAtoms::hardLight},
-    {"softLight", (int16_t)LuaAtoms::softLight},
-    {"difference", (int16_t)LuaAtoms::difference},
-    {"exclusion", (int16_t)LuaAtoms::exclusion},
-    {"multiply", (int16_t)LuaAtoms::multiply},
-    {"hue", (int16_t)LuaAtoms::hue},
-    {"saturation", (int16_t)LuaAtoms::saturation},
-    {"luminosity", (int16_t)LuaAtoms::luminosity},
-    {"copy", (int16_t)LuaAtoms::copy},
-    {"drawPath", (int16_t)LuaAtoms::drawPath},
-    {"drawImage", (int16_t)LuaAtoms::drawImage},
-    {"drawImageMesh", (int16_t)LuaAtoms::drawImageMesh},
-    {"clipPath", (int16_t)LuaAtoms::clipPath},
-    {"save", (int16_t)LuaAtoms::save},
-    {"restore", (int16_t)LuaAtoms::restore},
-    {"transform", (int16_t)LuaAtoms::transform},
-    {"value", (int16_t)LuaAtoms::value},
-    {"red", (int16_t)LuaAtoms::red},
-    {"green", (int16_t)LuaAtoms::green},
-    {"blue", (int16_t)LuaAtoms::blue},
-    {"alpha", (int16_t)LuaAtoms::alpha},
-    {"getNumber", (int16_t)LuaAtoms::getNumber},
-    {"getTrigger", (int16_t)LuaAtoms::getTrigger},
-    {"getString", (int16_t)LuaAtoms::getString},
-    {"getBoolean", (int16_t)LuaAtoms::getBoolean},
-    {"getColor", (int16_t)LuaAtoms::getColor},
-    {"getList", (int16_t)LuaAtoms::getList},
-    {"getViewModel", (int16_t)LuaAtoms::getViewModel},
-    {"getEnum", (int16_t)LuaAtoms::getEnum},
-    {"values", (int16_t)LuaAtoms::values},
-    {"addListener", (int16_t)LuaAtoms::addListener},
-    {"removeListener", (int16_t)LuaAtoms::removeListener},
-    {"fire", (int16_t)LuaAtoms::fire},
-    {"push", (int16_t)LuaAtoms::push},
-    {"insert", (int16_t)LuaAtoms::insert},
-    {"pop", (int16_t)LuaAtoms::pop},
-    {"swap", (int16_t)LuaAtoms::swap},
-    {"shift", (int16_t)LuaAtoms::shift},
-    {"draw", (int16_t)LuaAtoms::draw},
-    {"advance", (int16_t)LuaAtoms::advance},
-    {"frameOrigin", (int16_t)LuaAtoms::frameOrigin},
-    {"data", (int16_t)LuaAtoms::data},
-    {"instance", (int16_t)LuaAtoms::instance},
-    {"animation", (int16_t)LuaAtoms::animation},
-    {"new", (int16_t)LuaAtoms::newAtom},
-    {"bounds", (int16_t)LuaAtoms::bounds},
-    {"pointerDown", (int16_t)LuaAtoms::pointerDown},
-    {"pointerUp", (int16_t)LuaAtoms::pointerUp},
-    {"pointerMove", (int16_t)LuaAtoms::pointerMove},
-    {"pointerExit", (int16_t)LuaAtoms::pointerExit},
-    {"isNumber", (int16_t)LuaAtoms::isNumber},
-    {"isString", (int16_t)LuaAtoms::isString},
-    {"isBoolean", (int16_t)LuaAtoms::isBoolean},
-    {"isColor", (int16_t)LuaAtoms::isColor},
-    {"hit", (int16_t)LuaAtoms::hit},
-    {"id", (int16_t)LuaAtoms::id},
-    {"position", (int16_t)LuaAtoms::position},
-    {"rotation", (int16_t)LuaAtoms::rotation},
-    {"scale", (int16_t)LuaAtoms::scale},
-    {"worldTransform", (int16_t)LuaAtoms::worldTransform},
-    {"scaleX", (int16_t)LuaAtoms::scaleX},
-    {"scaleY", (int16_t)LuaAtoms::scaleY},
-    {"decompose", (int16_t)LuaAtoms::decompose},
-    {"children", (int16_t)LuaAtoms::children},
-    {"parent", (int16_t)LuaAtoms::parent},
-    {"node", (int16_t)LuaAtoms::node},
-    {"paint", (int16_t)LuaAtoms::paint},
-    {"asPath", (int16_t)LuaAtoms::asPath},
-    {"asPaint", (int16_t)LuaAtoms::asPaint},
-    {"addToPath", (int16_t)LuaAtoms::addToPath},
-    {"positionAndTangent", (int16_t)LuaAtoms::positionAndTangent},
-    {"warp", (int16_t)LuaAtoms::warp},
-    {"extract", (int16_t)LuaAtoms::extract},
-    {"next", (int16_t)LuaAtoms::next},
-    {"isClosed", (int16_t)LuaAtoms::isClosed},
-    {"markNeedsUpdate", (int16_t)LuaAtoms::markNeedsUpdate},
-    {"viewModel", (int16_t)LuaAtoms::viewModel},
-    {"rootViewModel", (int16_t)LuaAtoms::rootViewModel},
-    {"dataContext", (int16_t)LuaAtoms::dataContext},
-    {"image", (int16_t)LuaAtoms::image},
-    {"blob", (int16_t)LuaAtoms::blob},
-    {"size", (int16_t)LuaAtoms::size},
-    {"duration", (int16_t)LuaAtoms::duration},
-    {"setTime", (int16_t)LuaAtoms::setTime},
-    {"setTimeFrames", (int16_t)LuaAtoms::setTimeFrames},
-    {"setTimePercentage", (int16_t)LuaAtoms::setTimePercentage},
-    {"audio", (int16_t)LuaAtoms::audio},
-    {"play", (int16_t)LuaAtoms::play},
-    {"playAtTime", (int16_t)LuaAtoms::playAtTime},
-    {"playInTime", (int16_t)LuaAtoms::playInTime},
-    {"playAtFrame", (int16_t)LuaAtoms::playAtFrame},
-    {"playInFrame", (int16_t)LuaAtoms::playInFrame},
-    {"stop", (int16_t)LuaAtoms::stop},
-    {"pause", (int16_t)LuaAtoms::pause},
-    {"resume", (int16_t)LuaAtoms::resume},
-    {"seek", (int16_t)LuaAtoms::seek},
-    {"seekFrame", (int16_t)LuaAtoms::seekFrame},
-    {"volume", (int16_t)LuaAtoms::volume},
-    {"completed", (int16_t)LuaAtoms::completed},
-    {"time", (int16_t)LuaAtoms::time},
-    {"timeFrame", (int16_t)LuaAtoms::timeFrame},
-    {"sampleRate", (int16_t)LuaAtoms::sampleRate},
-};
+extern "C" int luaopen_rive_buffer_ext(lua_State* L);
 
 static const luaL_Reg lualibs[] = {
     {"", luaopen_base},
@@ -194,6 +50,7 @@ static const luaL_Reg lualibs[] = {
     {"context", luaopen_rive_contex},
     {"dataContext", luaopen_rive_data_context},
     {"audio", luaopen_rive_audio},
+    {"promise", luaopen_rive_promise},
     {NULL, NULL},
 };
 
@@ -201,14 +58,9 @@ namespace rive
 {
 int luaopen_rive(lua_State* L)
 {
-    lua_callbacks(L)->useratom = [](const char* s, size_t l) -> int16_t {
-        auto itr = atoms.find(s);
-        if (itr != atoms.end())
-        {
-            return itr->second;
-        }
-
-        return -1;
+    lua_callbacks(L)->useratom =
+        [](lua_State*, const char* s, size_t l) -> int16_t {
+        return rive_lua_findAtom(s, l);
     };
 
     const luaL_Reg* lib = lualibs;
@@ -218,6 +70,11 @@ int luaopen_rive(lua_State* L)
         lua_pushstring(L, lib->name);
         lua_call(L, 1, 0);
     }
+
+    // Extend the buffer library with SIMD-accelerated functions
+    // (readf16, writef16, stridedcopy, convert).
+    luaopen_rive_buffer_ext(L);
+
     return 0;
 }
 
@@ -241,11 +98,37 @@ int rive_lua_pcall(lua_State* state, int nargs, int nresults)
     ScriptingContext* context =
         static_cast<ScriptingContext*>(lua_getthreaddata(state));
 
-    return context->pCall(state, nargs, nresults);
+#ifdef RIVE_ORE
+    ScriptCallGpuScope gpuScope = rive_lua_enterScriptCallGpuScope(state);
+#endif
+    int ret = context->pCall(state, nargs, nresults);
+#ifdef RIVE_ORE
+    rive_lua_exitScriptCallGpuScope(state, gpuScope);
+#endif
+    return ret;
+}
+
+int rive_lua_pcall_with_context(lua_State* state,
+                                ScriptedObject* scriptedObject,
+                                int nargs,
+                                int nresults)
+{
+    ScriptingContext* context =
+        static_cast<ScriptingContext*>(lua_getthreaddata(state));
+    ScopedScriptedObjectContext scope(context, scriptedObject);
+#ifdef RIVE_ORE
+    ScriptCallGpuScope gpuScope = rive_lua_enterScriptCallGpuScope(state);
+#endif
+    int ret = context->pCall(state, nargs, nresults);
+#ifdef RIVE_ORE
+    rive_lua_exitScriptCallGpuScope(state, gpuScope);
+#endif
+    return ret;
 }
 
 int rive_lua_pushRef(lua_State* state, int ref)
 {
+    lua_checkstack(state, 1);
     return lua_rawgeti(state, luaRegistryIndex, ref);
 }
 
@@ -296,20 +179,18 @@ static int lua_requireinternal(lua_State* L, const char* requirerChunkname)
     lua_settop(L, 1);
     const char* path = luaL_checkstring(L, 1);
 
+    ScriptingContext* context =
+        static_cast<ScriptingContext*>(lua_getthreaddata(L));
+
     if (checkRegisteredModules(L, path) == 1)
     {
         return 1;
     }
 
     // Record missing dependency if we're registering a module
-    if (requirerChunkname)
+    if (requirerChunkname != nullptr && context != nullptr)
     {
-        ScriptingContext* context =
-            static_cast<ScriptingContext*>(lua_getthreaddata(L));
-        if (context)
-        {
-            context->recordMissingDependency(requirerChunkname, path);
-        }
+        context->recordMissingDependency(requirerChunkname, path);
     }
 
     luaL_error(L, "require could not find a script named %s", path);
@@ -376,10 +257,40 @@ ScriptingVM::ScriptingVM(std::unique_ptr<ScriptingContext> context) :
     init(m_state, m_ownedContext.get());
 }
 
-ScriptingVM::~ScriptingVM() { lua_close(m_state); }
+ScriptingVM::~ScriptingVM() { closeLuaState(); }
+
+void ScriptingVM::closeLuaState()
+{
+    if (m_state == nullptr)
+    {
+        return;
+    }
+    // Cancel async tasks before closing Lua state to prevent callbacks
+    // from accessing dead state.
+    if (m_ownedContext)
+        m_ownedContext->shutdownAsyncForState(m_state);
+
+    // Null every registered ScriptedObject's back-pointer before the lua
+    // teardown cascade. Once m_vm is gone, scriptDispose() (called from
+    // cascading destruction inside lua_close) skips its releaseRef /
+    // disposeScriptedContext calls. Those calls would otherwise dereference
+    // Lua userdatas (ScriptedContext, ref tables) that lua_close has already
+    // freed in earlier sweep iterations.
+    detachScriptedObjects();
+
+    lua_State* state = m_state;
+    m_state = nullptr;
+    lua_close(state);
+}
 
 void ScriptingVM::replaceContext(std::unique_ptr<ScriptingContext> newContext)
 {
+#ifdef WITH_RIVE_TOOLS
+    if (m_ownedContext != nullptr)
+    {
+        m_ownedContext->disposeOrphanScriptedProperties();
+    }
+#endif
     m_ownedContext = std::move(newContext);
     lua_setthreaddata(m_state, m_ownedContext.get());
 }
@@ -429,6 +340,8 @@ bool ScriptingVM::loadModule(lua_State* L,
         return false;
     }
 
+    static_cast<ScriptingContext*>(lua_getthreaddata(L))
+        ->onModuleLoaded(ML, name);
     // Thread with loaded closure is on top of L's stack.
     return true;
 }
@@ -437,8 +350,13 @@ bool ScriptingVM::loadModule(lua_State* L,
 // loadModule). On success, replaces the thread with the module result.
 // If isUtility, also registers the result in the require cache.
 // Returns true on success.
-bool ScriptingVM::executeModule(lua_State* L, const char* name, bool isUtility)
+bool ScriptingVM::executeModule(lua_State* L,
+                                const char* name,
+                                bool isUtility,
+                                const char* chunkname)
 {
+    const char* display = chunkname != nullptr ? chunkname : name;
+
     // The module thread should be on top of the stack.
     lua_State* ML = lua_tothread(L, -1);
     if (ML == nullptr)
@@ -451,22 +369,29 @@ bool ScriptingVM::executeModule(lua_State* L, const char* name, bool isUtility)
     {
         if (lua_gettop(ML) == 0)
         {
-            lua_pushfstring(ML, "%s:1: module must return a value", name);
+            lua_pushfstring(ML, "%s:1: module must return a value", display);
         }
         else if (!lua_istable(ML, -1) && !lua_isfunction(ML, -1))
         {
             lua_pushfstring(ML,
                             "%s:1: module must return a table or function",
-                            name);
+                            display);
         }
     }
     else if (status == LUA_YIELD)
     {
-        lua_pushfstring(ML, "%s:1: module can not yield", name);
+        lua_pushfstring(ML, "%s:1: module can not yield", display);
     }
     else if (!lua_isstring(ML, -1))
     {
-        lua_pushfstring(ML, "%s:1: unknown error while running module", name);
+        lua_pushfstring(ML,
+                        "%s:1: unknown error while running module",
+                        display);
+    }
+    // A yield is an error for a module too, and its frames are still there.
+    if (status != 0)
+    {
+        static_cast<ScriptingContext*>(lua_getthreaddata(L))->onModuleError(ML);
     }
 
     // add ML result to L stack
@@ -554,7 +479,7 @@ bool ScriptingContext::tryRegisterModule(lua_State* state,
         return false;
     }
 #endif
-    const std::string& name = moduleDetails->moduleName();
+    std::string name = moduleDetails->moduleName();
     bool registerSuccess = false;
     int functionRef = 0;
     if (moduleDetails->isProtocolScript())
@@ -602,10 +527,10 @@ void ScriptingContext::performRegistration(lua_State* state)
         {
             continue;
         }
-        std::string moduleName = moduleDetails->moduleName();
+        std::string cacheKey = moduleDetails->moduleName();
 
         // Skip if already registered
-        if (checkRegisteredModules(state, moduleName.c_str()) == 1)
+        if (checkRegisteredModules(state, cacheKey.c_str()) == 1)
         {
             lua_pop(state, 1);
             continue;
@@ -613,8 +538,8 @@ void ScriptingContext::performRegistration(lua_State* state)
         tryRegisterModule(state, moduleDetails);
     }
 
-    // If any modules had dependencies, resolve their registration order
-    // and try registering again
+    // One cleanup pass: producers emit modules in dependency order (the
+    // editor and rive-cli both sort), so a single sorted retry suffices.
     if (!m_pendingModules.empty())
     {
         std::vector<ModuleDetails*> pendingModules;
@@ -635,6 +560,20 @@ void ScriptingContext::performRegistration(lua_State* state)
         // Register modules in sorted order
         for (ModuleDetails* moduleDetails : sortedModules)
         {
+            // Skip utility modules that already made it into the cache.
+            if (checkRegisteredModules(state,
+                                       moduleDetails->moduleName().c_str()) ==
+                1)
+            {
+                lua_pop(state, 1);
+                continue;
+            }
+            // A known-missing require has not registered yet; re-running
+            // the chunk would repeat its side effects and error.
+            if (!moduleDetails->missingDependencies().empty())
+            {
+                continue;
+            }
             tryRegisterModule(state, moduleDetails);
         }
     }
@@ -691,24 +630,27 @@ void ScriptingContext::recordMissingDependency(
     const std::string& requiringModule,
     const std::string& missingModule)
 {
-    if (!requiringModule.empty())
+    if (requiringModule.empty())
     {
-        ModuleDetails* moduleDetails = m_moduleLookup[requiringModule];
-        if (moduleDetails != nullptr)
-        {
-            moduleDetails->addMissingDependency(missingModule);
-            m_pendingModules.insert(moduleDetails);
-        }
+        return;
     }
+    auto it = m_moduleLookup.find(requiringModule);
+    if (it == m_moduleLookup.end())
+    {
+        return;
+    }
+    it->second->addMissingDependency(missingModule);
+    m_pendingModules.insert(it->second);
 }
 
 void ScriptingContext::onModuleRegistered(ModuleDetails* moduleDetails)
 {
+    std::string key = moduleDetails->moduleName();
     for (ModuleDetails* module : m_modulesToRegister)
     {
         if (!module->missingDependencies().empty())
         {
-            moduleDetails->clearMissingDependency(moduleDetails->moduleName());
+            module->clearMissingDependency(key);
         }
     }
     auto it = m_pendingModules.find(moduleDetails);
@@ -719,6 +661,40 @@ void ScriptingContext::onModuleRegistered(ModuleDetails* moduleDetails)
 }
 
 #ifdef WITH_RIVE_TOOLS
+void ScriptingContext::registerShaderRstb(std::string name,
+                                          std::vector<uint8_t> bytes)
+{
+    m_shaderRstbs[std::move(name)] = std::move(bytes);
+}
+
+const std::vector<uint8_t>* ScriptingContext::findShaderRstb(
+    const std::string& name) const
+{
+    auto it = m_shaderRstbs.find(name);
+    return it != m_shaderRstbs.end() ? &it->second : nullptr;
+}
+
+const std::vector<uint8_t>* ScriptingContext::findShaderRstb(
+    const ScopedAssetReference& reference) const
+{
+    const std::vector<uint8_t>* found = nullptr;
+    int bestRank = 0;
+    for (const auto& entry : m_shaderRstbs)
+    {
+        size_t slash = entry.first.rfind('/');
+        std::string shortName = slash == std::string::npos
+                                    ? entry.first
+                                    : entry.first.substr(slash + 1);
+        int rank = reference.match(entry.first, shortName);
+        if (rank > bestRank)
+        {
+            bestRank = rank;
+            found = &entry.second;
+        }
+    }
+    return found;
+}
+
 void ScriptingContext::setGeneratorRef(uint32_t assetId, int ref)
 {
     m_assetGeneratorRefs[assetId] = ref;
@@ -736,11 +712,133 @@ bool ScriptingContext::hasGeneratorRef(uint32_t assetId) const
 {
     return m_assetGeneratorRefs.find(assetId) != m_assetGeneratorRefs.end();
 }
+
+void ScriptingContext::trackOrphanScriptedProperty(ScriptedProperty* property)
+{
+    if (property != nullptr)
+    {
+        m_orphanScriptedProperties.push_back(property);
+    }
+}
+
+void ScriptingContext::untrackOrphanScriptedProperty(ScriptedProperty* property)
+{
+    auto it = std::remove(m_orphanScriptedProperties.begin(),
+                          m_orphanScriptedProperties.end(),
+                          property);
+    m_orphanScriptedProperties.erase(it, m_orphanScriptedProperties.end());
+}
+
+void ScriptingContext::disposeOrphanScriptedProperties()
+{
+    auto orphans = m_orphanScriptedProperties;
+    for (ScriptedProperty* property : orphans)
+    {
+        if (property != nullptr)
+        {
+            property->dispose();
+        }
+    }
+    m_orphanScriptedProperties.clear();
+}
+
+void ScriptingContext::disposeOrphanScriptedProperties(uint32_t tag)
+{
+    if (tag == 0)
+    {
+        return;
+    }
+    // dispose() untracks each property, so iterate a copy.
+    auto orphans = m_orphanScriptedProperties;
+    for (ScriptedProperty* property : orphans)
+    {
+        if (property != nullptr && property->orphanOwnerTag() == tag)
+        {
+            property->dispose();
+        }
+    }
+}
 #endif
+
+void ScriptingContext::trackViewModelInstance(rcp<ViewModelInstance> instance)
+{
+    if (instance == nullptr)
+    {
+        return;
+    }
+    auto& tracked = m_trackedViewModelInstances[instance.get()];
+    tracked.instance = instance;
+    tracked.registrations++;
+}
+
+void ScriptingContext::untrackViewModelInstance(ViewModelInstance* instance)
+{
+    if (instance == nullptr)
+    {
+        return;
+    }
+    auto it = m_trackedViewModelInstances.find(instance);
+    if (it != m_trackedViewModelInstances.end() &&
+        --it->second.registrations <= 0)
+    {
+        m_trackedViewModelInstances.erase(it);
+    }
+}
+
+void ScriptingContext::advanceDetachedViewModels()
+{
+    for (auto& entry : m_trackedViewModelInstances)
+    {
+        ViewModelInstance* instance = entry.second.instance.get();
+        // Only advance detached roots. Instances with parents are already
+        // reached through the bound tree or their detached-root ancestor.
+        if (!instance->hasParents())
+        {
+            instance->advanced();
+        }
+    }
+}
+
+// ── WorkPool integration ───────────────────────────────────────────────────
+// getGlobalWorkPool() is defined in work_pool.cpp (shared singleton).
+
+WorkPool* ScriptingContext::workPool()
+{
+    if (m_ownerId == 0)
+        m_ownerId = WorkPool::nextOwnerId();
+    return getGlobalWorkPool().get();
+}
+
+// Forward-declared in lua_image_decode.cpp (WASM only).
+#ifdef __EMSCRIPTEN__
+extern void wasm_cancelPendingDecodes(lua_State* mainThread);
+#endif
+
+void ScriptingContext::shutdownAsync()
+{
+    if (m_ownerId != 0)
+    {
+        auto& pool = getGlobalWorkPoolIfExists();
+        if (pool)
+            pool->cancelAllForOwner(m_ownerId);
+        m_ownerId = 0;
+    }
+}
+
+// Called from ~ScriptingVM before lua_close. On WASM, also cancel
+// browser-native image decodes that bypass WorkPool.
+void ScriptingContext::shutdownAsyncForState(lua_State* mainThread)
+{
+    shutdownAsync();
+#ifdef __EMSCRIPTEN__
+    wasm_cancelPendingDecodes(mainThread);
+#endif
+}
 
 bool ScriptingVM::registerScript(lua_State* state,
                                  const char* name,
-                                 Span<uint8_t> bytecode)
+                                 Span<uint8_t> bytecode,
+                                 const char* chunkname)
 {
     // Check if already registered - leave module on stack for caller to use
     if (checkRegisteredModules(state, name) == 1)
@@ -748,12 +846,12 @@ bool ScriptingVM::registerScript(lua_State* state,
         return true;
     }
 
-    if (!loadModule(state, name, bytecode))
+    if (!loadModule(state, chunkname != nullptr ? chunkname : name, bytecode))
     {
         return false;
     }
 
-    if (!executeModule(state, name, false))
+    if (!executeModule(state, name, false, chunkname))
     {
         return false;
     }
@@ -763,7 +861,8 @@ bool ScriptingVM::registerScript(lua_State* state,
 
 bool ScriptingVM::registerModule(lua_State* state,
                                  const char* name,
-                                 Span<uint8_t> bytecode)
+                                 Span<uint8_t> bytecode,
+                                 const char* chunkname)
 {
     // Check if already registered
     if (checkRegisteredModules(state, name) == 1)
@@ -772,12 +871,12 @@ bool ScriptingVM::registerModule(lua_State* state,
         return true;
     }
 
-    if (!loadModule(state, name, bytecode))
+    if (!loadModule(state, chunkname != nullptr ? chunkname : name, bytecode))
     {
         return false;
     }
 
-    if (!executeModule(state, name, true))
+    if (!executeModule(state, name, true, chunkname))
     {
         return false;
     }

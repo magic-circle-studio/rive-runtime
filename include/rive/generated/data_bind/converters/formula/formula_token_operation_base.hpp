@@ -41,8 +41,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(operationTypePropertyKey,
+                             &m_OperationType,
+                             &value);
         m_OperationType = value;
-        operationTypeChanged();
+        RIVE_EDITOR_CHANGED(operationTypeChanged());
+        notifyPropertyChanged(operationTypePropertyKey);
     }
 
     Core* clone() const override;
@@ -65,6 +69,9 @@ public:
 
 protected:
     virtual void operationTypeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/converters/formula/formula_token_operation_ext.inl"
+#endif
 };
 } // namespace rive
 

@@ -44,8 +44,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(lengthPropertyKey, &m_Length, &value);
         m_Length = value;
-        lengthChanged();
+        RIVE_EDITOR_CHANGED(lengthChanged());
+        notifyPropertyChanged(lengthPropertyKey);
     }
 
     inline bool lengthIsPercentage() const { return m_LengthIsPercentage; }
@@ -55,8 +57,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(lengthIsPercentagePropertyKey,
+                             &m_LengthIsPercentage,
+                             &value);
         m_LengthIsPercentage = value;
-        lengthIsPercentageChanged();
+        RIVE_EDITOR_CHANGED(lengthIsPercentageChanged());
+        notifyPropertyChanged(lengthIsPercentagePropertyKey);
     }
 
     Core* clone() const override;
@@ -84,6 +90,9 @@ public:
 protected:
     virtual void lengthChanged() {}
     virtual void lengthIsPercentageChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/paint/dash_ext.inl"
+#endif
 };
 } // namespace rive
 

@@ -19,22 +19,64 @@ class ScrollConstraint : public ScrollConstraintBase,
                          public LayoutConstraint
 {
 private:
-    TransformComponents m_componentsA;
-    TransformComponents m_componentsB;
-    float m_offsetX = 0;
-    float m_offsetY = 0;
-    ScrollPhysics* m_physics;
-    Mat2D m_scrollTransform;
-    bool m_isDragging = false;
+    // Coordinate space a scroll write was expressed in.
+    enum class ScrollSpace : uint8_t
+    {
+        none,
+        percent,
+        index,
+    };
+    // A percent/index write awaiting conversion to an offset.
+    struct ScrollAxisIntent
+    {
+        ScrollSpace space = ScrollSpace::none;
+        float value = 0;
+    };
+
+    ScrollPhysics* m_physics = nullptr;
     ScrollVirtualizer* m_virtualizer = nullptr;
     std::vector<LayoutNodeProvider*> m_layoutChildren;
+
+    TransformComponents m_componentsA;
+    TransformComponents m_componentsB;
+    Mat2D m_scrollTransform;
+
+    float m_offsetX = 0;
+    float m_offsetY = 0;
+    float m_lastFrameOffsetX = 0;
+    float m_lastFrameOffsetY = 0;
     int m_childConstraintAppliedCount = 0;
 
-    Vec2D positionAtIndex(float index);
+    bool m_isDragging = false;
+    bool m_isScrollBarDragging = false;
+    bool m_hasListChildren = false;
+
+    // Unresolved writes per axis; held until layout can convert.
+    ScrollAxisIntent m_intentX;
+    ScrollAxisIntent m_intentY;
+
+    AABB boundsForFlatIndex(size_t index);
+    /// Returns false when layout can't resolve the index yet; out-of-range
+    /// indices clamp to the ends.
+    bool positionAtIndex(float index, Vec2D& outPosition);
     float indexAtPosition(Vec2D pos);
     float maxOffsetXForPercent();
     float maxOffsetYForPercent();
     bool isBoundsCollapsed(AABB bounds);
+    std::vector<Vec2D> collectSnapPoints();
+    bool scrollLayoutResolvable(bool isX);
+    float clampResolvedOffset(float value, bool isX);
+    bool resolveIntent(const ScrollAxisIntent& intent,
+                       bool isX,
+                       float& outOffset);
+    void setIntentX(ScrollAxisIntent intent);
+    void setIntentY(ScrollAxisIntent intent);
+    void resolveScrollIntents();
+    void clearScrollIntents()
+    {
+        m_intentX.space = ScrollSpace::none;
+        m_intentY.space = ScrollSpace::none;
+    }
 
 public:
     ~ScrollConstraint();
@@ -59,11 +101,17 @@ public:
     void initPhysics();
     void stopPhysics();
 
+    void clearVelocity();
+
     ScrollPhysicsType physicsType() const
     {
         return ScrollPhysicsType(physicsTypeValue());
     }
 
+    bool hasLayoutParent()
+    {
+        return parent() != nullptr && parent()->is<LayoutComponent>();
+    }
     LayoutComponent* content() { return parent()->as<LayoutComponent>(); }
     LayoutComponent* viewport()
     {
@@ -71,6 +119,17 @@ public:
     }
     float contentWidth();
     float contentHeight();
+    // Passthrough properties: binds read the live extents directly.
+    float computedContentWidth() override
+    {
+        return hasLayoutParent() ? contentWidth() : 0.0f;
+    }
+    float computedContentHeight() override
+    {
+        return hasLayoutParent() ? contentHeight() : 0.0f;
+    }
+    void setComputedContentWidth(float value) override {}
+    void setComputedContentHeight(float value) override {}
     float viewportWidth();
     float viewportHeight();
     float visibleWidthRatio();
@@ -97,6 +156,29 @@ public:
     void setScrollPercentY(float value) override;
     void setScrollIndex(float value) override;
 
+    float velocityX() override;
+    float velocityY() override;
+    void setVelocityX(float value) override {}
+    void setVelocityY(float value) override {}
+
+    bool scrollActive() override;
+    void setScrollActive(bool value) override {}
+
+    bool isScrollBarDragging() const { return m_isScrollBarDragging; }
+    void isScrollBarDragging(bool value)
+    {
+        if (!m_isScrollBarDragging && value)
+        {
+            // User interaction supersedes held intents.
+            clearScrollIntents();
+            // Prime the snapshot so the first advance comparison is
+            // meaningful (otherwise a stale value falsely flags motion).
+            m_lastFrameOffsetX = scrollOffsetX();
+            m_lastFrameOffsetY = scrollOffsetY();
+        }
+        m_isScrollBarDragging = value;
+    }
+
     size_t scrollItemCount();
     std::vector<LayoutNodeProvider*>& scrollChildren()
     {
@@ -108,6 +190,13 @@ public:
     /// Animate scroll to the target position using the physics settling
     /// animation.
     void scrollToPosition(float targetX, float targetY);
+
+    /// Given a target offset reached by scrolling from current, return the
+    /// nearest snap offset in the direction of travel, or target unchanged
+    /// if snap() is false, no snap points exist, or none lie in the scroll
+    /// direction. The returned snap is at least as far as target — so an
+    /// element brought into view by target stays in view.
+    Vec2D nearestSnapOffsetInDirection(Vec2D current, Vec2D target);
 
     /// Get the effective scroll offset X (target if animating, current
     /// otherwise). Use this to check element visibility during rapid focus

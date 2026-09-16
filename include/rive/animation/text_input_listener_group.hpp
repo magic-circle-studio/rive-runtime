@@ -2,6 +2,7 @@
 #define _RIVE_TEXT_INPUT_LISTENER_GROUP_HPP_
 
 #include "rive/listener_group.hpp"
+#include "rive/math/vec2d.hpp"
 
 namespace rive
 {
@@ -30,9 +31,26 @@ public:
         float timeStamp,
         StateMachineInstance* stateMachineInstance) override;
 
+    bool cancelPointer(int pointerId, Vec2D position, float timeStamp) override;
+
 private:
+    // Returns a timestamp in microseconds for multi-click detection. Uses the
+    // passed-in (deterministic) timeStamp when File::deterministicMode is set,
+    // otherwise wall-clock time, mirroring ScrollPhysics.
+    long long nowMicros(float timeStamp) const;
+
     TextInput* m_textInput;
-    bool m_isDragging = false;
+    // The pointer that owns the in-flight drag, or -1. Held by id rather than
+    // as a bool: cancellation walks every tracked pointer, and only the one
+    // that started the drag may end it.
+    int m_draggingPointerId = -1;
+
+    // Multi-click (double/triple-click) detection state.
+    int m_clickCount = 0;
+    long long m_lastClickTime = 0; // microseconds
+    Vec2D m_lastClickPosition = Vec2D(0, 0);
+    static constexpr long long kMultiClickIntervalUs = 500000; // 0.5s
+    static constexpr float kMultiClickDistance = 16.0f;        // world units
 };
 
 } // namespace rive

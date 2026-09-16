@@ -3,9 +3,10 @@
 #include "rive/component.hpp"
 #include "rive/core/field_types/core_color_type.hpp"
 #include "rive/core/field_types/core_double_type.hpp"
+#include "rive/generated/shapes/paint/color_channels_base.hpp"
 namespace rive
 {
-class GradientStopBase : public Component
+class GradientStopBase : public Component, public ColorChannelsBase
 {
 protected:
     typedef Component Super;
@@ -37,15 +38,17 @@ protected:
     float m_Position = 0.0f;
 
 public:
-    inline int colorValue() const { return m_ColorValue; }
-    void colorValue(int value)
+    inline int colorValue() const override { return m_ColorValue; }
+    void colorValue(int value) override
     {
         if (m_ColorValue == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(colorValuePropertyKey, &m_ColorValue, &value);
         m_ColorValue = value;
-        colorValueChanged();
+        RIVE_EDITOR_CHANGED(colorValueChanged());
+        notifyPropertyChanged(colorValuePropertyKey);
     }
 
     inline float position() const { return m_Position; }
@@ -55,8 +58,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(positionPropertyKey, &m_Position, &value);
         m_Position = value;
-        positionChanged();
+        RIVE_EDITOR_CHANGED(positionChanged());
+        notifyPropertyChanged(positionPropertyKey);
     }
 
     Core* clone() const override;
@@ -84,6 +89,9 @@ public:
 protected:
     virtual void colorValueChanged() {}
     virtual void positionChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/paint/gradient_stop_ext.inl"
+#endif
 };
 } // namespace rive
 

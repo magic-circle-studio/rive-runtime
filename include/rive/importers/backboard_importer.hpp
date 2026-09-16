@@ -21,6 +21,7 @@ class DataConverterGroupItem;
 class ScriptInputArtboard;
 class ScrollPhysics;
 class ArtboardReferencer;
+class ViewModelInstance;
 class BackboardImporter : public ImportStackObject
 {
 private:
@@ -49,7 +50,14 @@ public:
     void addDataConverterGroupItemReferencer(
         DataConverterGroupItem* referencer);
     void addInterpolator(KeyFrameInterpolator* interpolator);
+
+    /// Adds an interpolator that is already live in the file, for a partial
+    /// import that only needs to resolve against it. Unlike [addInterpolator]
+    /// it does not initialize: the object is in use and re-initializing it
+    /// would reset state the rest of the file is depending on.
+    void seedInterpolator(KeyFrameInterpolator* interpolator);
     void addPhysics(ScrollPhysics* physics);
+    void addViewModelInstance(ViewModelInstance* instance);
     std::vector<ScrollPhysics*> physics() { return m_physics; }
     std::vector<rcp<FileAsset>>* assets() { return &m_FileAssets; }
     void file(File* value);

@@ -14,7 +14,9 @@ std::unique_ptr<FiddleContext> FiddleContext::MakeD3D12PLS(
 #include "rive/renderer/rive_renderer.hpp"
 #include "rive/renderer/d3d/d3d_utils.hpp"
 #include "rive/renderer/d3d12/render_context_d3d12_impl.hpp"
+#include "rive/renderer/ore/ore_context.hpp"
 #include <dxgi1_6.h>
+#include <vector>
 
 #define GLFW_INCLUDE_NONE
 #define GLFW_EXPOSE_NATIVE_WIN32
@@ -23,6 +25,75 @@ std::unique_ptr<FiddleContext> FiddleContext::MakeD3D12PLS(
 
 using namespace rive;
 using namespace rive::gpu;
+
+// Set once a callback prints each debug-layer message as it posts, so a
+// mid-frame break surfaces its reason before the process dies.
+static bool s_d3d12MessageCallbackActive = false;
+
+#ifdef DEBUG
+static void __stdcall D3D12MessageCallback(D3D12_MESSAGE_CATEGORY category,
+                                           D3D12_MESSAGE_SEVERITY severity,
+                                           D3D12_MESSAGE_ID id,
+                                           LPCSTR description,
+                                           void*)
+{
+    fprintf(stderr,
+            "[D3D12 debug @ live] sev=%d id=%d cat=%d: %s\n",
+            static_cast<int>(severity),
+            static_cast<int>(id),
+            static_cast<int>(category),
+            description);
+    fflush(stderr);
+}
+#endif
+
+// Drain the D3D12 debug-layer info queue and print any stored messages to
+// stderr. Modeled on Dawn's AppendDebugLayerMessagesToError
+// (dawn/src/dawn/native/d3d12/DeviceD3D12.cpp). VERIFY_OK aborts on the bare
+// HRESULT, which strips the runtime's actual validation reason; calling this
+// before/after a failing op surfaces the real cause in CI logs.
+static void DrainD3D12DebugMessages(ID3D12Device* device, const char* context)
+{
+    if (device == nullptr)
+    {
+        return;
+    }
+    ComPtr<ID3D12InfoQueue> infoQueue;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&infoQueue))))
+    {
+        return;
+    }
+    // The live callback already printed each message as it posted.
+    if (s_d3d12MessageCallbackActive)
+    {
+        infoQueue->ClearStoredMessages();
+        return;
+    }
+    UINT64 numMessages = infoQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < numMessages; ++i)
+    {
+        SIZE_T messageLength = 0;
+        infoQueue->GetMessage(i, nullptr, &messageLength);
+        std::vector<uint8_t> data(messageLength);
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(data.data());
+        if (FAILED(infoQueue->GetMessage(i, message, &messageLength)))
+        {
+            continue;
+        }
+        fprintf(stderr,
+                "[D3D12 debug @ %s] sev=%d id=%d cat=%d: %s\n",
+                context,
+                static_cast<int>(message->Severity),
+                static_cast<int>(message->ID),
+                static_cast<int>(message->Category),
+                message->pDescription);
+    }
+    if (numMessages > 0)
+    {
+        fflush(stderr);
+        infoQueue->ClearStoredMessages();
+    }
+}
 
 void SetIntelInformation(const DXGI_ADAPTER_DESC& desc,
                          D3DContextOptions& contextOptions)
@@ -198,6 +269,11 @@ public:
             RenderContextD3D12Impl::MakeContext(m_device,
                                                 m_copyCommandList.Get(),
                                                 contextOptions);
+        // Enable canvas pre-pass support
+        // (makeCommandBuffer/commitCommandBuffer) by providing a command queue
+        // for canvas rendering.
+        m_renderContext->static_impl_cast<RenderContextD3D12Impl>()
+            ->setCommandQueue(m_commandQueue.Get());
         VERIFY_OK(m_copyCommandList->Close());
         VERIFY_OK(m_commandList->Close());
 
@@ -262,6 +338,21 @@ public:
     rive::gpu::RenderTarget* renderTargetOrNull() override
     {
         return m_renderTargets[m_frameIndex].get();
+    }
+
+    void* getCommandBuffer() override { return m_commandList.Get(); }
+
+    void beginOreFrame(rive::ore::Context* oreContext) override
+    {
+        beginFrame();
+        oreContext->beginFrame({.externalCommandBuffer = m_commandList.Get(),
+                                .safeFrameNumber = m_safeFrame,
+                                .currentFrameNumber = m_currentFrame});
+    }
+    void endOreFrame(rive::ore::Context* oreContext) override
+    {
+        FiddleContext::endOreFrame(oreContext);
+        moveToNextFrame();
     }
 
     void onSizeChanged(GLFWwindow* window,
@@ -418,6 +509,7 @@ public:
 
     void moveToNextFrame()
     {
+        DrainD3D12DebugMessages(m_device.Get(), "moveToNextFrame.entry");
         VERIFY_OK(m_commandList->Close());
         VERIFY_OK(m_copyCommandList->Close());
 
@@ -447,11 +539,9 @@ public:
         RIVE_PROF_ENDFRAME()
     }
 
-    void flushPLSContext(RenderTarget* offscreenRenderTarget) final
+    void beginFrame()
     {
-        m_frameIndex = getFrameIndex();
-
-        auto safeFrame = waitForNextSafeFrame();
+        m_safeFrame = waitForNextSafeFrame();
 
         VERIFY_OK(m_allocators[m_frameIndex]->Reset());
 
@@ -461,6 +551,14 @@ public:
 
         VERIFY_OK(m_copyCommandList->Reset(m_copyAllocators[m_frameIndex].Get(),
                                            NULL));
+    }
+
+    void flushPLSContext(RenderTarget* offscreenRenderTarget) final
+    {
+        m_frameIndex = getFrameIndex();
+
+        beginFrame();
+
 #if defined(RIVE_MICROPROFILE)
         MicroProfileGpuSetContext(m_commandList.Get());
 #endif
@@ -474,7 +572,7 @@ public:
                                 : m_renderTargets[m_frameIndex].get(),
             .externalCommandBuffer = &cmdLists,
             .currentFrameNumber = m_currentFrame,
-            .safeFrameNumber = safeFrame,
+            .safeFrameNumber = m_safeFrame,
         });
 
         moveToNextFrame();
@@ -493,17 +591,40 @@ public:
         ComPtr<ID3D12Resource> readbackBuffer;
         auto w = m_renderTargets[m_frameIndex]->width();
         auto h = m_renderTargets[m_frameIndex]->height();
-        size_t outputBufferSize = w * h * 4;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+        const size_t outputBufferSize = w * h * 4;
 
         auto targetTexture =
             m_renderTargets[m_frameIndex]->targetTexture()->resource();
+
+        // GetCopyableFootprints returns a RowPitch already aligned to
+        // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256), and totalBytes accounts
+        // for that padded layout. Per the D3D12 spec the
+        // D3D12_PLACED_SUBRESOURCE_FOOTPRINT used by CopyTextureRegion MUST
+        // have a 256-aligned RowPitch — overriding it to the natural pitch
+        // (w * bytesPerPixel) violates the rule and causes Close() to return
+        // E_INVALIDARG under strict validation. Match Dawn's pattern in
+        // CommandBufferD3D12.cpp (Align(..., kTextureBytesPerRowAlignment)):
+        // size the readback buffer for the padded layout and strip the
+        // padding when copying out to the tightly-packed pixelData.
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+        UINT numRows;
+        UINT64 rowSizeInBytes;
+        UINT64 totalBytes;
+        auto desc = targetTexture->GetDesc();
+        m_device->GetCopyableFootprints(&desc,
+                                        0,
+                                        1,
+                                        0,
+                                        &footprint,
+                                        &numRows,
+                                        &rowSizeInBytes,
+                                        &totalBytes);
 
         D3D12_HEAP_PROPERTIES readbackHeapProperties{
             CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK)};
 
         D3D12_RESOURCE_DESC readbackBufferDesc{
-            CD3DX12_RESOURCE_DESC::Buffer(outputBufferSize)};
+            CD3DX12_RESOURCE_DESC::Buffer(totalBytes)};
 
         VERIFY_OK(
             m_device->CreateCommittedResource(&readbackHeapProperties,
@@ -522,27 +643,11 @@ public:
             m_commandList->ResourceBarrier(1, &outputBufferResourceBarrier);
         }
 
-        UINT numRows;
-        UINT64 rowSizeInBtes;
-        UINT64 totalBytes;
-        auto desc = targetTexture->GetDesc();
-        m_device->GetCopyableFootprints(&desc,
-                                        0,
-                                        1,
-                                        0,
-                                        &footprint,
-                                        &numRows,
-                                        &rowSizeInBtes,
-                                        &totalBytes);
-        footprint.Footprint.RowPitch = w * 4;
-
         const CD3DX12_TEXTURE_COPY_LOCATION dst(readbackBuffer.Get(),
                                                 footprint);
         const CD3DX12_TEXTURE_COPY_LOCATION src(targetTexture, 0);
 
         m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-
-        footprint.Footprint.RowPitch = static_cast<UINT>(rowSizeInBtes);
 
         {
             D3D12_RESOURCE_BARRIER outputBufferResourceBarrier{
@@ -561,7 +666,7 @@ public:
         pixelData->resize(outputBufferSize);
 
         uint8_t* mappedData;
-        D3D12_RANGE range{0, outputBufferSize};
+        D3D12_RANGE range{0, static_cast<size_t>(totalBytes)};
         VERIFY_OK(readbackBuffer->Map(0,
                                       &range,
                                       reinterpret_cast<void**>(&mappedData)));
@@ -607,6 +712,7 @@ private:
     UINT64 m_previousFrames[FrameCount] = {0};
     UINT64 m_currentFrame = 0;
     UINT64 m_frameIndex = 0;
+    UINT64 m_safeFrame = 0;
     const bool m_isHeadless;
 
     ComPtr<IDXGIFactory4> m_factory;
@@ -701,6 +807,26 @@ std::unique_ptr<FiddleContext> FiddleContext::MakeD3D12PLS(
     {
         return nullptr;
     }
+
+#ifdef DEBUG
+    // Print debug-layer messages as they post; the frame-boundary drain misses
+    // a mid-frame break that kills the process first.
+    {
+        ComPtr<ID3D12InfoQueue1> infoQueue1;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue1))))
+        {
+            DWORD cookie = 0;
+            if (SUCCEEDED(infoQueue1->RegisterMessageCallback(
+                    &D3D12MessageCallback,
+                    D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                    nullptr,
+                    &cookie)))
+            {
+                s_d3d12MessageCallbackActive = true;
+            }
+        }
+    }
+#endif
 
     if (fiddleOptions.disableRasterOrdering)
     {

@@ -44,8 +44,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(heightPropertyKey, &m_Height, &value);
         m_Height = value;
-        heightChanged();
+        RIVE_EDITOR_CHANGED(heightChanged());
+        notifyPropertyChanged(heightPropertyKey);
     }
 
     inline float width() const { return m_Width; }
@@ -55,8 +57,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(widthPropertyKey, &m_Width, &value);
         m_Width = value;
-        widthChanged();
+        RIVE_EDITOR_CHANGED(widthChanged());
+        notifyPropertyChanged(widthPropertyKey);
     }
 
     void copy(const DrawableAssetBase& object)
@@ -83,6 +87,9 @@ public:
 protected:
     virtual void heightChanged() {}
     virtual void widthChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/assets/drawable_asset_ext.inl"
+#endif
 };
 } // namespace rive
 

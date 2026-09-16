@@ -1,11 +1,24 @@
 #include "rive/animation/text_input_listener_group.hpp"
 #include "rive/animation/state_machine_instance.hpp"
+#include "rive/file.hpp"
 #include "rive/focus_data.hpp"
 #include "rive/input/focus_manager.hpp"
 #include "rive/input/focus_node.hpp"
 #include "rive/text/text_input.hpp"
+#include <chrono>
 
 using namespace rive;
+
+long long TextInputListenerGroup::nowMicros(float timeStamp) const
+{
+    if (File::deterministicMode)
+    {
+        return (long long)(timeStamp * 1000000.0f);
+    }
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::high_resolution_clock::now().time_since_epoch())
+        .count();
+}
 
 TextInputListenerGroup::TextInputListenerGroup(
     TextInput* textInput,
@@ -14,6 +27,23 @@ TextInputListenerGroup::TextInputListenerGroup(
     // listener-based logic, just the click phase tracking
     ListenerGroup(nullptr), m_textInput(textInput)
 {}
+
+// processEvent ends the drag when it sees down -> clicked/out. Cancellation
+// clears the phase itself, so that transition never reaches it and the text
+// input would stay in its dragging state; end it here instead.
+bool TextInputListenerGroup::cancelPointer(int pointerId,
+                                           Vec2D position,
+                                           float timeStamp)
+{
+    bool wasDragging =
+        ListenerGroup::cancelPointer(pointerId, position, timeStamp);
+    if (m_draggingPointerId == pointerId)
+    {
+        m_textInput->endDrag(position);
+        m_draggingPointerId = -1;
+    }
+    return wasDragging;
+}
 
 ProcessEventResult TextInputListenerGroup::processEvent(
     Component* component,
@@ -64,23 +94,59 @@ ProcessEventResult TextInputListenerGroup::processEvent(
     if (prevPhase != GestureClickPhase::down &&
         newPhase == GestureClickPhase::down)
     {
+        // Detect double/triple-click from the time and distance since the
+        // previous click.
+        long long now = nowMicros(timeStamp);
+        long long dt = now - m_lastClickTime;
+        float dist = Vec2D::distance(position, m_lastClickPosition);
+        if (dt >= 0 && dt <= kMultiClickIntervalUs &&
+            dist <= kMultiClickDistance)
+        {
+            m_clickCount = m_clickCount >= 3 ? 1 : m_clickCount + 1;
+        }
+        else
+        {
+            m_clickCount = 1;
+        }
+        m_lastClickTime = now;
+        m_lastClickPosition = position;
+
         m_textInput->startDrag(position);
-        m_isDragging = true;
-        // Focus the closest FocusNode ancestor (handles artboard boundaries)
+        m_draggingPointerId = pointerId;
+
         auto* manager = stateMachineInstance->focusManager();
         if (manager != nullptr)
         {
-            auto focusNode = FocusData::findClosestFocusNode(m_textInput);
-            if (focusNode != nullptr)
+            for (auto* child : m_textInput->children())
             {
-                manager->setFocus(focusNode);
+                if (child->is<FocusData>())
+                {
+                    auto focusNode = child->as<FocusData>()->focusNode();
+                    if (focusNode != nullptr)
+                    {
+                        manager->setFocus(focusNode);
+                    }
+                    break;
+                }
             }
+        }
+
+        // Select the word (double-click) or visual line (triple-click) at the
+        // cursor that startDrag just placed.
+        if (m_clickCount == 2)
+        {
+            m_textInput->selectWord();
+        }
+        else if (m_clickCount == 3)
+        {
+            m_textInput->selectLine();
         }
         return ProcessEventResult::scroll;
     }
     // Handle drag continue: pointer is moving while down
     else if (hitEvent == ListenerType::move &&
-             newPhase == GestureClickPhase::down && m_isDragging)
+             newPhase == GestureClickPhase::down &&
+             m_draggingPointerId == pointerId)
     {
         m_textInput->drag(position);
         return ProcessEventResult::scroll;
@@ -90,10 +156,10 @@ ProcessEventResult TextInputListenerGroup::processEvent(
              (newPhase == GestureClickPhase::clicked ||
               newPhase == GestureClickPhase::out))
     {
-        if (m_isDragging)
+        if (m_draggingPointerId == pointerId)
         {
             m_textInput->endDrag(position);
-            m_isDragging = false;
+            m_draggingPointerId = -1;
         }
     }
 

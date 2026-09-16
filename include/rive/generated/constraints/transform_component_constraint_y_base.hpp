@@ -56,8 +56,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(copyFactorYPropertyKey, &m_CopyFactorY, &value);
         m_CopyFactorY = value;
-        copyFactorYChanged();
+        RIVE_EDITOR_CHANGED(copyFactorYChanged());
+        notifyPropertyChanged(copyFactorYPropertyKey);
     }
 
     inline float minValueY() const { return m_MinValueY; }
@@ -67,8 +69,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minValueYPropertyKey, &m_MinValueY, &value);
         m_MinValueY = value;
-        minValueYChanged();
+        RIVE_EDITOR_CHANGED(minValueYChanged());
+        notifyPropertyChanged(minValueYPropertyKey);
     }
 
     inline float maxValueY() const { return m_MaxValueY; }
@@ -78,8 +82,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxValueYPropertyKey, &m_MaxValueY, &value);
         m_MaxValueY = value;
-        maxValueYChanged();
+        RIVE_EDITOR_CHANGED(maxValueYChanged());
+        notifyPropertyChanged(maxValueYPropertyKey);
     }
 
     inline bool doesCopyY() const { return m_DoesCopyY; }
@@ -89,8 +95,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(doesCopyYPropertyKey, &m_DoesCopyY, &value);
         m_DoesCopyY = value;
-        doesCopyYChanged();
+        RIVE_EDITOR_CHANGED(doesCopyYChanged());
+        notifyPropertyChanged(doesCopyYPropertyKey);
     }
 
     inline bool minY() const { return m_MinY; }
@@ -100,8 +108,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minYPropertyKey, &m_MinY, &value);
         m_MinY = value;
-        minYChanged();
+        RIVE_EDITOR_CHANGED(minYChanged());
+        notifyPropertyChanged(minYPropertyKey);
     }
 
     inline bool maxY() const { return m_MaxY; }
@@ -111,8 +121,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxYPropertyKey, &m_MaxY, &value);
         m_MaxY = value;
-        maxYChanged();
+        RIVE_EDITOR_CHANGED(maxYChanged());
+        notifyPropertyChanged(maxYPropertyKey);
     }
 
     void copy(const TransformComponentConstraintYBase& object)
@@ -159,6 +171,9 @@ protected:
     virtual void doesCopyYChanged() {}
     virtual void minYChanged() {}
     virtual void maxYChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/transform_component_constraint_y_ext.inl"
+#endif
 };
 } // namespace rive
 

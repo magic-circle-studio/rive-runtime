@@ -7,7 +7,11 @@
 #include "rive/command_queue.hpp"
 #include "rive/command_server.hpp"
 #include "rive/file.hpp"
+#include "rive/semantic/semantic_role.hpp"
+#include "rive/semantic/semantic_state.hpp"
+#include "rive/semantic/semantic_trait.hpp"
 #include "common/render_context_null.hpp"
+#include <algorithm>
 #include <fstream>
 
 namespace rive
@@ -41,6 +45,19 @@ bool operator==(const CommandQueue::FileListener::ViewModelPropertyData& l,
 }
 bool operator!=(const CommandQueue::FileListener::ViewModelPropertyData& l,
                 const CommandQueue::FileListener::ViewModelPropertyData& r)
+{
+    return !(l == r);
+}
+bool operator==(const CommandQueue::FileListener::FileAssetData& l,
+                const CommandQueue::FileListener::FileAssetData& r)
+{
+    return l.name == r.name && l.uniqueName == r.uniqueName &&
+           l.assetID == r.assetID && l.cdnUUID == r.cdnUUID &&
+           l.cdnBaseURL == r.cdnBaseURL && l.fileExtension == r.fileExtension &&
+           l.type == r.type;
+}
+bool operator!=(const CommandQueue::FileListener::FileAssetData& l,
+                const CommandQueue::FileListener::FileAssetData& r)
 {
     return !(l == r);
 }
@@ -78,6 +95,12 @@ bool operator==(const std::vector<t>& left, const std::vector<t>& right)
 }
 
 #include "catch.hpp"
+#include <rive/assets/audio_asset.hpp>
+#include <rive/assets/blob_asset.hpp>
+#include <rive/assets/file_asset.hpp>
+#include <rive/assets/font_asset.hpp>
+#include <rive/assets/image_asset.hpp>
+#include <rive/assets/script_asset.hpp>
 
 using namespace rive;
 
@@ -478,6 +501,51 @@ TEST_CASE("draw loops", "[CommandQueue]")
     serverThread.join();
 }
 
+class TestAssetsFileLoader : public rive::FileAssetLoader
+{
+public:
+    bool loadContents(FileAsset& asset,
+                      Span<const uint8_t> inBandBytes,
+                      Factory* factory) override
+    {
+        CHECK((asset.is<ImageAsset>() || asset.is<AudioAsset>() ||
+               asset.is<FontAsset>() || asset.is<ScriptAsset>()));
+        m_called = true;
+        return false;
+    }
+
+    bool m_called = false;
+};
+
+static void server_thread_file_loader(rcp<CommandQueue> commandQueue,
+                                      rcp<rive::FileAssetLoader> loader)
+{
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(std::move(commandQueue),
+                         nullContext.get(),
+                         std::move(loader));
+    server.serveUntilDisconnect();
+}
+
+TEST_CASE("test support for all asset types", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    auto loader = make_rcp<TestAssetsFileLoader>();
+    std::thread serverThread(server_thread_file_loader, commandQueue, loader);
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    wait_for_server(commandQueue.get());
+
+    CHECK(loader->m_called);
+
+    commandQueue->disconnect();
+    serverThread.join();
+};
+
 TEST_CASE("wait for server race condition", "[CommandQueue]")
 {
     auto commandQueue = make_rcp<CommandQueue>();
@@ -568,6 +636,59 @@ TEST_CASE("draw happens once per poll", "[CommandQueue]")
     CHECK(test == 2);
     server.processCommands();
     CHECK(test == 2);
+
+    commandQueue->disconnect();
+}
+
+TEST_CASE("cancelDraw prevents pending draw from running", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    int drawCount = 0;
+    auto drawLambda = [&drawCount](DrawKey, CommandServer*) { ++drawCount; };
+    DrawKey drawKey = commandQueue->createDrawKey();
+
+    commandQueue->draw(drawKey, drawLambda);
+    commandQueue->cancelDraw(drawKey);
+
+    server.processCommands();
+
+    CHECK(drawCount == 0);
+
+    commandQueue->disconnect();
+}
+
+TEST_CASE("cancelDraw only cancels the matching draw key", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    int drawCountA = 0;
+    int drawCountB = 0;
+    auto drawLambdaA = [&drawCountA](DrawKey, CommandServer*) { ++drawCountA; };
+    auto drawLambdaB = [&drawCountB](DrawKey, CommandServer*) { ++drawCountB; };
+    DrawKey drawKeyA = commandQueue->createDrawKey();
+    DrawKey drawKeyB = commandQueue->createDrawKey();
+
+    commandQueue->draw(drawKeyA, drawLambdaA);
+    commandQueue->draw(drawKeyB, drawLambdaB);
+    commandQueue->cancelDraw(drawKeyA);
+
+    server.processCommands();
+
+    CHECK(drawCountA == 0);
+    CHECK(drawCountB == 1);
+
+    commandQueue->draw(drawKeyA, drawLambdaA);
+    server.processCommands();
+
+    CHECK(drawCountA == 1);
+    CHECK(drawCountB == 1);
 
     commandQueue->disconnect();
 }
@@ -1298,39 +1419,54 @@ TEST_CASE("External Resources", "[CommandQueue]")
     CHECK(externalAudio);
     CHECK(externalFont);
 
+    rcp<BlobAsset> externalBlob = make_rcp<BlobAsset>();
+    std::vector<uint8_t> blobData = {1, 2, 3, 4, 5};
+    SimpleArray<uint8_t> blobBytes(blobData.data(), blobData.size());
+    externalBlob->decode(blobBytes, nullptr);
+
     RenderImageHandle externalImageHandle =
         commandQueue->addExternalImage(externalImage);
     AudioSourceHandle externalAudioHandle =
         commandQueue->addExternalAudio(externalAudio);
     FontHandle externalFontHandle = commandQueue->addExternalFont(externalFont);
+    BlobAssetHandle externalBlobHandle =
+        commandQueue->addExternalBlob(externalBlob);
 
     commandQueue->runOnce([externalImageHandle,
                            externalImage,
                            externalAudioHandle,
                            externalAudio,
                            externalFontHandle,
-                           externalFont](CommandServer* server) {
+                           externalFont,
+                           externalBlobHandle,
+                           externalBlob](CommandServer* server) {
         auto image = server->getImage(externalImageHandle);
         CHECK(image == externalImage.get());
         auto audio = server->getAudioSource(externalAudioHandle);
         CHECK(audio == externalAudio.get());
         auto font = server->getFont(externalFontHandle);
         CHECK(font == externalFont.get());
+        auto blob = server->getBlob(externalBlobHandle);
+        CHECK(blob == externalBlob.get());
     });
 
     commandQueue->deleteImage(externalImageHandle);
     commandQueue->deleteAudio(externalAudioHandle);
     commandQueue->deleteFont(externalFontHandle);
+    commandQueue->deleteBlob(externalBlobHandle);
 
     commandQueue->runOnce([externalImageHandle,
                            externalAudioHandle,
-                           externalFontHandle](CommandServer* server) {
+                           externalFontHandle,
+                           externalBlobHandle](CommandServer* server) {
         auto image = server->getImage(externalImageHandle);
         CHECK(image == nullptr);
         auto audio = server->getAudioSource(externalAudioHandle);
         CHECK(audio == nullptr);
         auto font = server->getFont(externalFontHandle);
         CHECK(font == nullptr);
+        auto blob = server->getBlob(externalBlobHandle);
+        CHECK(blob == nullptr);
     });
 
     commandQueue->disconnect();
@@ -1364,6 +1500,132 @@ TEST_CASE("RenderImage", "[CommandQueue]")
         auto badImage = server->getImage(badImageHandle);
         CHECK(badImage == nullptr);
     });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("BlobAsset", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::vector<uint8_t> blobData = {0x10, 0x20, 0x30, 0x40};
+    BlobAssetHandle blobHandle = commandQueue->decodeBlob(blobData);
+    // Blobs are raw bytes, so unlike images an empty payload is still valid.
+    BlobAssetHandle emptyBlobHandle =
+        commandQueue->decodeBlob(std::vector<uint8_t>());
+
+    commandQueue->runOnce(
+        [blobHandle, emptyBlobHandle, blobData](CommandServer* server) {
+            auto blob = server->getBlob(blobHandle);
+            CHECK(blob != nullptr);
+            CHECK(blob->bytes().size() == blobData.size());
+            CHECK(std::equal(blobData.begin(),
+                             blobData.end(),
+                             blob->bytes().begin()));
+            auto emptyBlob = server->getBlob(emptyBlobHandle);
+            CHECK(emptyBlob != nullptr);
+            CHECK(emptyBlob->bytes().empty());
+        });
+
+    commandQueue->deleteBlob(blobHandle);
+    commandQueue->deleteBlob(emptyBlobHandle);
+
+    commandQueue->runOnce([blobHandle, emptyBlobHandle](CommandServer* server) {
+        auto blob = server->getBlob(blobHandle);
+        CHECK(blob == nullptr);
+        auto emptyBlob = server->getBlob(emptyBlobHandle);
+        CHECK(emptyBlob == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class TestBlobAssetListener : public CommandQueue::BlobAssetListener
+{
+public:
+    virtual void onBlobAssetDecoded(const BlobAssetHandle handle,
+                                    uint64_t requestId) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(!m_hasDecodedCallback);
+        m_hasDecodedCallback = true;
+    }
+
+    virtual void onBlobAssetError(const BlobAssetHandle handle,
+                                  uint64_t requestId,
+                                  std::string error) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(error.size());
+        CHECK(!m_hasErrorCallback);
+        m_hasErrorCallback = true;
+    }
+
+    virtual void onBlobAssetDeleted(const BlobAssetHandle handle,
+                                    uint64_t requestId) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_deleteRequestId);
+        CHECK(!m_hasDeletedCallback);
+        m_hasDeletedCallback = true;
+    }
+
+    BlobAssetHandle m_handle = RIVE_NULL_HANDLE;
+    uint64_t m_requestId = 0x10;
+    uint64_t m_deleteRequestId = 0x11;
+    bool m_hasDecodedCallback = false;
+    bool m_hasErrorCallback = false;
+    bool m_hasDeletedCallback = false;
+};
+
+TEST_CASE("blob asset listener callbacks", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestBlobAssetListener decodeListener;
+    decodeListener.m_handle =
+        commandQueue->decodeBlob(std::vector<uint8_t>{1, 2, 3},
+                                 &decodeListener,
+                                 decodeListener.m_requestId);
+
+    rcp<BlobAsset> externalBlob = make_rcp<BlobAsset>();
+    TestBlobAssetListener externalListener;
+    externalListener.m_handle =
+        commandQueue->addExternalBlob(externalBlob,
+                                      &externalListener,
+                                      externalListener.m_requestId);
+
+    // A null external blob should report an error.
+    TestBlobAssetListener errorListener;
+    errorListener.m_handle =
+        commandQueue->addExternalBlob(nullptr,
+                                      &errorListener,
+                                      errorListener.m_requestId);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(decodeListener.m_hasDecodedCallback);
+    CHECK(externalListener.m_hasDecodedCallback);
+    CHECK(!errorListener.m_hasDecodedCallback);
+    CHECK(errorListener.m_hasErrorCallback);
+
+    commandQueue->deleteBlob(decodeListener.m_handle,
+                             decodeListener.m_deleteRequestId);
+    commandQueue->deleteBlob(externalListener.m_handle,
+                             externalListener.m_deleteRequestId);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(decodeListener.m_hasDeletedCallback);
+    CHECK(externalListener.m_hasDeletedCallback);
 
     commandQueue->disconnect();
     serverThread.join();
@@ -1732,6 +1994,134 @@ public:
     uint64_t m_receivedErrors = 0;
 };
 
+/** Records failed reads without inspecting an invalid scalar payload. */
+class FailedPropertyReadListener
+    : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    /**
+     * Records each error's request ID and verifies its instance and diagnostic.
+     */
+    void onViewModelInstanceError(ViewModelInstanceHandle handle,
+                                  uint64_t requestId,
+                                  std::string error) override
+    {
+        CHECK(handle == expectedHandle);
+        CHECK(error.find("Could not find view model property") !=
+              std::string::npos);
+        errorIds.push_back(requestId);
+    }
+
+    /**
+     * Records value responses so failed requests cannot silently emit values.
+     */
+    void onViewModelDataReceived(
+        ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        CommandQueue::ViewModelInstanceData data) override
+    {
+        CHECK(handle == expectedHandle);
+        CHECK(data.metaData.name == expectedPath);
+        CHECK(data.metaData.type == expectedType);
+        valueIds.push_back(requestId);
+    }
+
+    ViewModelInstanceHandle expectedHandle;
+    std::string expectedPath;
+    DataType expectedType;
+    std::vector<uint64_t> errorIds;
+    std::vector<uint64_t> valueIds;
+};
+
+TEST_CASE("Failed property reads emit only errors and preserve later commands",
+          "[CommandQueue]")
+{
+    using Getter =
+        void (CommandQueue::*)(ViewModelInstanceHandle, std::string, uint64_t);
+    struct ReadCase
+    {
+        DataType type;
+        Getter getter;
+        const char* validPath;
+        const char* wrongTypePath;
+    };
+    const ReadCase cases[] = {
+        {DataType::boolean,
+         &CommandQueue::requestViewModelInstanceBool,
+         "Test Bool",
+         "Test Num"},
+        {DataType::number,
+         &CommandQueue::requestViewModelInstanceNumber,
+         "Test Num",
+         "Test Bool"},
+        {DataType::color,
+         &CommandQueue::requestViewModelInstanceColor,
+         "Test Color",
+         "Test Bool"},
+        {DataType::string,
+         &CommandQueue::requestViewModelInstanceString,
+         "Test String",
+         "Test Bool"},
+        {DataType::enumType,
+         &CommandQueue::requestViewModelInstanceEnum,
+         "Test Enum",
+         "Test Bool"},
+    };
+    const auto& read = cases[GENERATE(0, 1, 2, 3, 4)];
+    CAPTURE(read.validPath);
+
+    auto queue = make_rcp<CommandQueue>();
+    auto context = RenderContextNULL::MakeContext();
+    FailedPropertyReadListener listener;
+    CommandServer server(queue, context.get());
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    REQUIRE(stream.is_open());
+    auto file = queue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    auto artboard = queue->instantiateDefaultArtboard(file);
+    auto instance =
+        queue->instantiateDefaultViewModelInstance(file, artboard, &listener);
+    listener.expectedHandle = instance;
+    listener.expectedPath = read.validPath;
+    listener.expectedType = read.type;
+
+    // Draws queued before a failed read must still reach the batch epilogue.
+    bool drew = false;
+    queue->draw(queue->createDrawKey(),
+                [&](DrawKey, CommandServer*) { drew = true; });
+    uint64_t requestId = 0;
+    std::vector<uint64_t> expectedErrors;
+    for (const char* path : {"nonexistent",
+                             "Test Nested/nonexistent",
+                             "nonexistent/child",
+                             read.wrongTypePath})
+    {
+        CAPTURE(path);
+        expectedErrors.push_back(++requestId);
+        (queue.get()->*read.getter)(instance, path, requestId);
+    }
+    // A valid read in the same batch must survive all preceding lookup
+    // failures.
+    const auto validRequestId = ++requestId;
+    (queue.get()->*read.getter)(instance, read.validPath, validRequestId);
+    bool reachedLaterCommand = false;
+    queue->runOnce([&](CommandServer*) { reachedLaterCommand = true; });
+    server.processCommands();
+    queue->processMessages();
+
+    CHECK(reachedLaterCommand);
+    CHECK(drew);
+    CHECK(listener.errorIds == expectedErrors);
+    CHECK(listener.valueIds == std::vector<uint64_t>{validRequestId});
+
+    queue->deleteViewModelInstance(instance);
+    queue->deleteArtboard(artboard);
+    queue->deleteFile(file);
+    queue->disconnect();
+    server.processCommands();
+    queue->processMessages();
+}
+
 TEST_CASE("View Model Property Set/Get", "[CommandQueue]")
 {
     auto commandQueue = make_rcp<CommandQueue>();
@@ -1877,6 +2267,32 @@ TEST_CASE("View Model Property Set/Get", "[CommandQueue]")
             CHECK(imageProperty->testing_value() == image);
         });
 
+    // Setting a null image handle should clear the property.
+    commandQueue->setViewModelInstanceImage(tester.m_handle,
+                                            "Test Image",
+                                            RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([handle = tester.m_handle](CommandServer* server) {
+        auto viewModel = server->getViewModelInstance(handle);
+        CHECK(viewModel != nullptr);
+        auto imageProperty = viewModel->propertyImage("Test Image");
+        CHECK(imageProperty != nullptr);
+        CHECK(imageProperty->testing_value() == nullptr);
+    });
+
+    // Setting a null artboard handle should clear the property.
+    commandQueue->setViewModelInstanceArtboard(tester.m_handle,
+                                               "Test Artboard",
+                                               RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([handle = tester.m_handle](CommandServer* server) {
+        auto viewModel = server->getViewModelInstance(handle);
+        CHECK(viewModel != nullptr);
+        auto artboardProperty = viewModel->propertyArtboard("Test Artboard");
+        CHECK(artboardProperty != nullptr);
+        CHECK(artboardProperty->testing_value() == nullptr);
+    });
+
     // We should set / get in order as it goes through the list.
     for (int i = 0; i < 10; ++i)
     {
@@ -1950,6 +2366,253 @@ TEST_CASE("View Model Property Set/Get", "[CommandQueue]")
     commandQueue->disconnect();
     serverThread.join();
 }
+
+#if WITH_RIVE_TEXT
+class FontDataBindingListener : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    void onViewModelInstanceError(const ViewModelInstanceHandle handle,
+                                  uint64_t requestId,
+                                  std::string error) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(error.size());
+        ++m_receivedErrors;
+    }
+
+    void onViewModelDataReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        CommandQueue::ViewModelInstanceData data) override
+    {
+        CHECK(handle == m_handle);
+        m_receivedRequestIds.push_back(requestId);
+        m_receivedData.push_back(std::move(data));
+    }
+
+    ViewModelInstanceHandle m_handle = RIVE_NULL_HANDLE;
+    uint64_t m_subscriptionRequestId = 42;
+    size_t m_receivedErrors = 0;
+    std::vector<uint64_t> m_receivedRequestIds;
+    std::vector<CommandQueue::ViewModelInstanceData> m_receivedData;
+};
+
+class FontPropertyDefinitionListener : public CommandQueue::FileListener
+{
+public:
+    void onViewModelsListed(const FileHandle handle,
+                            uint64_t requestId,
+                            std::vector<std::string> viewModelNames) override
+    {
+        CHECK(handle == m_handle);
+        m_viewModelNames = std::move(viewModelNames);
+    }
+
+    void onViewModelPropertiesListed(
+        const FileHandle handle,
+        uint64_t requestId,
+        std::string viewModelName,
+        std::vector<ViewModelPropertyData> properties) override
+    {
+        CHECK(handle == m_handle);
+        auto result = m_properties.emplace(std::move(viewModelName),
+                                           std::move(properties));
+        CHECK(result.second);
+    }
+
+    FileHandle m_handle = RIVE_NULL_HANDLE;
+    std::vector<std::string> m_viewModelNames;
+    std::unordered_map<std::string, std::vector<ViewModelPropertyData>>
+        m_properties;
+};
+
+struct FontDataBindingFixture
+{
+    rcp<CommandQueue> commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    std::unique_ptr<CommandServer> server =
+        std::make_unique<CommandServer>(commandQueue, nullContext.get());
+    FontDataBindingListener listener;
+    FontHandle fontHandle = RIVE_NULL_HANDLE;
+    FontHandle alternateFontHandle = RIVE_NULL_HANDLE;
+
+    FontDataBindingFixture()
+    {
+        std::ifstream riveStream("assets/data_bind_font_test.riv",
+                                 std::ios::binary);
+        auto fileHandle = commandQueue->loadFile(
+            std::vector<uint8_t>(std::istreambuf_iterator<char>(riveStream),
+                                 {}));
+        auto artboardHandle =
+            commandQueue->instantiateDefaultArtboard(fileHandle);
+        listener.m_handle =
+            commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                              artboardHandle,
+                                                              &listener);
+
+        std::ifstream fontStream("assets/kablammo.ttf", std::ios::binary);
+        fontHandle = commandQueue->decodeFont(
+            std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream),
+                                 {}));
+        std::ifstream alternateFontStream("assets/nabla.ttf", std::ios::binary);
+        alternateFontHandle = commandQueue->decodeFont(std::vector<uint8_t>(
+            std::istreambuf_iterator<char>(alternateFontStream),
+            {}));
+        pump();
+    }
+
+    ViewModelInstanceAssetFontRuntime* property()
+    {
+        auto viewModel = server->getViewModelInstance(listener.m_handle);
+        return viewModel == nullptr ? nullptr
+                                    : viewModel->propertyFont("fontProperty");
+    }
+
+    void pump()
+    {
+        server->processCommands();
+        commandQueue->processMessages();
+    }
+};
+
+TEST_CASE(
+    "Setting, replacing, and clearing a view model font property handles valid values",
+    "[CommandQueue][font data binding]")
+{
+    FontDataBindingFixture fixture;
+    auto property = fixture.property();
+    REQUIRE(property != nullptr);
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   fixture.fontHandle);
+    fixture.pump();
+    REQUIRE(property->testing_value() ==
+            fixture.server->getFont(fixture.fontHandle));
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   fixture.alternateFontHandle);
+    fixture.pump();
+
+    CHECK(property->testing_value() ==
+          fixture.server->getFont(fixture.alternateFontHandle));
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   RIVE_NULL_HANDLE);
+    fixture.pump();
+
+    CHECK(property->testing_value() == nullptr);
+}
+
+TEST_CASE(
+    "An invalid FontHandle preserves the font property and reports an error",
+    "[CommandQueue][font data binding]")
+{
+    FontDataBindingFixture fixture;
+    auto property = fixture.property();
+    REQUIRE(property != nullptr);
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   fixture.fontHandle);
+    fixture.pump();
+    auto boundFont = property->testing_value();
+    REQUIRE(boundFont != nullptr);
+
+    fixture.commandQueue->deleteFont(fixture.alternateFontHandle);
+    fixture.pump();
+    REQUIRE(fixture.server->getFont(fixture.alternateFontHandle) == nullptr);
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   fixture.alternateFontHandle);
+    fixture.pump();
+
+    CHECK(property->testing_value() == boundFont);
+    CHECK(fixture.listener.m_receivedErrors == 1);
+}
+
+TEST_CASE("Setting a missing view model font property reports an error",
+          "[CommandQueue][font data binding]")
+{
+    FontDataBindingFixture fixture;
+
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "missingFontProperty",
+                                                   fixture.fontHandle);
+    fixture.pump();
+
+    CHECK(fixture.listener.m_receivedErrors == 1);
+}
+
+TEST_CASE("View model font subscriptions report assetFont metadata",
+          "[CommandQueue][font data binding]")
+{
+    FontDataBindingFixture fixture;
+
+    fixture.commandQueue->subscribeToViewModelProperty(
+        fixture.listener.m_handle,
+        "fontProperty",
+        DataType::assetFont,
+        fixture.listener.m_subscriptionRequestId);
+    fixture.commandQueue->setViewModelInstanceFont(fixture.listener.m_handle,
+                                                   "fontProperty",
+                                                   fixture.fontHandle);
+    fixture.pump();
+
+    REQUIRE(fixture.listener.m_receivedData.size() == 1);
+    REQUIRE(fixture.listener.m_receivedRequestIds.size() == 1);
+    CHECK(fixture.listener.m_receivedRequestIds[0] ==
+          fixture.listener.m_subscriptionRequestId);
+    CHECK(fixture.listener.m_receivedData[0].metaData.type ==
+          DataType::assetFont);
+    CHECK(fixture.listener.m_receivedData[0].metaData.name == "fontProperty");
+}
+
+TEST_CASE("View model property definitions report font properties as assetFont",
+          "[CommandQueue][font data binding]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    auto nullContext = RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+    FontPropertyDefinitionListener listener;
+
+    std::ifstream riveStream("assets/data_bind_font_test.riv",
+                             std::ios::binary);
+    listener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(riveStream), {}),
+        &listener);
+    commandQueue->requestViewModelNames(listener.m_handle);
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(!listener.m_viewModelNames.empty());
+    for (const auto& viewModelName : listener.m_viewModelNames)
+    {
+        commandQueue->requestViewModelPropertyDefinitions(listener.m_handle,
+                                                          viewModelName);
+    }
+    server.processCommands();
+    commandQueue->processMessages();
+
+    size_t fontPropertyCount = 0;
+    for (const auto& entry : listener.m_properties)
+    {
+        for (const auto& property : entry.second)
+        {
+            if (property.name == "fontProperty")
+            {
+                ++fontPropertyCount;
+                CHECK(property.type == DataType::assetFont);
+            }
+        }
+    }
+    CHECK(fontPropertyCount == 1);
+}
+#endif
 
 class ViewModelPropertySubscriptionListener
     : public CommandQueue::ViewModelInstanceListener
@@ -2187,9 +2850,6 @@ TEST_CASE("Set Artboard Size / Reset Artboard Size", "[CommandQueue]")
 
     auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
 
-    rive::ArtboardHandle InvalidHandle =
-        reinterpret_cast<rive::ArtboardHandle>(0xFF);
-
     commandQueue->setArtboardSize(artboardHandle, 1000, 1000);
 
     commandQueue->runOnce(
@@ -2219,10 +2879,74 @@ TEST_CASE("Set Artboard Size / Reset Artboard Size", "[CommandQueue]")
             CHECK(artboard->height() == artboard->originalHeight());
         });
 
-    commandQueue->setArtboardSize(InvalidHandle, 10, 10);
-    commandQueue->resetArtboardSize(InvalidHandle);
+    wait_for_server(commandQueue.get());
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class TestArtboardVolumeListener : public CommandQueue::ArtboardListener
+{
+public:
+    virtual void onArtboardVolumeReceived(const ArtboardHandle handle,
+                                          uint64_t requestId,
+                                          float volume) override
+    {
+        CHECK(requestId == m_requestId);
+        CHECK(handle == m_handle);
+        m_receivedVolume = volume;
+        m_hasCallback = true;
+    }
+
+    uint64_t m_requestId;
+    ArtboardHandle m_handle;
+    float m_receivedVolume = -1.0f;
+    bool m_hasCallback = false;
+};
+
+TEST_CASE("Set Artboard Volume / Get Artboard Volume", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+
+    commandQueue->setArtboardVolume(artboardHandle, 0.5f);
+
+    commandQueue->runOnce(
+        [artboardHandle = artboardHandle](CommandServer* server) {
+            auto artboard = server->getArtboardInstance(artboardHandle);
+            CHECK(artboard->volume() == 0.5f);
+        });
+
+    commandQueue->setArtboardVolume(artboardHandle, 0.0f);
+
+    commandQueue->runOnce(
+        [artboardHandle = artboardHandle](CommandServer* server) {
+            auto artboard = server->getArtboardInstance(artboardHandle);
+            CHECK(artboard->volume() == 0.0f);
+        });
+
+    // Test getter via listener
+    TestArtboardVolumeListener volumeListener;
+
+    auto listenerArtboard =
+        commandQueue->instantiateDefaultArtboard(fileHandle, &volumeListener);
+    volumeListener.m_handle = listenerArtboard;
+    volumeListener.m_requestId = 0x50;
+
+    commandQueue->setArtboardVolume(listenerArtboard, 0.75f);
+    commandQueue->requestArtboardVolume(listenerArtboard, 0x50);
 
     wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(volumeListener.m_hasCallback);
+    CHECK(volumeListener.m_receivedVolume == 0.75f);
 
     commandQueue->disconnect();
     serverThread.join();
@@ -2452,6 +3176,182 @@ TEST_CASE("View Model Property Subscriptions", "[CommandQueue]")
     commandQueue->disconnect();
 }
 
+class ViewModelBlobPropertyListener
+    : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    virtual void onViewModelInstanceError(const ViewModelInstanceHandle handle,
+                                          uint64_t requestId,
+                                          std::string error) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(error.size());
+        ++m_receivedErrors;
+    }
+
+    virtual void onViewModelDataReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        CommandQueue::ViewModelInstanceData data) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(data.metaData.type == DataType::assetBlob);
+        CHECK(data.metaData.name == "xml");
+        ++m_receivedCallbacks;
+    }
+
+    ViewModelInstanceHandle m_handle;
+    size_t m_expectedErrors = 0;
+    size_t m_receivedErrors = 0;
+    int m_receivedCallbacks = 0;
+};
+
+TEST_CASE("View Model Blob Property Set", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::ifstream stream("assets/data_bind_blob_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    ViewModelBlobPropertyListener tester;
+
+    auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+    tester.m_handle =
+        commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                          artboardHandle,
+                                                          &tester);
+
+    // Blobs don't have a "get" equivalent so we test them with a run once
+    // directly.
+    std::vector<uint8_t> blobData = {0xA, 0xB, 0xC};
+    auto blobHandle = commandQueue->decodeBlob(blobData);
+    commandQueue->setViewModelInstanceBlob(tester.m_handle, "xml", blobHandle);
+
+    commandQueue->runOnce([blobHandle, blobData, handle = tester.m_handle](
+                              CommandServer* server) {
+        auto blob = server->getBlob(blobHandle);
+        CHECK(blob != nullptr);
+        auto viewModel = server->getViewModelInstance(handle);
+        CHECK(viewModel != nullptr);
+        auto blobProperty = viewModel->propertyBlob("xml");
+        CHECK(blobProperty != nullptr);
+        CHECK(blobProperty->testing_value() == blob);
+        CHECK(blob->bytes().size() == blobData.size());
+    });
+
+    // A deleted (unknown) blob handle should report an error and leave the
+    // property untouched.
+    auto deletedBlobHandle = commandQueue->decodeBlob(blobData);
+    commandQueue->deleteBlob(deletedBlobHandle);
+    commandQueue->setViewModelInstanceBlob(tester.m_handle,
+                                           "xml",
+                                           deletedBlobHandle);
+    ++tester.m_expectedErrors;
+
+    commandQueue->runOnce(
+        [blobHandle, handle = tester.m_handle](CommandServer* server) {
+            auto blob = server->getBlob(blobHandle);
+            CHECK(blob != nullptr);
+            auto viewModel = server->getViewModelInstance(handle);
+            CHECK(viewModel != nullptr);
+            auto blobProperty = viewModel->propertyBlob("xml");
+            CHECK(blobProperty != nullptr);
+            CHECK(blobProperty->testing_value() == blob);
+        });
+
+    // Bad property path.
+    commandQueue->setViewModelInstanceBlob(tester.m_handle, "Blah", blobHandle);
+    ++tester.m_expectedErrors;
+
+    // Setting a null blob handle should clear the property.
+    commandQueue->setViewModelInstanceBlob(tester.m_handle,
+                                           "xml",
+                                           RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([handle = tester.m_handle](CommandServer* server) {
+        auto viewModel = server->getViewModelInstance(handle);
+        CHECK(viewModel != nullptr);
+        auto blobProperty = viewModel->propertyBlob("xml");
+        CHECK(blobProperty != nullptr);
+        CHECK(blobProperty->testing_value() == nullptr);
+    });
+
+    // Setting on a deleted view model instance should report an error.
+    commandQueue->deleteViewModelInstance(tester.m_handle);
+    commandQueue->setViewModelInstanceBlob(tester.m_handle, "xml", blobHandle);
+    ++tester.m_expectedErrors;
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(tester.m_expectedErrors == tester.m_receivedErrors);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("View Model Blob Property Subscription", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    // Same-thread server so the subscription pass at the end of
+    // processCommands is deterministic.
+    CommandServer server(commandQueue, nullContext.get());
+
+    std::ifstream stream("assets/data_bind_blob_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    ViewModelBlobPropertyListener tester;
+
+    auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+    tester.m_handle =
+        commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                          artboardHandle,
+                                                          &tester);
+
+    commandQueue->subscribeToViewModelProperty(tester.m_handle,
+                                               "xml",
+                                               DataType::assetBlob);
+
+    commandQueue->subscribeToViewModelProperty(tester.m_handle,
+                                               "Bad property",
+                                               DataType::assetBlob);
+    ++tester.m_expectedErrors;
+
+    commandQueue->runOnce([](CommandServer* server) {
+        auto subs = server->testing_getSubsciptions();
+        CHECK(subs.size() == 1);
+    });
+
+    auto blobHandle = commandQueue->decodeBlob(std::vector<uint8_t>{1, 2, 3});
+    commandQueue->setViewModelInstanceBlob(tester.m_handle, "xml", blobHandle);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(tester.m_receivedCallbacks == 1);
+
+    commandQueue->unsubscribeToViewModelProperty(tester.m_handle,
+                                                 "xml",
+                                                 DataType::assetBlob);
+
+    commandQueue->runOnce([](CommandServer* server) {
+        auto subs = server->testing_getSubsciptions();
+        CHECK(subs.empty());
+    });
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(tester.m_expectedErrors == tester.m_receivedErrors);
+
+    commandQueue->disconnect();
+}
+
 class AsyncSubListener : public CommandQueue::ViewModelInstanceListener
 {
 public:
@@ -2523,6 +3423,81 @@ TEST_CASE("View Model Property Async Subscriptions", "[CommandQueue]")
 
     commandQueue->disconnect();
     serverThread.join();
+}
+
+TEST_CASE("Child listener destruction preserves parent subscriptions",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    auto nullContext = RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    REQUIRE(stream.is_open());
+    auto file = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    ViewModelPropertySubscriptionListener parent;
+    parent.m_handle =
+        commandQueue->instantiateBlankViewModelInstance(file,
+                                                        "Test All",
+                                                        &parent);
+    commandQueue->subscribeToViewModelProperty(parent.m_handle,
+                                               "Test Num",
+                                               DataType::number);
+    parent.pushExpectation(commandQueue.get(), "Test Num", 10.0f);
+    server.processCommands();
+    commandQueue->processMessages();
+    REQUIRE(parent.m_receivedCallbacks == 1);
+    CHECK(parent.m_receivedErrors == 0);
+
+    {
+        ViewModelPropertySubscriptionListener child;
+        ViewModelInstanceHandle childHandle = RIVE_NULL_HANDLE;
+
+        SECTION("Nested property child")
+        {
+            childHandle =
+                commandQueue->referenceNestedViewModelInstance(parent.m_handle,
+                                                               "Test Nested",
+                                                               &child);
+        }
+
+        SECTION("List element child")
+        {
+            auto nested =
+                commandQueue->referenceNestedViewModelInstance(parent.m_handle,
+                                                               "Test Nested");
+            commandQueue->insertViewModelInstanceListViewModel(parent.m_handle,
+                                                               "Test List",
+                                                               nested,
+                                                               0);
+            childHandle =
+                commandQueue->referenceListViewModelInstance(parent.m_handle,
+                                                             "Test List",
+                                                             0,
+                                                             &child);
+        }
+
+        child.m_handle = childHandle;
+        server.processCommands();
+        commandQueue->processMessages();
+        REQUIRE(server.getViewModelInstance(childHandle) != nullptr);
+        CHECK(child.m_receivedErrors == 0);
+
+        parent.pushExpectation(commandQueue.get(), "Test Num", 20.0f);
+        server.processCommands();
+        commandQueue->processMessages();
+        REQUIRE(parent.m_receivedCallbacks == 2);
+    }
+
+    parent.pushExpectation(commandQueue.get(), "Test Num", 30.0f);
+    server.processCommands();
+    commandQueue->processMessages();
+    CHECK(parent.m_receivedCallbacks == 3);
+    CHECK(parent.m_receivedErrors == 0);
+
+    commandQueue->disconnect();
 }
 
 class ListViewModelPropertyListener
@@ -2800,6 +3775,29 @@ TEST_CASE("file Error Messages", "[CommandQueue]")
     commandQueue->processMessages();
     CHECK(badFileListener.m_receivedErrors == 3);
 
+    // Artboard with no view model should produce errors for all
+    // artboard-based VMI instantiation commands.
+    TestFileErrorListener noVMListener;
+    std::ifstream noVMStream("assets/entry.riv", std::ios::binary);
+    noVMListener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(noVMStream), {}),
+        &noVMListener);
+
+    auto noVMArtboard =
+        commandQueue->instantiateDefaultArtboard(noVMListener.m_handle);
+
+    commandQueue->instantiateBlankViewModelInstance(noVMListener.m_handle,
+                                                    noVMArtboard);
+    commandQueue->instantiateDefaultViewModelInstance(noVMListener.m_handle,
+                                                      noVMArtboard);
+    commandQueue->instantiateViewModelInstanceNamed(noVMListener.m_handle,
+                                                    noVMArtboard,
+                                                    "Nonexistent");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+    CHECK(noVMListener.m_receivedErrors == 3);
+
     commandQueue->disconnect();
     serverThread.join();
 }
@@ -2939,6 +3937,123 @@ TEST_CASE("listEnums", "[CommandQueue]")
     serverThread.join();
 }
 
+class TestViewModelInstanceViewModelNameListener
+    : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    virtual void onViewModelInstanceViewModelNameReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        std::string viewModelName) override
+    {
+        CHECK(requestId == m_requestId);
+        CHECK(handle == m_handle);
+        CHECK(viewModelName == m_expectedViewModelName);
+        m_hasCallback = true;
+    }
+
+    virtual void onViewModelInstanceNameReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        std::string instanceName) override
+    {
+        CHECK(requestId == m_requestId);
+        CHECK(handle == m_handle);
+        CHECK(instanceName == m_expectedInstanceName);
+        m_hasInstanceNameCallback = true;
+    }
+
+    virtual void onViewModelInstanceError(const ViewModelInstanceHandle handle,
+                                          uint64_t requestId,
+                                          std::string error) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(error.size());
+        if (requestId == m_instanceNameErrorRequestId)
+        {
+            m_hasInstanceNameError = true;
+        }
+        ++m_receivedErrors;
+    }
+
+    uint64_t m_requestId = 0;
+    ViewModelInstanceHandle m_handle;
+    std::string m_expectedViewModelName;
+    std::string m_expectedInstanceName;
+    bool m_hasCallback = false;
+    bool m_hasInstanceNameCallback = false;
+    uint64_t m_instanceNameErrorRequestId = 0;
+    bool m_hasInstanceNameError = false;
+    int m_receivedErrors = 0;
+};
+
+TEST_CASE("requestViewModelInstanceViewModelName and "
+          "requestViewModelInstanceName",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestViewModelInstanceViewModelNameListener vmListener;
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    ArtboardHandle artboardHandle =
+        commandQueue->instantiateDefaultArtboard(fileHandle);
+
+    ViewModelInstanceHandle vmHandle =
+        commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                          artboardHandle,
+                                                          &vmListener);
+
+    vmListener.m_handle = vmHandle;
+    vmListener.m_expectedViewModelName = "Test All";
+    vmListener.m_expectedInstanceName = "Test Default";
+    vmListener.m_requestId = 0x50;
+
+    commandQueue->requestViewModelInstanceViewModelName(vmHandle,
+                                                        vmListener.m_requestId);
+    commandQueue->requestViewModelInstanceName(vmHandle,
+                                               vmListener.m_requestId);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(vmListener.m_hasCallback);
+    CHECK(vmListener.m_hasInstanceNameCallback);
+
+    // A handle that resolves to a null instance on the server (invalid view
+    // model name) should not trigger the success callback but should produce
+    // an error on its listener.
+    TestViewModelInstanceViewModelNameListener badListener;
+    ViewModelInstanceHandle badHandle =
+        commandQueue->instantiateViewModelInstanceNamed(fileHandle,
+                                                        "Blah",
+                                                        "Blah",
+                                                        &badListener);
+    badListener.m_handle = badHandle;
+    badListener.m_instanceNameErrorRequestId = 0x52;
+
+    commandQueue->requestViewModelInstanceViewModelName(badHandle, 0x51);
+    commandQueue->requestViewModelInstanceName(
+        badHandle,
+        badListener.m_instanceNameErrorRequestId);
+
+    wait_for_server(commandQueue.get());
+
+    commandQueue->processMessages();
+
+    CHECK(!badListener.m_hasCallback);
+    CHECK(!badListener.m_hasInstanceNameCallback);
+    CHECK(badListener.m_hasInstanceNameError);
+    CHECK(badListener.m_receivedErrors >= 1);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
 class TestRenderImageErrorListener : public CommandQueue::RenderImageListener
 {
 public:
@@ -3022,17 +4137,36 @@ TEST_CASE("render image / audio source / font error", "[CommandQueue]")
 class TestStateMachineErrorListener : public CommandQueue::StateMachineListener
 {
 public:
+    struct ReceivedViewModelInstance
+    {
+        ViewModelInstanceHandle handle;
+        uint64_t requestId;
+    };
+
     virtual void onStateMachineError(const StateMachineHandle handle,
                                      uint64_t requestId,
                                      std::string error) override
     {
         CHECK(handle == m_handle);
         CHECK(error.size());
+        m_errorRequestIds.push_back(requestId);
         ++m_receivedErrors;
+    }
+
+    virtual void onViewModelInstanceReceived(
+        const StateMachineHandle stateMachineHandle,
+        uint64_t requestId,
+        ViewModelInstanceHandle viewModelInstanceHandle) override
+    {
+        CHECK(stateMachineHandle == m_handle);
+        m_receivedViewModelInstances.push_back(
+            {viewModelInstanceHandle, requestId});
     }
 
     StateMachineHandle m_handle;
     size_t m_receivedErrors = 0;
+    std::vector<uint64_t> m_errorRequestIds;
+    std::vector<ReceivedViewModelInstance> m_receivedViewModelInstances;
 };
 
 TEST_CASE("state machine error", "[CommandQueue]")
@@ -3085,11 +4219,13 @@ public:
     {
         CHECK(handle == m_handle);
         CHECK(error.size());
+        m_requestIDs.push_back(requestId);
         ++m_receivedErrors;
     }
 
     size_t m_receivedErrors = 0;
     ArtboardHandle m_handle;
+    std::vector<uint64_t> m_requestIDs;
 };
 
 TEST_CASE("artboard errors", "[CommandQueue]")
@@ -3129,6 +4265,56 @@ TEST_CASE("artboard errors", "[CommandQueue]")
     commandQueue->processMessages();
 
     CHECK(badArtboardListener.m_receivedErrors == 2);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("Set Artboard Volume / Get Artboard Volume errors on invalid handles",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestArtboardErrorListener errorListener;
+    auto invalidHandle = reinterpret_cast<rive::ArtboardHandle>(0xFF);
+    errorListener.m_handle = invalidHandle;
+    commandQueue->setGlobalArtboardListener(&errorListener);
+
+    commandQueue->setArtboardVolume(invalidHandle, 0.5f, 0x51);
+    commandQueue->requestArtboardVolume(invalidHandle, 0x52);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(errorListener.m_receivedErrors == 2);
+    CHECK(errorListener.m_requestIDs[0] == 0x51);
+    CHECK(errorListener.m_requestIDs[1] == 0x52);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("Set Artboard Size / Reset Artboard Size errors on invalid handles",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestArtboardErrorListener errorListener;
+    auto invalidHandle = reinterpret_cast<rive::ArtboardHandle>(0xFF);
+    errorListener.m_handle = invalidHandle;
+    commandQueue->setGlobalArtboardListener(&errorListener);
+
+    commandQueue->setArtboardSize(invalidHandle, 10, 10, 1, 0x51);
+    commandQueue->resetArtboardSize(invalidHandle, 0x52);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(errorListener.m_receivedErrors == 2);
+    CHECK(errorListener.m_requestIDs[0] == 0x51);
+    CHECK(errorListener.m_requestIDs[1] == 0x52);
 
     commandQueue->disconnect();
     serverThread.join();
@@ -3204,6 +4390,116 @@ TEST_CASE("listStateMachine", "[CommandQueue]")
     commandQueue->processMessages();
 
     CHECK(!artboardListener.m_hasCallback);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class TestArtboardSizeListener : public CommandQueue::ArtboardListener
+{
+public:
+    void onArtboardSizeReceived(const ArtboardHandle handle,
+                                uint64_t requestId,
+                                float width,
+                                float height) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_requestId);
+        m_width = width;
+        m_height = height;
+        m_hasCallback = true;
+    }
+
+    void onArtboardError(const ArtboardHandle handle,
+                         uint64_t requestId,
+                         std::string error) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(!error.empty());
+        m_hasError = true;
+    }
+
+    uint64_t m_requestId = 0;
+    ArtboardHandle m_handle = RIVE_NULL_HANDLE;
+    float m_width = 0;
+    float m_height = 0;
+    bool m_hasCallback = false;
+    bool m_hasError = false;
+};
+
+TEST_CASE("requestArtboardSize", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    TestArtboardSizeListener listener;
+    auto artboardHandle =
+        commandQueue->instantiateDefaultArtboard(fileHandle, &listener);
+    listener.m_handle = artboardHandle;
+
+    SECTION("returns default artboard size")
+    {
+        listener.m_requestId = 0x50;
+        commandQueue->requestArtboardSize(artboardHandle, listener.m_requestId);
+
+        float expectedWidth = 0;
+        float expectedHeight = 0;
+        commandQueue->runOnce([artboardHandle, &expectedWidth, &expectedHeight](
+                                  CommandServer* server) {
+            auto artboard = server->getArtboardInstance(artboardHandle);
+            expectedWidth = artboard->originalWidth();
+            expectedHeight = artboard->originalHeight();
+        });
+
+        wait_for_server(commandQueue.get());
+        commandQueue->processMessages();
+
+        CHECK(listener.m_hasCallback);
+        CHECK(listener.m_width == expectedWidth);
+        CHECK(listener.m_height == expectedHeight);
+    }
+
+    SECTION("returns size after setArtboardSize")
+    {
+        commandQueue->setArtboardSize(artboardHandle, 1000, 500);
+
+        listener.m_requestId = 0x51;
+        commandQueue->requestArtboardSize(artboardHandle, listener.m_requestId);
+
+        wait_for_server(commandQueue.get());
+        commandQueue->processMessages();
+
+        CHECK(listener.m_hasCallback);
+        CHECK(listener.m_width == 1000.f);
+        CHECK(listener.m_height == 500.f);
+    }
+
+    SECTION("reports error for invalid handle")
+    {
+        rive::ArtboardHandle invalidHandle =
+            reinterpret_cast<rive::ArtboardHandle>(0xFF);
+
+        TestArtboardSizeListener globalListener;
+        globalListener.m_handle = invalidHandle;
+        globalListener.m_requestId = 0x52;
+        commandQueue->setGlobalArtboardListener(&globalListener);
+
+        commandQueue->requestArtboardSize(invalidHandle,
+                                          globalListener.m_requestId);
+
+        wait_for_server(commandQueue.get());
+        commandQueue->processMessages();
+
+        CHECK(!globalListener.m_hasCallback);
+        CHECK(globalListener.m_hasError);
+
+        commandQueue->setGlobalArtboardListener(nullptr);
+    }
 
     commandQueue->disconnect();
     serverThread.join();
@@ -3372,8 +4668,9 @@ TEST_CASE("bindViewModelInstance", "[CommandQueue]")
         auto viewModel = server->getViewModelInstance(viewModelHandle);
         CHECK(viewModel != nullptr);
 
-        CHECK(stateMachine->artboard()->dataContext()->viewModelInstance() ==
-              viewModel->instance());
+        CHECK(
+            stateMachine->artboard()->dataContext()->mainViewModelInstance() ==
+            viewModel->instance());
     });
 
     auto badInstanceHandle =
@@ -3628,6 +4925,247 @@ TEST_CASE("fileLoadedCallback", "[CommandQueue]")
 
     CHECK(!badFileListener.m_hasCallback);
 
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class ArtboardInstantiatedListener : public CommandQueue::FileListener
+{
+public:
+    virtual void onArtboardInstantiated(const FileHandle fileHandle,
+                                        uint64_t requestId,
+                                        ArtboardHandle artboardHandle) override
+    {
+        CHECK(fileHandle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(artboardHandle == m_artboardHandle);
+        m_hasCallback = true;
+    }
+
+    uint64_t m_requestId = 0;
+    FileHandle m_handle = RIVE_NULL_HANDLE;
+    ArtboardHandle m_artboardHandle = RIVE_NULL_HANDLE;
+    bool m_hasCallback = false;
+};
+
+TEST_CASE("artboardInstantiatedCallback", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    std::ifstream stream("assets/two_artboards.riv", std::ios::binary);
+
+    ArtboardInstantiatedListener fileListener;
+
+    fileListener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+
+    fileListener.m_artboardHandle =
+        commandQueue->instantiateArtboardNamed(fileListener.m_handle, "One");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(fileListener.m_hasCallback);
+
+    // Bad artboard name should not trigger the callback.
+    ArtboardInstantiatedListener badListener;
+
+    std::ifstream stream2("assets/two_artboards.riv", std::ios::binary);
+    badListener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &badListener);
+
+    commandQueue->instantiateArtboardNamed(badListener.m_handle, "Blah");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(!badListener.m_hasCallback);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class StateMachineInstantiatedListener : public CommandQueue::ArtboardListener
+{
+public:
+    virtual void onStateMachineInstantiated(
+        const ArtboardHandle artboardHandle,
+        uint64_t requestId,
+        StateMachineHandle stateMachineHandle) override
+    {
+        CHECK(artboardHandle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(stateMachineHandle == m_stateMachineHandle);
+        m_hasCallback = true;
+    }
+
+    uint64_t m_requestId = 0;
+    ArtboardHandle m_handle = RIVE_NULL_HANDLE;
+    StateMachineHandle m_stateMachineHandle = RIVE_NULL_HANDLE;
+    bool m_hasCallback = false;
+};
+
+TEST_CASE("stateMachineInstantiatedCallback", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    std::ifstream stream("assets/multiple_state_machines.riv",
+                         std::ios::binary);
+
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    StateMachineInstantiatedListener artboardListener;
+
+    artboardListener.m_handle =
+        commandQueue->instantiateDefaultArtboard(fileHandle, &artboardListener);
+
+    artboardListener.m_stateMachineHandle =
+        commandQueue->instantiateStateMachineNamed(artboardListener.m_handle,
+                                                   "one");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(artboardListener.m_hasCallback);
+
+    // Bad state machine name should not trigger the callback.
+    StateMachineInstantiatedListener badListener;
+
+    badListener.m_handle =
+        commandQueue->instantiateDefaultArtboard(fileHandle, &badListener);
+
+    commandQueue->instantiateStateMachineNamed(badListener.m_handle,
+                                               "blahblahblah");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(!badListener.m_hasCallback);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class ViewModelInstanceInstantiatedListener : public CommandQueue::FileListener
+{
+public:
+    virtual void onViewModelInstanceInstantiated(
+        const FileHandle fileHandle,
+        uint64_t requestId,
+        ViewModelInstanceHandle viewModelInstanceHandle) override
+    {
+        CHECK(fileHandle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(viewModelInstanceHandle == m_viewModelInstanceHandle);
+        m_hasCallback = true;
+    }
+
+    uint64_t m_requestId = 0;
+    FileHandle m_handle = RIVE_NULL_HANDLE;
+    ViewModelInstanceHandle m_viewModelInstanceHandle = RIVE_NULL_HANDLE;
+    bool m_hasCallback = false;
+};
+
+TEST_CASE("viewModelInstanceInstantiatedCallback", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+
+    ViewModelInstanceInstantiatedListener fileListener;
+
+    fileListener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+
+    fileListener.m_viewModelInstanceHandle =
+        commandQueue->instantiateViewModelInstanceNamed(fileListener.m_handle,
+                                                        "Test All",
+                                                        "Test Alternate");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(fileListener.m_hasCallback);
+
+    // Bad view model instance name should not trigger the callback.
+    ViewModelInstanceInstantiatedListener badListener;
+
+    std::ifstream stream2("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    badListener.m_handle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &badListener);
+
+    commandQueue->instantiateViewModelInstanceNamed(badListener.m_handle,
+                                                    "Test All",
+                                                    "Blah");
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(!badListener.m_hasCallback);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class ReferencedViewModelInstanceInstantiatedListener
+    : public CommandQueue::FileListener
+{
+public:
+    void onViewModelInstanceInstantiated(
+        const FileHandle fileHandle,
+        uint64_t requestId,
+        ViewModelInstanceHandle viewModelInstanceHandle) override
+    {
+        CHECK(fileHandle == RIVE_NULL_HANDLE);
+        m_handles[requestId] = viewModelInstanceHandle;
+    }
+
+    std::unordered_map<uint64_t, ViewModelInstanceHandle> m_handles;
+};
+
+TEST_CASE("referencedViewModelInstanceInstantiatedCallback", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+
+    auto fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    auto parent =
+        commandQueue->instantiateBlankViewModelInstance(fileHandle, "Test All");
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    ReferencedViewModelInstanceInstantiatedListener listener;
+    commandQueue->setGlobalFileListener(&listener);
+
+    auto nested = commandQueue->referenceNestedViewModelInstance(parent,
+                                                                 "Test Nested",
+                                                                 nullptr,
+                                                                 31);
+    commandQueue->insertViewModelInstanceListViewModel(parent,
+                                                       "Test List",
+                                                       nested,
+                                                       0);
+    auto listItem = commandQueue->referenceListViewModelInstance(parent,
+                                                                 "Test List",
+                                                                 0,
+                                                                 nullptr,
+                                                                 32);
+
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    REQUIRE(listener.m_handles.size() == 2);
+    CHECK(listener.m_handles.at(31) == nested);
+    CHECK(listener.m_handles.at(32) == listItem);
+
+    commandQueue->setGlobalFileListener(nullptr);
     commandQueue->disconnect();
     serverThread.join();
 }
@@ -3993,6 +5531,75 @@ TEST_CASE("pointer input", "[CommandQueue]")
     serverThread.join();
 }
 
+// Captures the view model update emitted by rapid_pointer_events.riv when its
+// state machine reaches the down-driven state.
+class RapidPointerViewModelListener
+    : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    virtual void onViewModelDataReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        CommandQueue::ViewModelInstanceData data) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(data.metaData.name == "hasReached");
+        CHECK(data.metaData.type == DataType::boolean);
+        m_hasReached = data.boolValue;
+        ++m_receivedCallbacks;
+    }
+
+    ViewModelInstanceHandle m_handle = RIVE_NULL_HANDLE;
+    bool m_hasReached = false;
+    int m_receivedCallbacks = 0;
+};
+
+TEST_CASE("pointer down advances before rapid pointer up", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    std::ifstream stream("assets/rapid_pointer_events.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    ArtboardHandle artboardHandle =
+        commandQueue->instantiateDefaultArtboard(fileHandle);
+    StateMachineHandle smHandle =
+        commandQueue->instantiateDefaultStateMachine(artboardHandle);
+
+    RapidPointerViewModelListener listener;
+    listener.m_handle =
+        commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                          artboardHandle,
+                                                          &listener);
+    auto viewModelHandle = listener.m_handle;
+    commandQueue->bindViewModelInstance(smHandle, viewModelHandle);
+    commandQueue->subscribeToViewModelProperty(viewModelHandle,
+                                               "hasReached",
+                                               DataType::boolean);
+    server.processCommands();
+    commandQueue->processMessages();
+    CHECK(!listener.m_hasReached);
+    CHECK(listener.m_receivedCallbacks == 0);
+
+    commandQueue->advanceStateMachine(smHandle, 0.0f);
+    commandQueue->pointerDown(smHandle, {.position = Vec2D(250.0f, 250.0f)});
+    server.processCommands();
+    commandQueue->processMessages();
+    CHECK(listener.m_hasReached);
+    CHECK(listener.m_receivedCallbacks == 1);
+
+    commandQueue->pointerUp(smHandle, {.position = Vec2D(250.0f, 250.0f)});
+    server.processCommands();
+    commandQueue->processMessages();
+    CHECK(listener.m_hasReached);
+    CHECK(listener.m_receivedCallbacks == 1);
+
+    commandQueue->disconnect();
+}
+
 static bool aboutEquals(const Vec2D& l, const Vec2D& r, float theta = 0.0001)
 {
     auto b = l - r;
@@ -4160,6 +5767,16 @@ public:
 
     DEFINE_TEST_CALLBACK(onFileDeleted, FileHandle, 7);
     DEFINE_TEST_CALLBACK(onFileLoaded, FileHandle, 1);
+    DEFINE_TEST_CALLBACK_ONE_PARAM(onArtboardInstantiated,
+                                   FileHandle,
+                                   0,
+                                   ArtboardHandle,
+                                   artboardHandle);
+    DEFINE_TEST_CALLBACK_ONE_PARAM(onViewModelInstanceInstantiated,
+                                   FileHandle,
+                                   0,
+                                   ViewModelInstanceHandle,
+                                   viewModelInstanceHandle);
     DEFINE_TEST_CALLBACK_ONE_PARAM(onArtboardsListed,
                                    FileHandle,
                                    2,
@@ -4193,6 +5810,8 @@ public:
                                    enums);
 
     FileHandle m_handle;
+    ArtboardHandle m_artboardHandle;
+    ViewModelInstanceHandle m_viewModelInstanceHandle;
     std::array<std::string, 4> m_artboardNames = {"Test Artboard",
                                                   "Test Transitions",
                                                   "Test Observation",
@@ -4278,6 +5897,19 @@ public:
     FontHandle m_handle;
 };
 
+class GlobalBlobAssetListener : public CommandQueue::BlobAssetListener
+{
+public:
+    virtual void onBlobAssetError(const BlobAssetHandle,
+                                  uint64_t requestId,
+                                  std::string error) override
+    {}
+
+    DEFINE_TEST_CALLBACK(onBlobAssetDeleted, BlobAssetHandle, 21);
+
+    BlobAssetHandle m_handle;
+};
+
 class GlobalArtboardListener : public CommandQueue::ArtboardListener
 {
 public:
@@ -4287,6 +5919,11 @@ public:
     {}
 
     DEFINE_TEST_CALLBACK(onArtboardDeleted, ArtboardHandle, 12);
+    DEFINE_TEST_CALLBACK_ONE_PARAM(onStateMachineInstantiated,
+                                   ArtboardHandle,
+                                   0,
+                                   StateMachineHandle,
+                                   stateMachineHandle);
     DEFINE_TEST_CALLBACK_ONE_PARAM(onStateMachinesListed,
                                    ArtboardHandle,
                                    11,
@@ -4301,6 +5938,7 @@ public:
                                    instanceName);
 
     ArtboardHandle m_handle;
+    StateMachineHandle m_stateMachineHandle;
     std::array<std::string, 1> m_stateMachineNames = {"SM"};
     std::string m_viewModelName = "Test All";
     std::string m_instanceName = "Test Default";
@@ -4331,8 +5969,22 @@ public:
                                    size_t,
                                    size);
 
+    DEFINE_TEST_CALLBACK_ONE_PARAM(onViewModelInstanceViewModelNameReceived,
+                                   ViewModelInstanceHandle,
+                                   18,
+                                   std::string,
+                                   viewModelName);
+
+    DEFINE_TEST_CALLBACK_ONE_PARAM(onViewModelInstanceNameReceived,
+                                   ViewModelInstanceHandle,
+                                   19,
+                                   std::string,
+                                   instanceName);
+
     size_t m_size = 2;
     std::string m_path = "Test List";
+    std::string m_viewModelName = "Test All";
+    std::string m_instanceName = "Test Default";
     ViewModelInstanceHandle m_handle;
     CommandQueue::ViewModelInstanceData m_instanceData = {
         .metaData = PropertyData{DataType::boolean, "Test Bool"},
@@ -4361,6 +6013,7 @@ TEST_CASE("global Listener", "[CommandQueue]")
     GlobalFontListener globalFontListener;
     GlobalAudioSourceListener globalAudioSourceListener;
     GlobalRenderImageListener globalRenderImageListener;
+    GlobalBlobAssetListener globalBlobAssetListener;
     GlobalFileListener globalFileListener;
 
     auto commandQueue = make_rcp<CommandQueue>();
@@ -4374,6 +6027,7 @@ TEST_CASE("global Listener", "[CommandQueue]")
     commandQueue->setGlobalViewModelInstanceListener(
         &globalViewModelInstanceListener);
     commandQueue->setGlobalFontListener(&globalFontListener);
+    commandQueue->setGlobalBlobAssetListener(&globalBlobAssetListener);
 
     std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
     FileHandle fileHandle = commandQueue->loadFile(
@@ -4400,13 +6054,19 @@ TEST_CASE("global Listener", "[CommandQueue]")
     auto font = commandQueue->decodeFont(
         std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream), {}));
 
+    auto blobAsset = commandQueue->decodeBlob(std::vector<uint8_t>{1, 2, 3});
+
     globalFileListener.m_handle = fileHandle;
+    globalFileListener.m_artboardHandle = artboardHandle;
+    globalFileListener.m_viewModelInstanceHandle = viewModel;
     globalArtboardListener.m_handle = artboardHandle;
+    globalArtboardListener.m_stateMachineHandle = stateMachineHandle;
     globalStateMachineListener.m_handle = stateMachineHandle;
     globalViewModelInstanceListener.m_handle = viewModel;
     globalRenderImageListener.m_handle = renderImage;
     globalAudioSourceListener.m_handle = audioSource;
     globalFontListener.m_handle = font;
+    globalBlobAssetListener.m_handle = blobAsset;
 
     // 1 is create file or fileLoaded callback
     commandQueue->requestArtboardNames(fileHandle, 2);
@@ -4420,6 +6080,8 @@ TEST_CASE("global Listener", "[CommandQueue]")
     commandQueue->requestDefaultViewModelInfo(artboardHandle, fileHandle, 20);
     commandQueue->requestViewModelInstanceBool(viewModel, "Test Bool", 13);
     commandQueue->requestViewModelInstanceListSize(viewModel, "Test List", 14);
+    commandQueue->requestViewModelInstanceViewModelName(viewModel, 18);
+    commandQueue->requestViewModelInstanceName(viewModel, 19);
     commandQueue->advanceStateMachine(stateMachineHandle, 1, 16);
     commandQueue->advanceStateMachine(stateMachineHandle, 1, 16);
     commandQueue->advanceStateMachine(stateMachineHandle, 1, 16);
@@ -4431,6 +6093,7 @@ TEST_CASE("global Listener", "[CommandQueue]")
     commandQueue->deleteImage(renderImage, 8);
     commandQueue->deleteFile(fileHandle, 7);
     commandQueue->deleteAudio(audioSource, 9);
+    commandQueue->deleteBlob(blobAsset, 21);
 
     wait_for_server(commandQueue.get());
     commandQueue->processMessages();
@@ -4442,12 +6105,19 @@ TEST_CASE("global Listener", "[CommandQueue]")
     CHECK_CALLBACK(globalViewModelInstanceListener, onViewModelDataReceived);
     CHECK_CALLBACK(globalViewModelInstanceListener,
                    onViewModelListSizeReceived);
+    CHECK_CALLBACK(globalViewModelInstanceListener,
+                   onViewModelInstanceViewModelNameReceived);
+    CHECK_CALLBACK(globalViewModelInstanceListener,
+                   onViewModelInstanceNameReceived);
 
     CHECK_CALLBACK(globalArtboardListener, onArtboardDeleted);
+    CHECK_CALLBACK(globalArtboardListener, onStateMachineInstantiated);
     CHECK_CALLBACK(globalArtboardListener, onStateMachinesListed);
 
     CHECK_CALLBACK(globalFileListener, onFileDeleted);
     CHECK_CALLBACK(globalFileListener, onFileLoaded);
+    CHECK_CALLBACK(globalFileListener, onArtboardInstantiated);
+    CHECK_CALLBACK(globalFileListener, onViewModelInstanceInstantiated);
     CHECK_CALLBACK(globalFileListener, onArtboardsListed);
     CHECK_CALLBACK(globalFileListener, onViewModelsListed);
     CHECK_CALLBACK(globalFileListener, onViewModelEnumsListed);
@@ -4457,7 +6127,170 @@ TEST_CASE("global Listener", "[CommandQueue]")
     CHECK_CALLBACK(globalFontListener, onFontDeleted);
     CHECK_CALLBACK(globalAudioSourceListener, onAudioSourceDeleted);
     CHECK_CALLBACK(globalRenderImageListener, onRenderImageDeleted);
+    CHECK_CALLBACK(globalBlobAssetListener, onBlobAssetDeleted);
 
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+static void local_server_thread(CommandServer* server)
+{
+#ifndef NDEBUG
+    // Only exists to satisfy the server's debug-only thread asserts, and the
+    // override itself is compiled out with them.
+    server->testing_overrideThreadID(std::this_thread::get_id());
+#endif
+    server->serveUntilDisconnect();
+}
+
+TEST_CASE("sync pointer events", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    std::unique_ptr<CommandServer> server =
+        std::make_unique<CommandServer>(commandQueue, nullContext.get());
+    std::thread serverThread(local_server_thread, server.get());
+
+    std::ifstream stream("assets/pointer_events.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    auto artboardHandle =
+        commandQueue->instantiateArtboardNamed(fileHandle, "art-1");
+    auto stateMachineHandle =
+        commandQueue->instantiateStateMachineNamed(artboardHandle, "sm-1");
+
+    commandQueue->advanceStateMachine(stateMachineHandle, 0.0f);
+
+    wait_for_server(commandQueue.get());
+    // Cause as much contention as you can.
+    for (int i = 0; i < 20; ++i)
+    {
+        Vec2D pos(50.0f + i * 10.0f, 50.0f + i * 10.0f);
+        commandQueue->pointerDown(stateMachineHandle, {.position = pos});
+        commandQueue->pointerUp(stateMachineHandle, {.position = pos});
+        commandQueue->pointerMove(stateMachineHandle, {.position = pos});
+
+        commandQueue->advanceStateMachine(stateMachineHandle, 0.1f);
+
+        server->pointerDownSynchronized(stateMachineHandle, {.position = pos});
+        server->pointerUpSynchronized(stateMachineHandle, {.position = pos});
+        server->pointerMoveSynchronized(stateMachineHandle, {.position = pos});
+    }
+
+    commandQueue->deleteStateMachine(stateMachineHandle);
+
+    server->pointerDownSynchronized(stateMachineHandle, {.position = {}});
+    server->pointerUpSynchronized(stateMachineHandle, {.position = {}});
+    server->pointerMoveSynchronized(stateMachineHandle, {.position = {}});
+
+    wait_for_server(commandQueue.get());
+
+    // Test bad handles
+    server->pointerDownSynchronized(stateMachineHandle, {.position = {}});
+    server->pointerUpSynchronized(stateMachineHandle, {.position = {}});
+    server->pointerMoveSynchronized(stateMachineHandle, {.position = {}});
+
+    wait_for_server(commandQueue.get());
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("requestViewModelInstanceListClear", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+
+    auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+
+    // Listener to verify onViewModelListCleared is delivered.
+    class ListClearListener : public CommandQueue::ViewModelInstanceListener
+    {
+    public:
+        ViewModelInstanceHandle m_handle = RIVE_NULL_HANDLE;
+        uint64_t m_requestId = 0;
+        std::string m_path;
+        bool m_hasCallback = false;
+
+        virtual void onViewModelListCleared(
+            const ViewModelInstanceHandle handle,
+            uint64_t requestId,
+            std::string path) override
+        {
+            CHECK(handle == m_handle);
+            CHECK(requestId == m_requestId);
+            CHECK(path == m_path);
+            m_hasCallback = true;
+        }
+    };
+
+    ListClearListener listener;
+    listener.m_path = "Test List";
+    listener.m_requestId = 0x42;
+
+    // Instantiate the view model and register the listener with it.
+    auto vmHandle =
+        commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                          artboardHandle,
+                                                          &listener);
+    listener.m_handle = vmHandle;
+
+    // Create one list item and append it to the "Test List" property.
+    auto nested1 =
+        commandQueue->instantiateBlankViewModelInstance(fileHandle,
+                                                        "ListViewModel");
+
+    commandQueue->appendViewModelInstanceListViewModel(vmHandle,
+                                                       "Test List",
+                                                       nested1);
+
+    // Wait for the server to process the appended item and verify size >= 1.
+    wait_for_server(commandQueue.get());
+    commandQueue->runOnce([vmHandle](CommandServer* server) {
+        auto instance = server->getViewModelInstance(vmHandle);
+        CHECK(instance != nullptr);
+        auto list = instance->propertyList("Test List");
+        CHECK(list != nullptr);
+        CHECK(list->size() >= 1);
+    });
+
+    // Request the server to clear the list (listener request id = 0x42).
+    commandQueue->requestViewModelInstanceListClear(vmHandle,
+                                                    "Test List",
+                                                    listener.m_requestId);
+
+    // Wait for the server to process the clear, process messages and verify the
+    // listener was called.
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+    CHECK(listener.m_hasCallback);
+
+    // Verify the list is empty on the server side.
+    commandQueue->runOnce([vmHandle](CommandServer* server) {
+        auto instance = server->getViewModelInstance(vmHandle);
+        CHECK(instance != nullptr);
+        auto list = instance->propertyList("Test List");
+        CHECK(list != nullptr);
+        CHECK(list->size() == 0);
+    });
+
+    wait_for_server(commandQueue.get());
+
+    auto badVM =
+        commandQueue->instantiateBlankViewModelInstance(fileHandle, "Bad");
+
+    // Request the server to clear a bad view model handle.
+    commandQueue->requestViewModelInstanceListClear(badVM, "Test List", 0x42);
+
+    // Request the server to clear a bad property.
+    commandQueue->requestViewModelInstanceListClear(vmHandle, "Bad", 0x42);
+
+    wait_for_server(commandQueue.get());
     commandQueue->disconnect();
     serverThread.join();
 }
@@ -4537,6 +6370,2787 @@ TEST_CASE("dependency lifetime management", "[CommandQueue]")
         CHECK(server->getStateMachineInstance(stateMachine2_2) != nullptr);
         CHECK(server->getStateMachineInstance(stateMachine3) != nullptr);
         CHECK(server->getStateMachineInstance(stateMachine3_2) != nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class FileAssetsListenerCallback : public CommandQueue::FileListener
+{
+public:
+    void onFileAssetsListed(const FileHandle fileHandle,
+                            uint64_t requestId,
+                            std::vector<FileAssetData> assets) override
+    {
+        CHECK(requestId == m_requestId);
+        CHECK(fileHandle == m_fileHandle);
+        m_assets = std::move(assets);
+        m_hasCallback = true;
+    }
+
+    void onFileError(const FileHandle fileHandle,
+                     uint64_t requestId,
+                     std::string error) override
+    {
+        CHECK(requestId == m_requestId);
+        CHECK(fileHandle == m_fileHandle);
+        m_errorMessage = std::move(error);
+        m_hasError = true;
+    }
+
+    bool m_hasCallback = false;
+    bool m_hasError = false;
+    FileHandle m_fileHandle = RIVE_NULL_HANDLE;
+    uint64_t m_requestId = 0;
+    std::vector<FileAssetData> m_assets;
+    std::string m_errorMessage;
+};
+
+TEST_CASE("file assets listed - image asset", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    listener.m_fileHandle = fileHandle;
+    listener.m_requestId = 42;
+
+    commandQueue->requestFileAssets(fileHandle, listener.m_requestId);
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    REQUIRE(listener.m_hasCallback);
+    REQUIRE(listener.m_assets.size() == 1);
+
+    auto& asset = listener.m_assets[0];
+    CHECK(asset.name == "one.png");
+    CHECK(asset.uniqueName == "one-45008");
+    CHECK(asset.assetID == 45008);
+    CHECK(asset.cdnUUID == "edcb1816-8405-4983-acd2-16db48d85df4");
+    CHECK(asset.cdnBaseURL == "https://public.uat.rive.app/cdn/uuid");
+    CHECK(asset.fileExtension == "png");
+    CHECK(asset.type == 105);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("file assets listed - font asset", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    listener.m_fileHandle = fileHandle;
+    listener.m_requestId = 43;
+
+    commandQueue->requestFileAssets(fileHandle, listener.m_requestId);
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    REQUIRE(listener.m_hasCallback);
+    REQUIRE(listener.m_assets.size() == 1);
+
+    auto& asset = listener.m_assets[0];
+    CHECK(asset.name == "Inter");
+    CHECK(asset.uniqueName == "Inter-43276");
+    CHECK(asset.assetID == 43276);
+    CHECK(asset.cdnBaseURL == "https://public.uat.rive.app/cdn/uuid");
+    CHECK(asset.fileExtension == "ttf");
+    CHECK(asset.type == 141);
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("file assets listed - type IDs match runtime", "[CommandQueue]")
+{
+    uint16_t imageType = ImageAsset::typeKey;
+    uint16_t fontType = FontAsset::typeKey;
+    uint16_t audioType = AudioAsset::typeKey;
+    CHECK(imageType == 105);
+    CHECK(fontType == 141);
+    CHECK(audioType == 406);
+}
+
+TEST_CASE("file assets listed - empty file", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/two_artboards.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    listener.m_fileHandle = fileHandle;
+    listener.m_requestId = 44;
+
+    commandQueue->requestFileAssets(fileHandle, listener.m_requestId);
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    REQUIRE(listener.m_hasCallback);
+    CHECK(listener.m_assets.empty());
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("file assets listed - invalid handle", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    FileHandle badHandle =
+        reinterpret_cast<FileHandle>(static_cast<uintptr_t>(999));
+    listener.m_fileHandle = badHandle;
+    listener.m_requestId = 45;
+
+    commandQueue->setGlobalFileListener(&listener);
+    commandQueue->requestFileAssets(badHandle, listener.m_requestId);
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    CHECK(!listener.m_hasCallback);
+    CHECK(listener.m_hasError);
+
+    commandQueue->setGlobalFileListener(nullptr);
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("file assets listed - all assets returned", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/data_bind_test_cmdq.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    listener.m_fileHandle = fileHandle;
+    listener.m_requestId = 46;
+
+    commandQueue->requestFileAssets(fileHandle, listener.m_requestId);
+    wait_for_server(commandQueue.get());
+    commandQueue->processMessages();
+
+    REQUIRE(listener.m_hasCallback);
+
+    // Verify the count matches the total file assets (no filtering)
+    commandQueue->runOnce([fileHandle, &listener](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        auto allAssets = file->assets();
+        CHECK(listener.m_assets.size() == allAssets.size());
+    });
+
+    wait_for_server(commandQueue.get());
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+// ============================================================
+// Focus
+// ============================================================
+
+namespace
+{
+struct FocusBoolResult
+{
+    uint64_t requestId;
+    bool value;
+};
+
+struct FocusStateResult
+{
+    uint64_t requestId;
+    CommandQueue::FocusState focusState;
+};
+
+class KeyboardAcceptingFocusable : public Focusable
+{
+public:
+    bool keyInput(Key, KeyModifiers, bool, bool) override { return false; }
+    bool textInput(const std::string&) override { return false; }
+    void focused() override {}
+    void blurred() override {}
+    bool acceptsKeyboardInput() const override { return true; }
+};
+
+class FocusCommandListener : public CommandQueue::StateMachineListener
+{
+public:
+    void onStateMachineError(const StateMachineHandle handle,
+                             uint64_t requestId,
+                             std::string) override
+    {
+        CHECK(handle == m_handle);
+        m_errorRequestIds.push_back(requestId);
+    }
+
+    void onHasFocusNodesReceived(const StateMachineHandle handle,
+                                 uint64_t requestId,
+                                 bool hasFocusNodes) override
+    {
+        CHECK(handle == m_handle);
+        m_availabilityResults.push_back({requestId, hasFocusNodes});
+    }
+
+    void onFocusStateReceived(const StateMachineHandle handle,
+                              uint64_t requestId,
+                              CommandQueue::FocusState focusState) override
+    {
+        CHECK(handle == m_handle);
+        m_focusStateResults.push_back({requestId, focusState});
+    }
+
+    StateMachineHandle m_handle = RIVE_NULL_HANDLE;
+    std::vector<FocusBoolResult> m_availabilityResults;
+    std::vector<FocusStateResult> m_focusStateResults;
+    std::vector<uint64_t> m_errorRequestIds;
+};
+
+struct FocusCommandFixture
+{
+    rcp<CommandQueue> commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    std::unique_ptr<CommandServer> server =
+        std::make_unique<CommandServer>(commandQueue, nullContext.get());
+    FileHandle fileHandle = RIVE_NULL_HANDLE;
+    ArtboardHandle artboardHandle = RIVE_NULL_HANDLE;
+    StateMachineHandle stateMachineHandle = RIVE_NULL_HANDLE;
+
+    explicit FocusCommandFixture(FocusCommandListener* listener = nullptr)
+    {
+        std::ifstream stream("assets/multiple_state_machines.riv",
+                             std::ios::binary);
+        fileHandle = commandQueue->loadFile(
+            std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+        artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+        stateMachineHandle =
+            commandQueue->instantiateStateMachineNamed(artboardHandle,
+                                                       "one",
+                                                       listener);
+        if (listener != nullptr)
+        {
+            listener->m_handle = stateMachineHandle;
+        }
+        pump();
+    }
+
+    void pump()
+    {
+        server->processCommands();
+        commandQueue->processMessages();
+    }
+};
+} // namespace
+
+TEST_CASE("Focus commands mirror StateMachineInstance traversal and queries",
+          "[CommandQueue]")
+{
+    FocusCommandListener listener;
+    FocusCommandFixture fx(&listener);
+
+    fx.commandQueue->requestHasFocusNodes(fx.stateMachineHandle, 0xF1);
+    fx.pump();
+
+    REQUIRE(listener.m_availabilityResults.size() == 1);
+    CHECK(listener.m_availabilityResults[0].requestId == 0xF1);
+    CHECK_FALSE(listener.m_availabilityResults[0].value);
+
+    FocusNode* firstNode = nullptr;
+    FocusNode* secondNode = nullptr;
+    fx.commandQueue->runOnce([handle = fx.stateMachineHandle,
+                              &firstNode,
+                              &secondNode](CommandServer* server) {
+        auto* instance = server->getStateMachineInstance(handle);
+        REQUIRE(instance != nullptr);
+        auto first = make_rcp<FocusNode>();
+        auto second = make_rcp<FocusNode>();
+        firstNode = first.get();
+        secondNode = second.get();
+        instance->focusManager()->addChild(nullptr, std::move(first));
+        instance->focusManager()->addChild(nullptr, std::move(second));
+    });
+    fx.pump();
+
+    fx.commandQueue->requestHasFocusNodes(fx.stateMachineHandle, 0xF2);
+    fx.commandQueue->focusNext(fx.stateMachineHandle, 0xF3);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, firstNode](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocusPtr() == firstNode);
+        });
+    fx.commandQueue->focusNext(fx.stateMachineHandle, 0xF4);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, secondNode](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocusPtr() == secondNode);
+        });
+    fx.commandQueue->focusNext(fx.stateMachineHandle, 0xF5);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocusPtr() == nullptr);
+        });
+    fx.commandQueue->focusPrevious(fx.stateMachineHandle, 0xF6);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, secondNode](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocusPtr() == secondNode);
+        });
+    fx.pump();
+
+    REQUIRE(listener.m_availabilityResults.size() == 2);
+    CHECK(listener.m_availabilityResults[1].requestId == 0xF2);
+    CHECK(listener.m_availabilityResults[1].value);
+
+    fx.commandQueue->clearFocus(fx.stateMachineHandle, 0xF7);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocus() == nullptr);
+        });
+    fx.pump();
+    CHECK(listener.m_errorRequestIds.empty());
+}
+
+TEST_CASE("Synchronized focus traversal mirrors StateMachineInstance",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    std::ifstream stream("assets/multiple_state_machines.riv",
+                         std::ios::binary);
+    auto fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    auto artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+    auto stateMachineHandle =
+        commandQueue->instantiateStateMachineNamed(artboardHandle, "one");
+
+    commandQueue->runOnce([stateMachineHandle](CommandServer* server) {
+        auto* instance = server->getStateMachineInstance(stateMachineHandle);
+        REQUIRE(instance != nullptr);
+        instance->focusManager()->addChild(nullptr, make_rcp<FocusNode>());
+        instance->focusManager()->addChild(nullptr, make_rcp<FocusNode>());
+    });
+
+    CHECK(commandQueue->focusNextSynchronized(stateMachineHandle));
+    CHECK(commandQueue->focusNextSynchronized(stateMachineHandle));
+    CHECK_FALSE(commandQueue->focusNextSynchronized(stateMachineHandle));
+    CHECK(commandQueue->focusPreviousSynchronized(stateMachineHandle));
+
+    CHECK_FALSE(commandQueue->focusNextSynchronized(RIVE_NULL_HANDLE));
+    CHECK_FALSE(commandQueue->focusPreviousSynchronized(RIVE_NULL_HANDLE));
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("Focus state query reports internal focus changes", "[CommandQueue]")
+{
+    KeyboardAcceptingFocusable focusable;
+    FocusCommandListener listener;
+    FocusCommandFixture fx(&listener);
+
+    fx.commandQueue->requestFocusState(fx.stateMachineHandle, 0xF8);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, &focusable](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            auto node = make_rcp<FocusNode>(&focusable);
+            instance->focusManager()->addChild(nullptr, node);
+            instance->focusManager()->setFocus(std::move(node));
+        });
+    fx.commandQueue->requestFocusState(fx.stateMachineHandle, 0xF9);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            instance->clearFocus();
+        });
+    fx.commandQueue->requestFocusState(fx.stateMachineHandle, 0xFB);
+    fx.pump();
+
+    REQUIRE(listener.m_focusStateResults.size() == 3);
+    CHECK(listener.m_focusStateResults[0].requestId == 0xF8);
+    CHECK_FALSE(listener.m_focusStateResults[0].focusState.hasFocus);
+    CHECK_FALSE(
+        listener.m_focusStateResults[0].focusState.expectsKeyboardInput);
+    CHECK(listener.m_focusStateResults[1].requestId == 0xF9);
+    CHECK(listener.m_focusStateResults[1].focusState.hasFocus);
+    CHECK(listener.m_focusStateResults[1].focusState.expectsKeyboardInput);
+    CHECK(listener.m_focusStateResults[2].requestId == 0xFB);
+    CHECK_FALSE(listener.m_focusStateResults[2].focusState.hasFocus);
+    CHECK_FALSE(
+        listener.m_focusStateResults[2].focusState.expectsKeyboardInput);
+    CHECK(listener.m_errorRequestIds.empty());
+}
+
+TEST_CASE("Focus command preserves current stop traversal result",
+          "[CommandQueue]")
+{
+    FocusCommandListener listener;
+    FocusCommandFixture fx(&listener);
+
+    FocusNode* stoppedNode = nullptr;
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, &stoppedNode](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            auto* manager = instance->focusManager();
+            auto scope = make_rcp<FocusNode>();
+            auto first = make_rcp<FocusNode>();
+            auto second = make_rcp<FocusNode>();
+            scope->edgeBehavior(EdgeBehavior::stop);
+            stoppedNode = second.get();
+            manager->addChild(nullptr, scope);
+            manager->addChild(scope, first);
+            manager->addChild(scope, second);
+            manager->setFocus(second);
+        });
+    fx.pump();
+
+    fx.commandQueue->focusNext(fx.stateMachineHandle, 0xFA);
+    fx.commandQueue->runOnce(
+        [handle = fx.stateMachineHandle, stoppedNode](CommandServer* server) {
+            auto* instance = server->getStateMachineInstance(handle);
+            REQUIRE(instance != nullptr);
+            CHECK(instance->focusManager()->primaryFocusPtr() == stoppedNode);
+        });
+    fx.pump();
+
+    CHECK(listener.m_errorRequestIds.empty());
+}
+
+TEST_CASE("Focus commands report invalid state machine handles",
+          "[CommandQueue]")
+{
+    FocusCommandFixture fx;
+    FocusCommandListener listener;
+    auto invalidHandle =
+        fx.commandQueue->instantiateStateMachineNamed(fx.artboardHandle,
+                                                      "does not exist",
+                                                      &listener);
+    listener.m_handle = invalidHandle;
+
+    fx.commandQueue->focusNext(invalidHandle, 0xFB);
+    fx.commandQueue->focusPrevious(invalidHandle, 0xFC);
+    fx.commandQueue->requestHasFocusNodes(invalidHandle, 0xFD);
+    fx.commandQueue->clearFocus(invalidHandle, 0xFE);
+    fx.commandQueue->requestFocusState(invalidHandle, 0xFF);
+    fx.pump();
+
+    REQUIRE(listener.m_errorRequestIds.size() == 5);
+    CHECK(listener.m_errorRequestIds[0] == 0xFB);
+    CHECK(listener.m_errorRequestIds[1] == 0xFC);
+    CHECK(listener.m_errorRequestIds[2] == 0xFD);
+    CHECK(listener.m_errorRequestIds[3] == 0xFE);
+    CHECK(listener.m_errorRequestIds[4] == 0xFF);
+    CHECK(listener.m_availabilityResults.empty());
+    CHECK(listener.m_focusStateResults.empty());
+}
+
+// ============================================================
+// Semantics
+// ============================================================
+
+namespace
+{
+// Flatten a diff's added+moved+updatedSemantic nodes into a single list,
+// useful for locating a specific node by role in test assertions.
+struct SemanticTestModel
+{
+    std::unordered_map<uint32_t, SemanticsDiffNode> nodes;
+
+    void apply(const SemanticsDiff& diff)
+    {
+        for (auto id : diff.removed)
+            nodes.erase(id);
+        for (auto& n : diff.added)
+            nodes[n.id] = n;
+        for (auto& n : diff.moved)
+            nodes[n.id] = n;
+        for (auto& n : diff.updatedSemantic)
+        {
+            auto it = nodes.find(n.id);
+            if (it != nodes.end())
+            {
+                // updatedSemantic carries full content, preserve existing
+                // geometry if present.
+                float minX = it->second.minX, minY = it->second.minY;
+                float maxX = it->second.maxX, maxY = it->second.maxY;
+                it->second = n;
+                it->second.minX = minX;
+                it->second.minY = minY;
+                it->second.maxX = maxX;
+                it->second.maxY = maxY;
+            }
+            else
+            {
+                nodes[n.id] = n;
+            }
+        }
+        for (auto& n : diff.updatedGeometry)
+        {
+            auto it = nodes.find(n.id);
+            if (it != nodes.end())
+            {
+                it->second.minX = n.minX;
+                it->second.minY = n.minY;
+                it->second.maxX = n.maxX;
+                it->second.maxY = n.maxY;
+            }
+        }
+    }
+};
+
+class SemanticTestListener : public CommandQueue::StateMachineListener
+{
+public:
+    void onStateMachineSettled(const StateMachineHandle, uint64_t) override
+    {
+        m_settleCount++;
+    }
+
+    void onStateMachineError(const StateMachineHandle,
+                             uint64_t requestId,
+                             std::string error) override
+    {
+        m_errorCount++;
+        m_lastErrorRequestId = requestId;
+        m_lastError = std::move(error);
+    }
+
+    void onSemanticsDiffReceived(const StateMachineHandle handle,
+                                 uint64_t requestId,
+                                 SemanticsDiff diff) override
+    {
+        CHECK(handle == m_handle);
+        m_diffCount++;
+        m_lastDiffRequestId = requestId;
+        m_model.apply(diff);
+        m_lastDiff = std::move(diff);
+    }
+
+    StateMachineHandle m_handle = RIVE_NULL_HANDLE;
+    int m_settleCount = 0;
+    int m_diffCount = 0;
+    int m_errorCount = 0;
+    uint64_t m_lastDiffRequestId = 0;
+    uint64_t m_lastErrorRequestId = 0;
+    std::string m_lastError;
+    SemanticsDiff m_lastDiff;
+    SemanticTestModel m_model;
+};
+
+// Helper that spins up server, loads semantic/simpsons.riv, creates artboard +
+// default view model instance + state machine, and returns the handles.
+// Caller owns the commandQueue and server lifetime.
+struct SemanticFixture
+{
+    rcp<CommandQueue> commandQueue;
+    std::unique_ptr<gpu::RenderContext> nullContext;
+    std::unique_ptr<CommandServer> server;
+    FileHandle fileHandle = RIVE_NULL_HANDLE;
+    ArtboardHandle artboardHandle = RIVE_NULL_HANDLE;
+    ViewModelInstanceHandle viewModelHandle = RIVE_NULL_HANDLE;
+    StateMachineHandle stateMachineHandle = RIVE_NULL_HANDLE;
+
+    SemanticFixture(SemanticTestListener* listener = nullptr,
+                    const char* rivPath = "assets/semantic/simpsons.riv")
+    {
+        commandQueue = make_rcp<CommandQueue>();
+        nullContext = RenderContextNULL::MakeContext();
+        server =
+            std::make_unique<CommandServer>(commandQueue, nullContext.get());
+
+        std::ifstream stream(rivPath, std::ios::binary);
+        fileHandle = commandQueue->loadFile(
+            std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+        artboardHandle = commandQueue->instantiateDefaultArtboard(fileHandle);
+        viewModelHandle =
+            commandQueue->instantiateDefaultViewModelInstance(fileHandle,
+                                                              artboardHandle);
+        stateMachineHandle =
+            commandQueue->instantiateDefaultStateMachine(artboardHandle,
+                                                         listener);
+        commandQueue->bindViewModelInstance(stateMachineHandle,
+                                            viewModelHandle);
+        if (listener)
+            listener->m_handle = stateMachineHandle;
+    }
+
+    // Advance N frames to let the state machine settle into a steady state,
+    // mirroring the warmup that semantic_simpsons_test.dart does before
+    // reading its initial tree.
+    void warmup(int frames = 10, float dt = 0.1f)
+    {
+        for (int i = 0; i < frames; ++i)
+        {
+            commandQueue->advanceStateMachine(stateMachineHandle, dt);
+        }
+    }
+
+    void drain(uint64_t requestId = 0,
+               Fit fit = Fit::contain,
+               Alignment alignment = Alignment::center,
+               float scaleFactor = 1.0f,
+               Vec2D viewBounds = Vec2D(500.0f, 500.0f))
+    {
+        commandQueue->drainSemanticsDiff(stateMachineHandle,
+                                         fit,
+                                         alignment,
+                                         scaleFactor,
+                                         viewBounds,
+                                         requestId);
+    }
+
+    void pump()
+    {
+        server->processCommands();
+        commandQueue->processMessages();
+    }
+};
+} // namespace
+
+TEST_CASE("Semantics advance does not auto-deliver diff", "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.pump();
+
+    CHECK(listener.m_diffCount == 0);
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics enable + initial diff on drainSemanticsDiff",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    CHECK(listener.m_diffCount >= 1);
+    CHECK(listener.m_errorCount == 0);
+    CHECK(!listener.m_model.nodes.empty());
+
+    // The fixture should include a tabList (simpsons.riv layout).
+    bool foundTabList = false;
+    for (auto& kv : listener.m_model.nodes)
+    {
+        if (kv.second.role == static_cast<uint32_t>(SemanticRole::tabList))
+        {
+            foundTabList = true;
+            break;
+        }
+    }
+    CHECK(foundTabList);
+}
+
+TEST_CASE("Semantics no diff when not enabled", "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.warmup();
+    fx.pump();
+
+    CHECK(listener.m_diffCount == 0);
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics drainSemanticsDiff errors when not enabled",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    const uint64_t reqId = 0x1234;
+    fx.drain(reqId);
+    fx.pump();
+
+    CHECK(listener.m_diffCount == 0);
+    CHECK(listener.m_errorCount == 1);
+    CHECK(listener.m_lastErrorRequestId == reqId);
+}
+
+TEST_CASE("Semantics drainSemanticsDiff only emits for non-empty diff",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    const uint64_t reqId = 0xABCD;
+    fx.drain(reqId);
+    fx.pump();
+
+    CHECK(listener.m_diffCount == 1);
+    CHECK(listener.m_lastDiffRequestId == reqId);
+    CHECK(listener.m_errorCount == 0);
+
+    // No changes since the previous drain: no callback expected.
+    fx.drain(0xBCDE);
+    fx.pump();
+
+    CHECK(listener.m_diffCount == 1);
+    CHECK(listener.m_lastDiffRequestId == reqId);
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics fireSemanticAction tap changes selected tab",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    // Find tabs and the one that's currently selected.
+    uint32_t selectedTabId = 0;
+    uint32_t otherTabId = 0;
+    for (auto& kv : listener.m_model.nodes)
+    {
+        const auto& node = kv.second;
+        if (node.role != static_cast<uint32_t>(SemanticRole::tab))
+            continue;
+        if (hasSemanticState(node.stateFlags, SemanticState::Selected))
+            selectedTabId = node.id;
+        else if (otherTabId == 0)
+            otherTabId = node.id;
+    }
+    REQUIRE(selectedTabId != 0);
+    REQUIRE(otherTabId != 0);
+
+    // Fire tap on the other tab, then advance to let the state machine
+    // process the deferred action and update the data-bound selection.
+    fx.commandQueue->fireSemanticAction(fx.stateMachineHandle,
+                                        otherTabId,
+                                        SemanticActionType::tap);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    auto itOther = listener.m_model.nodes.find(otherTabId);
+    auto itInitial = listener.m_model.nodes.find(selectedTabId);
+    REQUIRE(itOther != listener.m_model.nodes.end());
+    REQUIRE(itInitial != listener.m_model.nodes.end());
+    CHECK(
+        hasSemanticState(itOther->second.stateFlags, SemanticState::Selected));
+    CHECK(!hasSemanticState(itInitial->second.stateFlags,
+                            SemanticState::Selected));
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics commands on invalid state machine handle",
+          "[CommandQueue]")
+{
+    SemanticTestListener bogusListener;
+    SemanticFixture fx; // no main listener — we only watch the bogus one.
+
+    // A state machine handle whose instantiation fails (name not found). The
+    // listener is bound to the handle, so per-handle state-machine errors route
+    // to it; the instantiation failure goes to the artboard channel instead.
+    auto bogusHandle = fx.commandQueue->instantiateStateMachineNamed(
+        fx.artboardHandle,
+        "this state machine does not exist",
+        &bogusListener);
+    bogusListener.m_handle = bogusHandle;
+
+    fx.commandQueue->enableSemantics(bogusHandle, 0xE1);
+    fx.commandQueue->drainSemanticsDiff(bogusHandle,
+                                        Fit::contain,
+                                        Alignment::center,
+                                        1.0f,
+                                        Vec2D(500.0f, 500.0f),
+                                        0xE2);
+    fx.commandQueue->fireSemanticAction(bogusHandle,
+                                        42,
+                                        SemanticActionType::tap,
+                                        0xE3);
+    fx.commandQueue->requestSemanticFocus(bogusHandle, 42, 0xE4);
+    fx.commandQueue->clearSemanticFocus(bogusHandle, 0xE5);
+
+    fx.pump();
+
+    // One stateMachineError per semantic command; the instantiation failure is
+    // an artboardError, so it does not reach this listener.
+    CHECK(bogusListener.m_errorCount == 5);
+    CHECK(bogusListener.m_diffCount == 0);
+}
+
+TEST_CASE("Semantics drainSemanticsDiff maps bounds into view space",
+          "[CommandQueue]")
+{
+    // This validates the view-space mapping math by running the same .riv
+    // through drainSemanticsDiff twice (small and large views), then comparing
+    // width/height ratios for the same semantic node id.
+    auto captureTabsById = [](Vec2D viewBounds)
+        -> std::unordered_map<uint32_t, SemanticsDiffNode> {
+        SemanticTestListener listener;
+        SemanticFixture fx(&listener);
+        fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+        fx.warmup();
+        fx.drain(0, Fit::contain, Alignment::center, 1.0f, viewBounds);
+        fx.pump();
+
+        REQUIRE(listener.m_diffCount >= 1);
+
+        std::unordered_map<uint32_t, SemanticsDiffNode> tabsById;
+        for (auto& kv : listener.m_model.nodes)
+        {
+            const auto& node = kv.second;
+            if (node.role != static_cast<uint32_t>(SemanticRole::tab))
+            {
+                continue;
+            }
+            AABB nodeBounds = node.bounds();
+            if (nodeBounds.width() > 0.0f && nodeBounds.height() > 0.0f)
+            {
+                tabsById[node.id] = node;
+            }
+        }
+        return tabsById;
+    };
+
+    Vec2D smallViewBounds(200.0f, 200.0f);
+    Vec2D largeViewBounds(800.0f, 800.0f);
+
+    auto smallTabs = captureTabsById(smallViewBounds);
+    auto largeTabs = captureTabsById(largeViewBounds);
+
+    REQUIRE(!smallTabs.empty());
+    REQUIRE(!largeTabs.empty());
+
+    bool foundSharedTabId = false;
+    uint32_t sharedTabId = 0;
+    for (const auto& kv : smallTabs)
+    {
+        if (largeTabs.find(kv.first) != largeTabs.end())
+        {
+            foundSharedTabId = true;
+            sharedTabId = kv.first;
+            break;
+        }
+    }
+    REQUIRE(foundSharedTabId);
+
+    const auto& smallTab = smallTabs.at(sharedTabId);
+    const auto& largeTab = largeTabs.at(sharedTabId);
+
+    float smallWidth = smallTab.bounds().width();
+    float smallHeight = smallTab.bounds().height();
+    float largeWidth = largeTab.bounds().width();
+    float largeHeight = largeTab.bounds().height();
+
+    float expectedScale = largeViewBounds.x / smallViewBounds.x;
+
+    CHECK(largeWidth > smallWidth);
+    CHECK(largeHeight > smallHeight);
+    CHECK(largeWidth / smallWidth == Approx(expectedScale).epsilon(0.01));
+    CHECK(largeHeight / smallHeight == Approx(expectedScale).epsilon(0.01));
+}
+
+TEST_CASE("Semantics drainSemanticsDiff republishes bounds when the viewport "
+          "changes",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener, "assets/semantic/tabtest.riv");
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain(0, Fit::contain, Alignment::center, 1.0f, Vec2D(200.0f, 200.0f));
+    fx.pump();
+
+    REQUIRE(listener.m_diffCount == 1);
+    const uint32_t expectedRootId = listener.m_lastDiff.rootId;
+    REQUIRE(expectedRootId != 0);
+    auto initialNode =
+        std::find_if(listener.m_model.nodes.begin(),
+                     listener.m_model.nodes.end(),
+                     [](const auto& entry) {
+                         return entry.second.role ==
+                                    static_cast<uint32_t>(SemanticRole::tab) &&
+                                entry.second.bounds().width() > 0.0f;
+                     });
+    REQUIRE(initialNode != listener.m_model.nodes.end());
+    const uint32_t nodeId = initialNode->first;
+    const AABB initialBounds = initialNode->second.bounds();
+
+    // No state-machine advance occurs between drains. The changed viewport
+    // alone must republish every current node's mapped geometry. Advance the
+    // test frame id so the expected metadata is distinguishable from a
+    // default-initialized diff.
+    Artboard::incFrameId();
+    const uint64_t expectedFrameNumber = Artboard::frameId();
+    fx.drain(0, Fit::contain, Alignment::center, 1.0f, Vec2D(800.0f, 800.0f));
+    fx.pump();
+
+    REQUIRE(listener.m_diffCount == 2);
+    CHECK(listener.m_lastDiff.frameNumber == expectedFrameNumber);
+    CHECK(listener.m_lastDiff.rootId == expectedRootId);
+    CHECK_FALSE(listener.m_lastDiff.updatedGeometry.empty());
+    const AABB resizedBounds = listener.m_model.nodes.at(nodeId).bounds();
+    CHECK(resizedBounds.width() / initialBounds.width() ==
+          Approx(4.0f).epsilon(0.01));
+    CHECK(resizedBounds.height() / initialBounds.height() ==
+          Approx(4.0f).epsilon(0.01));
+}
+
+TEST_CASE("Semantics requestSemanticFocus errors when not enabled",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    // No enableSemantics: the command must surface a stateMachineError rather
+    // than silently no-op (consistent with drainSemanticsDiff).
+    const uint64_t reqId = 0x5151;
+    fx.commandQueue->requestSemanticFocus(fx.stateMachineHandle, 1, reqId);
+    fx.pump();
+
+    CHECK(listener.m_errorCount == 1);
+    CHECK(listener.m_lastErrorRequestId == reqId);
+    CHECK(listener.m_diffCount == 0);
+}
+
+TEST_CASE("Semantics fireSemanticAction errors when not enabled",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    // No enableSemantics: the command must surface a stateMachineError rather
+    // than silently no-op (consistent with drainSemanticsDiff).
+    const uint64_t reqId = 0x5252;
+    fx.commandQueue->fireSemanticAction(fx.stateMachineHandle,
+                                        1,
+                                        SemanticActionType::tap,
+                                        reqId);
+    fx.pump();
+
+    CHECK(listener.m_errorCount == 1);
+    CHECK(listener.m_lastErrorRequestId == reqId);
+    CHECK(listener.m_diffCount == 0);
+}
+
+TEST_CASE("Semantics requestSemanticFocus on a valid node routes without error",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener);
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    REQUIRE(!listener.m_model.nodes.empty());
+
+    // Route a focus request for a real node to an enabled state machine.
+    // (FocusNode-level focus behavior is covered by focus_test.cpp.)
+    const uint32_t targetId = listener.m_model.nodes.begin()->first;
+    fx.commandQueue->requestSemanticFocus(fx.stateMachineHandle, targetId);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    // Routing to an enabled state machine must never surface an error,
+    // regardless of whether the node ultimately accepts focus.
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics clearSemanticFocus removes Focused bit from focused node",
+          "[CommandQueue]")
+{
+    SemanticTestListener listener;
+    SemanticFixture fx(&listener,
+                       "assets/semantic/semantic_list_scroll_focus_fixed.riv");
+
+    fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    // Find a node with the Focusable trait.
+    uint32_t focusableId = 0;
+    for (auto& kv : listener.m_model.nodes)
+    {
+        if (hasSemanticTrait(kv.second.traitFlags, SemanticTrait::Focusable))
+        {
+            focusableId = kv.second.id;
+            break;
+        }
+    }
+    REQUIRE(focusableId != 0);
+
+    // Focus it through the command queue.
+    fx.commandQueue->requestSemanticFocus(fx.stateMachineHandle, focusableId);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    auto it = listener.m_model.nodes.find(focusableId);
+    REQUIRE(it != listener.m_model.nodes.end());
+    CHECK(hasSemanticState(it->second.stateFlags, SemanticState::Focused));
+
+    // Clear focus through the command queue.
+    fx.commandQueue->clearSemanticFocus(fx.stateMachineHandle);
+    fx.warmup();
+    fx.drain();
+    fx.pump();
+
+    it = listener.m_model.nodes.find(focusableId);
+    REQUIRE(it != listener.m_model.nodes.end());
+    CHECK_FALSE(
+        hasSemanticState(it->second.stateFlags, SemanticState::Focused));
+    CHECK(listener.m_errorCount == 0);
+}
+
+TEST_CASE("Semantics drainSemanticsDiff honors scaleFactor when the view "
+          "matches the artboard",
+          "[CommandQueue]")
+{
+    // Fit::layout scales by scaleFactor, so bounds must be mapped into view
+    // space even when the view matches the artboard.
+
+    // Discover the artboard bounds so the view can be set equal to them.
+    AABB artboardBounds(0.0f, 0.0f, 0.0f, 0.0f);
+    {
+        SemanticFixture probe;
+        probe.commandQueue->runOnce([&](CommandServer* server) {
+            auto* ab = server->getArtboardInstance(probe.artboardHandle);
+            REQUIRE(ab != nullptr);
+            artboardBounds = ab->bounds();
+        });
+        probe.pump();
+    }
+    // surfaceBounds is AABB(origin, viewBounds), so view == artboard needs an
+    // origin-based artboard.
+    REQUIRE(artboardBounds.left() == Approx(0.0f));
+    REQUIRE(artboardBounds.top() == Approx(0.0f));
+    REQUIRE(artboardBounds.width() > 0.0f);
+    REQUIRE(artboardBounds.height() > 0.0f);
+
+    const Vec2D viewBounds(artboardBounds.width(), artboardBounds.height());
+
+    auto boundsByIdAtScale =
+        [&](float scaleFactor) -> std::unordered_map<uint32_t, AABB> {
+        SemanticTestListener listener;
+        SemanticFixture fx(&listener);
+        fx.commandQueue->enableSemantics(fx.stateMachineHandle);
+        fx.warmup();
+        fx.drain(0, Fit::layout, Alignment::center, scaleFactor, viewBounds);
+        fx.pump();
+        std::unordered_map<uint32_t, AABB> out;
+        for (auto& kv : listener.m_model.nodes)
+        {
+            AABB b = kv.second.bounds();
+            if (b.width() > 0.0f && b.height() > 0.0f)
+            {
+                out[kv.first] = b;
+            }
+        }
+        return out;
+    };
+
+    auto atScale1 = boundsByIdAtScale(1.0f);
+    auto atScale2 = boundsByIdAtScale(2.0f);
+    REQUIRE(!atScale1.empty());
+
+    // Doubling scaleFactor must double the mapped node sizes.
+    bool comparedAny = false;
+    for (const auto& kv : atScale1)
+    {
+        auto it = atScale2.find(kv.first);
+        if (it == atScale2.end())
+        {
+            continue;
+        }
+        CHECK(it->second.width() / kv.second.width() ==
+              Approx(2.0f).epsilon(0.02));
+        CHECK(it->second.height() / kv.second.height() ==
+              Approx(2.0f).epsilon(0.02));
+        comparedAny = true;
+    }
+    REQUIRE(comparedAny);
+}
+
+class GlobalNamesListener : public CommandQueue::FileListener
+{
+public:
+    virtual void onGlobalViewModelNamesListed(
+        const FileHandle handle,
+        uint64_t requestId,
+        std::vector<std::string> names) override
+    {
+        m_handle = handle;
+        m_requestId = requestId;
+        m_names = std::move(names);
+        m_hasCallback = true;
+    }
+
+    virtual void onViewModelPropertiesListed(
+        const FileHandle handle,
+        uint64_t requestId,
+        std::string viewModelName,
+        std::vector<CommandQueue::FileListener::ViewModelPropertyData>
+            properties) override
+    {
+        m_handle = handle;
+        m_requestId = requestId;
+        m_propertyViewModelName = std::move(viewModelName);
+        m_properties = std::move(properties);
+        m_hasPropertiesCallback = true;
+    }
+
+    bool m_hasCallback = false;
+    bool m_hasPropertiesCallback = false;
+    FileHandle m_handle = RIVE_NULL_HANDLE;
+    uint64_t m_requestId = 0;
+    std::vector<std::string> m_names;
+    std::string m_propertyViewModelName;
+    std::vector<CommandQueue::FileListener::ViewModelPropertyData> m_properties;
+};
+
+TEST_CASE("Global View Model Names Listed", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+    {
+        GlobalNamesListener listener;
+        std::ifstream stream("assets/global_variables_test.riv",
+                             std::ios::binary);
+        FileHandle fileHandle = commandQueue->loadFile(
+            std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+            &listener);
+
+        commandQueue->requestGlobalViewModelNames(fileHandle, 7);
+
+        wait_for_server(commandQueue.get());
+        commandQueue->processMessages();
+
+        CHECK(listener.m_hasCallback);
+        CHECK(listener.m_handle == fileHandle);
+        CHECK(listener.m_requestId == 7);
+        CHECK_FALSE(listener.m_names.empty());
+        for (auto& name : listener.m_names)
+        {
+            CHECK_FALSE(name.empty());
+        }
+    }
+
+    // An invalid file yields no callback (file error instead).
+    {
+        GlobalNamesListener listener;
+        FileHandle fileHandle =
+            commandQueue->loadFile(std::vector<uint8_t>(1024 * 1024, {}),
+                                   &listener);
+
+        commandQueue->requestGlobalViewModelNames(fileHandle, 8);
+
+        wait_for_server(commandQueue.get());
+        commandQueue->processMessages();
+
+        CHECK(!listener.m_hasCallback);
+    }
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+class BoundInstanceListener : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    virtual void onViewModelInstanceViewModelNameReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        std::string viewModelName) override
+    {
+        m_handle = handle;
+        m_viewModelName = viewModelName;
+        m_hasNameCallback = true;
+    }
+
+    virtual void onViewModelInstanceError(const ViewModelInstanceHandle,
+                                          uint64_t,
+                                          std::string) override
+    {
+        m_hasErrorCallback = true;
+    }
+
+    bool m_hasNameCallback = false;
+    bool m_hasErrorCallback = false;
+    ViewModelInstanceHandle m_handle = RIVE_NULL_HANDLE;
+    std::string m_viewModelName;
+};
+
+class GlobalValueListener : public CommandQueue::ViewModelInstanceListener
+{
+public:
+    virtual void onViewModelDataReceived(
+        const ViewModelInstanceHandle handle,
+        uint64_t requestId,
+        CommandQueue::ViewModelInstanceData data) override
+    {
+        CHECK(handle == m_handle);
+        CHECK(requestId == m_requestId);
+        CHECK(data == m_expectedData);
+        m_hasCallback = true;
+    }
+
+    ViewModelInstanceHandle m_handle = RIVE_NULL_HANDLE;
+    uint64_t m_requestId = 0;
+    CommandQueue::ViewModelInstanceData m_expectedData;
+    bool m_hasCallback = false;
+};
+
+TEST_CASE("Clear Main View Model Instance", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    GlobalNamesListener fileListener;
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+    commandQueue->requestGlobalViewModelNames(fileHandle, 1);
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(fileListener.m_hasCallback);
+    REQUIRE_FALSE(fileListener.m_names.empty());
+    // Keep one global as a control: clearing main must not clear the rest of
+    // the shared data context.
+    const std::string globalName = fileListener.m_names[0];
+
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    auto stateMachineHandle =
+        commandQueue->instantiateDefaultStateMachine(artboard);
+
+    rcp<ViewModelInstance> originalMain;
+    rcp<ViewModelInstance> originalGlobal;
+
+    // Capture both native identities after bind() for the isolation checks
+    // below.
+    commandQueue->bind(stateMachineHandle);
+    commandQueue->runOnce([stateMachineHandle,
+                           globalName,
+                           &originalMain,
+                           &originalGlobal](CommandServer* server) {
+        auto stateMachine = server->getStateMachineInstance(stateMachineHandle);
+        REQUIRE(stateMachine != nullptr);
+        REQUIRE(stateMachine->dataContext() != nullptr);
+
+        originalMain = stateMachine->dataContext()->mainViewModelInstance();
+        originalGlobal = stateMachine->globalViewModelInstance(globalName);
+        REQUIRE(originalMain != nullptr);
+        REQUIRE(originalGlobal != nullptr);
+    });
+
+    // Clear leaves main empty until the next bind, without disturbing globals.
+    commandQueue->clearViewModelInstance(stateMachineHandle, 2);
+    commandQueue->runOnce([stateMachineHandle, globalName, &originalGlobal](
+                              CommandServer* server) {
+        auto stateMachine = server->getStateMachineInstance(stateMachineHandle);
+        REQUIRE(stateMachine != nullptr);
+        REQUIRE(stateMachine->dataContext() != nullptr);
+
+        CHECK(stateMachine->dataContext()->mainViewModelInstance() == nullptr);
+        CHECK(stateMachine->globalViewModelInstance(globalName) ==
+              originalGlobal);
+    });
+
+    // Bind creates a new default main but preserves the existing global.
+    commandQueue->bind(stateMachineHandle);
+    commandQueue->runOnce([stateMachineHandle,
+                           globalName,
+                           &originalMain,
+                           &originalGlobal](CommandServer* server) {
+        auto stateMachine = server->getStateMachineInstance(stateMachineHandle);
+        REQUIRE(stateMachine != nullptr);
+        REQUIRE(stateMachine->dataContext() != nullptr);
+
+        CHECK(stateMachine->dataContext()->mainViewModelInstance() !=
+              originalMain);
+        CHECK(stateMachine->globalViewModelInstance(globalName) ==
+              originalGlobal);
+    });
+
+    server.processCommands();
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Clear Global View Model Instance", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    GlobalNamesListener fileListener;
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+    commandQueue->requestGlobalViewModelNames(fileHandle, 1);
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(fileListener.m_hasCallback);
+    REQUIRE(fileListener.m_names.size() >= 2);
+    const std::string clearedGlobalName = fileListener.m_names[0];
+    const std::string untouchedGlobalName = fileListener.m_names[1];
+
+    // Find a mutable primitive on the untouched global so the preservation
+    // check does not depend on a particular property in the test asset.
+    commandQueue->requestViewModelPropertyDefinitions(fileHandle,
+                                                      untouchedGlobalName,
+                                                      2);
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(fileListener.m_hasPropertiesCallback);
+    REQUIRE(fileListener.m_propertyViewModelName == untouchedGlobalName);
+    auto property =
+        std::find_if(fileListener.m_properties.begin(),
+                     fileListener.m_properties.end(),
+                     [](const auto& candidate) {
+                         return candidate.type == DataType::number ||
+                                candidate.type == DataType::string ||
+                                candidate.type == DataType::color;
+                     });
+    REQUIRE(property != fileListener.m_properties.end());
+
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    TestStateMachineErrorListener stateMachineListener;
+    auto stateMachineHandle =
+        commandQueue->instantiateDefaultStateMachine(artboard,
+                                                     &stateMachineListener);
+    stateMachineListener.m_handle = stateMachineHandle;
+
+    // Bind all defaults, then mutate a global that will not be cleared. Its
+    // value lets us detect an accidental clear-all/default recreation.
+    commandQueue->bind(stateMachineHandle);
+    auto originalUntouchedHandle =
+        commandQueue->globalViewModelInstance(stateMachineHandle,
+                                              untouchedGlobalName);
+    GlobalValueListener valueListener;
+    valueListener.m_expectedData.metaData = {property->type, property->name};
+    switch (property->type)
+    {
+        case DataType::number:
+            valueListener.m_expectedData.numberValue = 12345.5f;
+            commandQueue->setViewModelInstanceNumber(
+                originalUntouchedHandle,
+                property->name,
+                valueListener.m_expectedData.numberValue);
+            break;
+        case DataType::string:
+            valueListener.m_expectedData.stringValue = "preserved mutation";
+            commandQueue->setViewModelInstanceString(
+                originalUntouchedHandle,
+                property->name,
+                valueListener.m_expectedData.stringValue);
+            break;
+        case DataType::color:
+            valueListener.m_expectedData.colorValue = 0xFF123456;
+            commandQueue->setViewModelInstanceColor(
+                originalUntouchedHandle,
+                property->name,
+                valueListener.m_expectedData.colorValue);
+            break;
+        default:
+            FAIL("Unsupported property type selected for mutation");
+    }
+
+    // Clear only the target slot and query it before bind() to prove that the
+    // clear itself leaves the slot empty rather than eagerly making a default.
+    commandQueue->clearGlobalViewModelInstance(stateMachineHandle,
+                                               clearedGlobalName,
+                                               3);
+    BoundInstanceListener clearedListener;
+    commandQueue->globalViewModelInstance(stateMachineHandle,
+                                          clearedGlobalName,
+                                          &clearedListener,
+                                          4);
+
+    // Rebinding must restore the cleared slot's default while retaining the
+    // existing instance (and therefore the mutation) in every untouched slot.
+    commandQueue->bind(stateMachineHandle);
+    BoundInstanceListener reboundListener;
+    auto reboundHandle =
+        commandQueue->globalViewModelInstance(stateMachineHandle,
+                                              clearedGlobalName,
+                                              &reboundListener);
+    commandQueue->requestViewModelInstanceViewModelName(reboundHandle, 5);
+
+    valueListener.m_handle =
+        commandQueue->globalViewModelInstance(stateMachineHandle,
+                                              untouchedGlobalName,
+                                              &valueListener);
+    valueListener.m_requestId = 6;
+    switch (property->type)
+    {
+        case DataType::number:
+            commandQueue->requestViewModelInstanceNumber(
+                valueListener.m_handle,
+                property->name,
+                valueListener.m_requestId);
+            break;
+        case DataType::string:
+            commandQueue->requestViewModelInstanceString(
+                valueListener.m_handle,
+                property->name,
+                valueListener.m_requestId);
+            break;
+        case DataType::color:
+            commandQueue->requestViewModelInstanceColor(
+                valueListener.m_handle,
+                property->name,
+                valueListener.m_requestId);
+            break;
+        default:
+            FAIL("Unsupported property type selected for readback");
+    }
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(stateMachineListener.m_errorRequestIds.size() == 1);
+    CHECK(stateMachineListener.m_errorRequestIds[0] == 4);
+    CHECK_FALSE(clearedListener.m_hasErrorCallback);
+    CHECK(reboundListener.m_hasNameCallback);
+    CHECK(reboundListener.m_viewModelName == clearedGlobalName);
+    CHECK(valueListener.m_hasCallback);
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Clear Global View Model Instance Reports Invalid Name",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    TestStateMachineErrorListener stateMachineListener;
+    auto stateMachineHandle =
+        commandQueue->instantiateDefaultStateMachine(artboard,
+                                                     &stateMachineListener);
+    stateMachineListener.m_handle = stateMachineHandle;
+
+    commandQueue->clearGlobalViewModelInstance(stateMachineHandle,
+                                               "not-a-global",
+                                               1);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(stateMachineListener.m_receivedErrors == 1);
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Clear View Model Instances Report Invalid State Machine",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    TestStateMachineErrorListener stateMachineListener;
+    stateMachineListener.m_handle = reinterpret_cast<StateMachineHandle>(0xFF);
+    commandQueue->setGlobalStateMachineListener(&stateMachineListener);
+
+    commandQueue->clearViewModelInstance(stateMachineListener.m_handle, 1);
+    commandQueue->clearGlobalViewModelInstance(stateMachineListener.m_handle,
+                                               "Global",
+                                               2);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(stateMachineListener.m_receivedErrors == 2);
+    commandQueue->setGlobalStateMachineListener(nullptr);
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Get Bound View Model Instances", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    GlobalNamesListener fileListener;
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+
+    commandQueue->requestGlobalViewModelNames(fileHandle, 1);
+    server.processCommands();
+    commandQueue->processMessages();
+    REQUIRE(fileListener.m_hasCallback);
+    REQUIRE_FALSE(fileListener.m_names.empty());
+    const std::string globalName = fileListener.m_names.front();
+
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    TestStateMachineErrorListener stateMachineListener;
+    auto stateMachine =
+        commandQueue->instantiateDefaultStateMachine(artboard,
+                                                     &stateMachineListener);
+    stateMachineListener.m_handle = stateMachine;
+    commandQueue->bind(stateMachine);
+
+    BoundInstanceListener mainListener;
+    auto fetchedMain =
+        commandQueue->mainViewModelInstance(stateMachine, &mainListener, 2);
+    BoundInstanceListener globalListener;
+    auto fetchedGlobal = commandQueue->globalViewModelInstance(stateMachine,
+                                                               globalName,
+                                                               &globalListener,
+                                                               3);
+    commandQueue->requestViewModelInstanceViewModelName(fetchedGlobal, 4);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    REQUIRE(stateMachineListener.m_receivedViewModelInstances.size() == 2);
+    CHECK(stateMachineListener.m_receivedViewModelInstances[0].handle ==
+          fetchedMain);
+    CHECK(stateMachineListener.m_receivedViewModelInstances[0].requestId == 2);
+    CHECK(stateMachineListener.m_receivedViewModelInstances[1].handle ==
+          fetchedGlobal);
+    CHECK(stateMachineListener.m_receivedViewModelInstances[1].requestId == 3);
+    CHECK(stateMachineListener.m_errorRequestIds.empty());
+    CHECK_FALSE(mainListener.m_hasErrorCallback);
+    CHECK_FALSE(globalListener.m_hasErrorCallback);
+    CHECK(globalListener.m_hasNameCallback);
+    CHECK(globalListener.m_viewModelName == globalName);
+
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Get Unbound View Model Instances", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    GlobalNamesListener fileListener;
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &fileListener);
+    commandQueue->requestGlobalViewModelNames(fileHandle, 1);
+    server.processCommands();
+    commandQueue->processMessages();
+    REQUIRE(fileListener.m_hasCallback);
+    REQUIRE_FALSE(fileListener.m_names.empty());
+
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    TestStateMachineErrorListener stateMachineListener;
+    auto stateMachine =
+        commandQueue->instantiateDefaultStateMachine(artboard,
+                                                     &stateMachineListener);
+    stateMachineListener.m_handle = stateMachine;
+
+    BoundInstanceListener mainListener;
+    commandQueue->mainViewModelInstance(stateMachine, &mainListener, 2);
+    BoundInstanceListener globalListener;
+    commandQueue->globalViewModelInstance(stateMachine,
+                                          fileListener.m_names.front(),
+                                          &globalListener,
+                                          3);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(stateMachineListener.m_receivedViewModelInstances.empty());
+    REQUIRE(stateMachineListener.m_errorRequestIds.size() == 2);
+    CHECK(stateMachineListener.m_errorRequestIds[0] == 2);
+    CHECK(stateMachineListener.m_errorRequestIds[1] == 3);
+    CHECK_FALSE(mainListener.m_hasErrorCallback);
+    CHECK_FALSE(globalListener.m_hasErrorCallback);
+
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Get Global View Model Instance Reports Invalid Name",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    std::ifstream stream("assets/global_variables_test.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}));
+    auto artboard = commandQueue->instantiateDefaultArtboard(fileHandle);
+    TestStateMachineErrorListener stateMachineListener;
+    auto stateMachine =
+        commandQueue->instantiateDefaultStateMachine(artboard,
+                                                     &stateMachineListener);
+    stateMachineListener.m_handle = stateMachine;
+    commandQueue->bind(stateMachine);
+
+    BoundInstanceListener listener;
+    commandQueue->globalViewModelInstance(stateMachine,
+                                          "not-a-global",
+                                          &listener,
+                                          1);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(stateMachineListener.m_receivedViewModelInstances.empty());
+    REQUIRE(stateMachineListener.m_errorRequestIds.size() == 1);
+    CHECK(stateMachineListener.m_errorRequestIds[0] == 1);
+    CHECK_FALSE(listener.m_hasErrorCallback);
+
+    commandQueue->disconnect();
+}
+
+TEST_CASE("Get View Model Instances Report Invalid State Machine",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::unique_ptr<gpu::RenderContext> nullContext =
+        RenderContextNULL::MakeContext();
+    CommandServer server(commandQueue, nullContext.get());
+
+    auto stateMachine = reinterpret_cast<StateMachineHandle>(123456);
+    TestStateMachineErrorListener stateMachineListener;
+    stateMachineListener.m_handle = stateMachine;
+    commandQueue->setGlobalStateMachineListener(&stateMachineListener);
+    BoundInstanceListener mainListener;
+    commandQueue->mainViewModelInstance(stateMachine, &mainListener, 1);
+    BoundInstanceListener globalListener;
+    commandQueue->globalViewModelInstance(stateMachine,
+                                          "Global",
+                                          &globalListener,
+                                          2);
+
+    server.processCommands();
+    commandQueue->processMessages();
+
+    CHECK(stateMachineListener.m_receivedViewModelInstances.empty());
+    REQUIRE(stateMachineListener.m_errorRequestIds.size() == 2);
+    CHECK(stateMachineListener.m_errorRequestIds[0] == 1);
+    CHECK(stateMachineListener.m_errorRequestIds[1] == 2);
+    CHECK_FALSE(mainListener.m_hasErrorCallback);
+    CHECK_FALSE(globalListener.m_hasErrorCallback);
+
+    commandQueue->setGlobalStateMachineListener(nullptr);
+    commandQueue->disconnect();
+}
+
+TEST_CASE("registered global image asset applies to files loaded afterward",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    FileAssetsListenerCallback listener;
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() ==
+              server->getImage(imageHandle));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalImageAsset resolves across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, imageHandle](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalImageAsset replaces across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream imageStream1("assets/batdude.png", std::ios::binary);
+    auto imageHandle1 = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream1), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle1);
+
+    std::ifstream imageStream2("assets/batdude.png", std::ios::binary);
+    auto imageHandle2 = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream2), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle2);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, imageHandle2](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle2));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle2));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("removeGlobalImageAsset clears across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+    commandQueue->removeGlobalImageAsset("one-45008");
+
+    commandQueue->runOnce([fileHandle1, fileHandle2](CommandServer* server) {
+        auto file1 = server->getFile(fileHandle1);
+        REQUIRE(file1 != nullptr);
+        CHECK(file1->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+
+        auto file2 = server->getFile(fileHandle2);
+        REQUIRE(file2 != nullptr);
+        CHECK(file2->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE(
+    "addGlobalImageAsset with non-matching name does not resolve on files",
+    "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("wrong-name", imageHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalImageAsset with invalid handle reports error",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestRenderImageErrorListener errorListener;
+    errorListener.m_handle = RIVE_NULL_HANDLE;
+    commandQueue->setGlobalRenderImageListener(&errorListener);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    commandQueue->addGlobalImageAsset("one-45008", RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+    });
+
+    wait_for_server(commandQueue.get());
+
+    commandQueue->processMessages();
+    CHECK(errorListener.m_hasCallback);
+
+    commandQueue->setGlobalRenderImageListener(nullptr);
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+#ifdef WITH_RIVE_TEXT
+TEST_CASE("addGlobalFontAsset resolves across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream fontStream("assets/fonts/OpenSans-Italic.ttf",
+                             std::ios::binary);
+    auto fontHandle = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream), {}));
+
+    commandQueue->addGlobalFontAsset("Inter-43276", fontHandle);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, fontHandle](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<FontAsset>()->font().get() ==
+                  server->getFont(fontHandle));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<FontAsset>()->font().get() ==
+                  server->getFont(fontHandle));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalFontAsset replaces across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream fontStream1("assets/fonts/OpenSans-Italic.ttf",
+                              std::ios::binary);
+    auto fontHandle1 = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream1), {}));
+
+    commandQueue->addGlobalFontAsset("Inter-43276", fontHandle1);
+
+    std::ifstream fontStream2("assets/fonts/OpenSans-Italic.ttf",
+                              std::ios::binary);
+    auto fontHandle2 = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream2), {}));
+
+    commandQueue->addGlobalFontAsset("Inter-43276", fontHandle2);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, fontHandle2](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<FontAsset>()->font().get() ==
+                  server->getFont(fontHandle2));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<FontAsset>()->font().get() ==
+                  server->getFont(fontHandle2));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("removeGlobalFontAsset clears across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream fontStream("assets/fonts/OpenSans-Italic.ttf",
+                             std::ios::binary);
+    auto fontHandle = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream), {}));
+
+    commandQueue->addGlobalFontAsset("Inter-43276", fontHandle);
+    commandQueue->removeGlobalFontAsset("Inter-43276");
+
+    commandQueue->runOnce([fileHandle1, fileHandle2](CommandServer* server) {
+        auto file1 = server->getFile(fileHandle1);
+        REQUIRE(file1 != nullptr);
+        CHECK(file1->assets()[0]->as<FontAsset>()->font() == nullptr);
+
+        auto file2 = server->getFile(fileHandle2);
+        REQUIRE(file2 != nullptr);
+        CHECK(file2->assets()[0]->as<FontAsset>()->font() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalFontAsset with non-matching name does not resolve on files",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream fontStream("assets/fonts/OpenSans-Italic.ttf",
+                             std::ios::binary);
+    auto fontHandle = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream), {}));
+
+    commandQueue->addGlobalFontAsset("wrong-name", fontHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<FontAsset>()->font() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalFontAsset with invalid handle reports error",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestFontErrorListener errorListener;
+    errorListener.m_handle = RIVE_NULL_HANDLE;
+    commandQueue->setGlobalFontListener(&errorListener);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    commandQueue->addGlobalFontAsset("Inter-43276", RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<FontAsset>()->font() == nullptr);
+    });
+
+    wait_for_server(commandQueue.get());
+
+    commandQueue->processMessages();
+    CHECK(errorListener.m_hasCallback);
+
+    commandQueue->setGlobalFontListener(nullptr);
+    commandQueue->disconnect();
+    serverThread.join();
+}
+#endif
+
+#ifdef WITH_RIVE_AUDIO
+TEST_CASE("addGlobalAudioAsset resolves across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream audioStream("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream), {}));
+
+    commandQueue->addGlobalAudioAsset("sound-55368", audioHandle);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, audioHandle](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<AudioAsset>()->audioSource().get() ==
+                  server->getAudioSource(audioHandle));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<AudioAsset>()->audioSource().get() ==
+                  server->getAudioSource(audioHandle));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalAudioAsset replaces across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream audioStream1("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle1 = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream1), {}));
+
+    commandQueue->addGlobalAudioAsset("sound-55368", audioHandle1);
+
+    std::ifstream audioStream2("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle2 = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream2), {}));
+
+    commandQueue->addGlobalAudioAsset("sound-55368", audioHandle2);
+
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, audioHandle2](CommandServer* server) {
+            auto file1 = server->getFile(fileHandle1);
+            REQUIRE(file1 != nullptr);
+            CHECK(file1->assets()[0]->as<AudioAsset>()->audioSource().get() ==
+                  server->getAudioSource(audioHandle2));
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<AudioAsset>()->audioSource().get() ==
+                  server->getAudioSource(audioHandle2));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("removeGlobalAudioAsset clears across all files", "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream audioStream("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream), {}));
+
+    commandQueue->addGlobalAudioAsset("sound-55368", audioHandle);
+    commandQueue->removeGlobalAudioAsset("sound-55368");
+
+    commandQueue->runOnce([fileHandle1, fileHandle2](CommandServer* server) {
+        auto file1 = server->getFile(fileHandle1);
+        REQUIRE(file1 != nullptr);
+        CHECK(file1->assets()[0]->as<AudioAsset>()->audioSource() == nullptr);
+
+        auto file2 = server->getFile(fileHandle2);
+        REQUIRE(file2 != nullptr);
+        CHECK(file2->assets()[0]->as<AudioAsset>()->audioSource() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE(
+    "addGlobalAudioAsset with non-matching name does not resolve on files",
+    "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream audioStream("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream), {}));
+
+    commandQueue->addGlobalAudioAsset("wrong-name", audioHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<AudioAsset>()->audioSource() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("addGlobalAudioAsset with invalid handle reports error",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    TestAudioSourceErrorListener errorListener;
+    errorListener.m_handle = RIVE_NULL_HANDLE;
+    commandQueue->setGlobalAudioSourceListener(&errorListener);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    commandQueue->addGlobalAudioAsset("sound-55368", RIVE_NULL_HANDLE);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<AudioAsset>()->audioSource() == nullptr);
+    });
+
+    wait_for_server(commandQueue.get());
+
+    commandQueue->processMessages();
+    CHECK(errorListener.m_hasCallback);
+
+    commandQueue->setGlobalAudioSourceListener(nullptr);
+    commandQueue->disconnect();
+    serverThread.join();
+}
+#endif
+
+TEST_CASE("deleting a file does not disturb another file's global asset",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener1;
+    FileAssetsListenerCallback listener2;
+
+    std::ifstream stream1("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle1 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream1), {}),
+        &listener1);
+
+    std::ifstream stream2("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle2 = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream2), {}),
+        &listener2);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+    commandQueue->deleteFile(fileHandle1);
+
+    // The surviving file keeps its resolved asset, and the deleted file is
+    // gone.
+    commandQueue->runOnce(
+        [fileHandle1, fileHandle2, imageHandle](CommandServer* server) {
+            CHECK(server->getFile(fileHandle1) == nullptr);
+
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle));
+        });
+
+    // A subsequent global change for the same name must reach the surviving
+    // file and must not touch the deleted file's assets.
+    std::ifstream replacementStream("assets/batdude.png", std::ios::binary);
+    auto replacementHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(replacementStream),
+                             {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", replacementHandle);
+
+    commandQueue->runOnce(
+        [fileHandle2, replacementHandle](CommandServer* server) {
+            auto file2 = server->getFile(fileHandle2);
+            REQUIRE(file2 != nullptr);
+            CHECK(file2->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(replacementHandle));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("global asset changes after deleting its only file are a safe no-op",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+    commandQueue->deleteFile(fileHandle);
+
+    // With no file referencing the name, applying and clearing it must not
+    // dereference the deleted file's assets.
+    commandQueue->removeGlobalImageAsset("one-45008");
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        CHECK(server->getFile(fileHandle) == nullptr);
+        CHECK(server->getImage(imageHandle) != nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("failed load does not contaminate a later file's global assets",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    // A file that fails to import must not leave its assets tracked.
+    FileHandle badFile =
+        commandQueue->loadFile(std::vector<uint8_t>(100 * 1024, 0));
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle goodFile = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    commandQueue->runOnce(
+        [badFile, goodFile, imageHandle](CommandServer* server) {
+            CHECK(server->getFile(badFile) == nullptr);
+
+            auto file = server->getFile(goodFile);
+            REQUIRE(file != nullptr);
+            CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() ==
+                  server->getImage(imageHandle));
+        });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("global image asset does not override embedded asset",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    // Registered before the file loads: the embedded contents must still win.
+    commandQueue->addGlobalImageAsset("1x1-45022", imageHandle);
+
+    std::ifstream stream("assets/in_band_asset.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        auto image = file->assets()[0]->as<ImageAsset>()->renderImage();
+        CHECK(image != nullptr);
+        CHECK(image != server->getImage(imageHandle));
+    });
+
+    // Removing and re-adding the global after load must not clear or replace
+    // the embedded contents either.
+    commandQueue->removeGlobalImageAsset("1x1-45022");
+    commandQueue->addGlobalImageAsset("1x1-45022", imageHandle);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        auto image = file->assets()[0]->as<ImageAsset>()->renderImage();
+        CHECK(image != nullptr);
+        CHECK(image != server->getImage(imageHandle));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("deleting an image clears the applied global asset on loaded files",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() ==
+              server->getImage(imageHandle));
+    });
+
+    // Deleting the image deletes the global asset backed by it, so the
+    // change is applied to loaded files just like a removal.
+    commandQueue->deleteImage(imageHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+TEST_CASE("deleting an image registered under multiple names clears all",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    // The same image backs two global asset names.
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+    commandQueue->addGlobalImageAsset("two-45009", imageHandle);
+
+    commandQueue->runOnce([fileHandle, imageHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() ==
+              server->getImage(imageHandle));
+    });
+
+    // Deleting the image deletes every global asset it backed, applying the
+    // removal to loaded files and leaving no stale registry entries.
+    commandQueue->deleteImage(imageHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+        CHECK(!server->testing_globalImageContains("one-45008"));
+        CHECK(!server->testing_globalImageContains("two-45009"));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+#ifdef WITH_RIVE_TEXT
+TEST_CASE("deleting a font clears the applied global asset on loaded files",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_font_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream fontStream("assets/fonts/OpenSans-Italic.ttf",
+                             std::ios::binary);
+    auto fontHandle = commandQueue->decodeFont(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(fontStream), {}));
+
+    commandQueue->addGlobalFontAsset("Inter-43276", fontHandle);
+
+    commandQueue->runOnce([fileHandle, fontHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<FontAsset>()->font().get() ==
+              server->getFont(fontHandle));
+    });
+
+    // Deleting the font deletes the global asset backed by it, so the
+    // change is applied to loaded files just like a removal.
+    commandQueue->deleteFont(fontHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<FontAsset>()->font() == nullptr);
+        CHECK(!server->testing_globalFontContains("Inter-43276"));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+#endif
+
+#ifdef WITH_RIVE_AUDIO
+TEST_CASE(
+    "deleting an audio source clears the applied global asset on loaded files",
+    "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_audio_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream audioStream("assets/audio/what.wav", std::ios::binary);
+    auto audioHandle = commandQueue->decodeAudio(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(audioStream), {}));
+
+    commandQueue->addGlobalAudioAsset("sound-55368", audioHandle);
+
+    commandQueue->runOnce([fileHandle, audioHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<AudioAsset>()->audioSource().get() ==
+              server->getAudioSource(audioHandle));
+    });
+
+    // Deleting the audio source deletes the global asset backed by it, so
+    // the change is applied to loaded files just like a removal.
+    commandQueue->deleteAudio(audioHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<AudioAsset>()->audioSource() == nullptr);
+        CHECK(!server->testing_globalAudioContains("sound-55368"));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+#endif
+
+TEST_CASE("deleting a replaced image does not clear its former name",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    std::thread serverThread(server_thread, commandQueue);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    std::ifstream imageStream1("assets/batdude.png", std::ios::binary);
+    auto firstHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream1), {}));
+
+    std::ifstream imageStream2("assets/batdude.png", std::ios::binary);
+    auto secondHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream2), {}));
+
+    // The name is re-registered from the first image to the second.
+    commandQueue->addGlobalImageAsset("one-45008", firstHandle);
+    commandQueue->addGlobalImageAsset("one-45008", secondHandle);
+
+    // Deleting the first image must not clear the name, which now belongs
+    // to the second image.
+    commandQueue->deleteImage(firstHandle);
+
+    commandQueue->runOnce([fileHandle, secondHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() ==
+              server->getImage(secondHandle));
+        CHECK(server->testing_globalImageContains("one-45008"));
+    });
+
+    commandQueue->disconnect();
+    serverThread.join();
+}
+
+namespace
+{
+// Claims image assets without providing contents, standing in for a custom
+// loader that owns asset resolution.
+class ClaimingImageAssetLoader : public rive::FileAssetLoader
+{
+public:
+    bool loadContents(FileAsset& asset,
+                      Span<const uint8_t> inBandBytes,
+                      Factory* factory) override
+    {
+        return asset.is<ImageAsset>();
+    }
+};
+} // namespace
+
+TEST_CASE("internal loader claimed asset is not overridden by global asset",
+          "[CommandQueue]")
+{
+    auto commandQueue = make_rcp<CommandQueue>();
+    auto loader = make_rcp<ClaimingImageAssetLoader>();
+    std::thread serverThread(server_thread_file_loader, commandQueue, loader);
+
+    FileAssetsListenerCallback listener;
+
+    std::ifstream imageStream("assets/batdude.png", std::ios::binary);
+    auto imageHandle = commandQueue->decodeImage(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(imageStream), {}));
+
+    // Registered before the file loads: the claiming loader still wins.
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    std::ifstream stream("assets/hosted_image_file.riv", std::ios::binary);
+    FileHandle fileHandle = commandQueue->loadFile(
+        std::vector<uint8_t>(std::istreambuf_iterator<char>(stream), {}),
+        &listener);
+
+    // The claiming loader set no contents, and the global asset must not
+    // have been applied over its claim at load.
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
+    });
+
+    // Re-applying the global after load must not reach the claimed asset
+    // either.
+    commandQueue->addGlobalImageAsset("one-45008", imageHandle);
+
+    commandQueue->runOnce([fileHandle](CommandServer* server) {
+        auto file = server->getFile(fileHandle);
+        REQUIRE(file != nullptr);
+        CHECK(file->assets()[0]->as<ImageAsset>()->renderImage() == nullptr);
     });
 
     commandQueue->disconnect();

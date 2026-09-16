@@ -1,9 +1,12 @@
+#include "rive/animation/listener_invocation.hpp"
 #include "rive/animation/state_machine_listener.hpp"
 #include "rive/constraints/scrolling/scroll_bar_constraint.hpp"
 #include "rive/constraints/scrolling/scroll_constraint.hpp"
 #include "rive/listener_group.hpp"
+#include "rive/profiler/rive_profile.hpp"
 #include "rive/scripted/scripted_drawable.hpp"
 #include "rive/scripted/scripted_layout.hpp"
+#include "rive/scripted/scripted_transition.hpp"
 
 using namespace rive;
 
@@ -57,6 +60,69 @@ void ListenerGroup::reset(int pointerId)
     }
 }
 
+_PointerData* ListenerGroup::findPointerData(int id)
+{
+    auto itr = m_pointers.find(id);
+    return itr == m_pointers.end() ? nullptr : itr->second;
+}
+
+// Ends any gesture this pointer has in flight, for when the contents the group
+// lives in stop existing mid-gesture (an artboard collapsed to a 0 scale).
+// Being occluded doesn't do this -- a drag has to survive the pointer passing
+// over other targets -- but content that isn't there can't hold a press.
+//
+// The dragEnd is reported rather than dispatched: StateMachineInstance::dragEnd
+// re-enters updateListeners, which resets every group's phase, so dispatching
+// from here would make the groups cancelled after this one look like they had
+// nothing in flight and strand their state.
+bool ListenerGroup::cancelPointer(int pointerId,
+                                  Vec2D position,
+                                  float timeStamp)
+{
+    auto pointer = findPointerData(pointerId);
+    if (pointer == nullptr)
+    {
+        return false;
+    }
+    // disabled is disablePointerEvents' sticky state; it clears on enable().
+    if (pointer->phase == GestureClickPhase::disabled ||
+        pointer->phase == GestureClickPhase::out)
+    {
+        return false;
+    }
+    bool wasDragging =
+        pointer->hasDragged && pointer->phase == GestureClickPhase::down;
+    pointer->phase = GestureClickPhase::out;
+    pointer->hasDragged = false;
+    return wasDragging;
+}
+
+void ListenerGroup::cancelPointers(Vec2D position,
+                                   float timeStamp,
+                                   std::vector<int>& dragEnded)
+{
+    for (auto& entry : m_pointers)
+    {
+        if (!cancelPointer(entry.first, position, timeStamp))
+        {
+            continue;
+        }
+        bool alreadyEnded = false;
+        for (auto id : dragEnded)
+        {
+            if (id == entry.first)
+            {
+                alreadyEnded = true;
+                break;
+            }
+        }
+        if (!alreadyEnded)
+        {
+            dragEnded.push_back(entry.first);
+        }
+    }
+}
+
 void ListenerGroup::releaseEvent(int pointerId)
 {
     if (m_pointers.find(pointerId) != m_pointers.end())
@@ -65,6 +131,7 @@ void ListenerGroup::releaseEvent(int pointerId)
         auto pointerData = m_pointers[pointerId];
         pointerData->isHovered = false;
         pointerData->isPrevHovered = false;
+        pointerData->hasDragged = false;
         pointerData->phase = GestureClickPhase::out;
         auto previousPosition = pointerData->previousPosition();
         previousPosition->x = 0;
@@ -90,27 +157,24 @@ void ListenerGroup::disable(int pointerId)
 
 bool ListenerGroup::canEarlyOut(Component* drawable)
 {
-    auto listenerType = m_listener->listenerType();
-    return !(listenerType == ListenerType::enter ||
-             listenerType == ListenerType::exit ||
-             listenerType == ListenerType::move ||
-             listenerType == ListenerType::drag);
+    return !(m_listener->hasListener(ListenerType::enter) ||
+             m_listener->hasListener(ListenerType::exit) ||
+             m_listener->hasListener(ListenerType::move) ||
+             m_listener->hasListener(ListenerType::drag));
 }
 
 bool ListenerGroup::needsDownListener(Component* drawable)
 {
-    auto listenerType = m_listener->listenerType();
-    return listenerType == ListenerType::down ||
-           listenerType == ListenerType::click ||
-           listenerType == ListenerType::drag;
+    return m_listener->hasListener(ListenerType::down) ||
+           m_listener->hasListener(ListenerType::click) ||
+           m_listener->hasListener(ListenerType::drag);
 }
 
 bool ListenerGroup::needsUpListener(Component* drawable)
 {
-    auto listenerType = m_listener->listenerType();
-    return listenerType == ListenerType::up ||
-           listenerType == ListenerType::click ||
-           listenerType == ListenerType::drag;
+    return m_listener->hasListener(ListenerType::up) ||
+           m_listener->hasListener(ListenerType::click) ||
+           m_listener->hasListener(ListenerType::drag);
 }
 
 ProcessEventResult ListenerGroup::processEvent(
@@ -173,68 +237,92 @@ ProcessEventResult ListenerGroup::processEvent(
     if (prevPhase == GestureClickPhase::down &&
         (pointer->phase == GestureClickPhase::clicked ||
          pointer->phase == GestureClickPhase::out) &&
-        m_hasDragged)
+        pointer->hasDragged)
     {
         stateMachineInstance->dragEnd(position, timeStamp, pointerId);
-        m_hasDragged = false;
+        pointer->hasDragged = false;
     }
     auto _listener = listener();
+    bool shouldPerformChanges = false;
+    auto listenerTypeMatched = hitEvent;
     // Always update hover states regardless of which specific listener type
     // we're trying to trigger.
     // If hover has changed and:
     // - it's hovering and the listener is of type enter
     // - it's not hovering and the listener is of type exit
-    if (hoverChange &&
-        ((isGroupHovered && _listener->listenerType() == ListenerType::enter) ||
-         (!isGroupHovered && _listener->listenerType() == ListenerType::exit)))
+    if (hoverChange)
     {
-        _listener->performChanges(
-            stateMachineInstance,
-            position,
-            Vec2D(previousPosition->x, previousPosition->y),
-            pointerId);
-        stateMachineInstance->markNeedsAdvance();
-        consume();
+        if (isGroupHovered && _listener->hasListener(ListenerType::enter))
+        {
+            shouldPerformChanges = true;
+            listenerTypeMatched = ListenerType::enter;
+        }
+        else if ((!isGroupHovered &&
+                  _listener->hasListener(ListenerType::exit)))
+        {
+            shouldPerformChanges = true;
+            listenerTypeMatched = ListenerType::exit;
+        }
     }
     // Perform changes if:
     // - the click gesture is complete and the listener is of type click
     // - the event type matches the listener type and it is hovering the
     // group
-    if ((pointer->phase == GestureClickPhase::clicked &&
-         _listener->listenerType() == ListenerType::click) ||
-        (isGroupHovered && hitEvent == _listener->listenerType()))
+    if (pointer->phase == GestureClickPhase::clicked &&
+        _listener->hasListener(ListenerType::click))
     {
-        _listener->performChanges(
-            stateMachineInstance,
-            position,
-            Vec2D(previousPosition->x, previousPosition->y),
-            pointerId);
-        stateMachineInstance->markNeedsAdvance();
-        consume();
+        shouldPerformChanges = true;
+        listenerTypeMatched = ListenerType::click;
+    }
+    else if (isGroupHovered && _listener->hasListener(hitEvent))
+    {
+        shouldPerformChanges = true;
     }
     // Perform changes if:
     // - the listener type is drag
     // - the clickPhase is down
     // - the pointer type is move
     if (pointer->phase == GestureClickPhase::down &&
-        _listener->listenerType() == ListenerType::drag &&
+        _listener->hasListener(ListenerType::drag) &&
         hitEvent == ListenerType::move)
     {
-        _listener->performChanges(
-            stateMachineInstance,
-            position,
-            Vec2D(previousPosition->x, previousPosition->y),
-            pointerId);
-        stateMachineInstance->markNeedsAdvance();
-        if (!m_hasDragged)
+        shouldPerformChanges = true;
+        listenerTypeMatched = ListenerType::drag;
+        if (!pointer->hasDragged)
         {
             stateMachineInstance->dragStart(position,
                                             timeStamp,
                                             false,
                                             pointerId);
-            m_hasDragged = true;
+            pointer->hasDragged = true;
         }
+    }
+    if (shouldPerformChanges)
+    {
+        _listener->performChanges(
+            stateMachineInstance,
+            ListenerInvocation::pointer(
+                position,
+                Vec2D(previousPosition->x, previousPosition->y),
+                pointerId,
+                listenerTypeMatched,
+                timeStamp));
+        stateMachineInstance->markNeedsAdvance();
         consume();
+
+#ifdef RIVE_MICROPROFILE
+        if (RiveProfile::instance().logFlags() &
+            ProfileLogListenerPerformChanges)
+        {
+            RiveProfile::instance().recordListenerPerformChange(
+                stateMachineInstance->artboard()->name(),
+                stateMachineInstance->name(),
+                _listener->name(),
+                static_cast<uint32_t>(listenerTypeMatched),
+                static_cast<uint32_t>(hitEvent),
+                pointerId);
+        }
+#endif
     }
     previousPosition->x = position.x;
     previousPosition->y = position.y;
@@ -253,6 +341,8 @@ ListenerGroupProvider* ListenerGroupProvider::from(Core* component)
             return component->as<ScriptedLayout>();
         case ScriptedDrawable::typeKey:
             return component->as<ScriptedDrawable>();
+        case ScriptedTransition::typeKey:
+            return component->as<ScriptedTransition>();
     }
     return nullptr;
 }

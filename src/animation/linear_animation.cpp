@@ -24,15 +24,41 @@ LinearAnimation::~LinearAnimation()
 
 StatusCode LinearAnimation::onAddedDirty(CoreContext* context)
 {
-    StatusCode code;
-    for (const auto& object : m_KeyedObjects)
+    StatusCode status = StatusCode::Ok;
+    std::vector<size_t> failedKeyedObjects;
+    for (size_t i = 0; i < m_KeyedObjects.size(); ++i)
     {
-        if ((code = object->onAddedDirty(context)) != StatusCode::Ok)
+        StatusCode code = m_KeyedObjects[i]->onAddedDirty(context);
+        if (code != StatusCode::Ok)
         {
-            return code;
+            failedKeyedObjects.push_back(i);
+            if (status == StatusCode::Ok || status == StatusCode::MissingObject)
+            {
+                status = code;
+            }
         }
     }
-    return StatusCode::Ok;
+
+    // Failed keyed objects should not be applied later in animation playback.
+    for (auto it = failedKeyedObjects.rbegin(); it != failedKeyedObjects.rend();
+         ++it)
+    {
+        m_KeyedObjects.erase(m_KeyedObjects.begin() + *it);
+    }
+
+#ifdef WITH_RIVE_EDITOR
+    // Coop-hydrated KeyedObjects run their own onAddedDirty in the
+    // dispatcher's Pass 3 (editor_native/command_dispatcher.cpp); this
+    // loop is redundant for arena-owned entries but cheap (vector is
+    // empty on .riv-loaded animations).
+    for (auto* object : m_EditorKeyedObjects)
+    {
+        object->onAddedDirty(context);
+    }
+#endif
+
+    // Missing keyed objects are non-fatal at artboard init time.
+    return status == StatusCode::MissingObject ? StatusCode::Ok : status;
 }
 
 StatusCode LinearAnimation::onAddedClean(CoreContext* context)
@@ -45,6 +71,12 @@ StatusCode LinearAnimation::onAddedClean(CoreContext* context)
             return code;
         }
     }
+#ifdef WITH_RIVE_EDITOR
+    for (auto* object : m_EditorKeyedObjects)
+    {
+        object->onAddedClean(context);
+    }
+#endif
     return StatusCode::Ok;
 }
 
@@ -53,7 +85,14 @@ void LinearAnimation::addKeyedObject(std::unique_ptr<KeyedObject> object)
     m_KeyedObjects.push_back(std::move(object));
 }
 
-void LinearAnimation::apply(Artboard* artboard, float time, float mix) const
+// `addKeyedObjectForEditor` and `clearEditorKeyedObjects` live in
+// `editor_native/native/src/editor/animation/linear_animation_editor.cpp`
+// — see the matching comment in `keyed_property.cpp`.
+
+void LinearAnimation::apply(Artboard* artboard,
+                            float time,
+                            float mix,
+                            const LinearAnimationInstance* context) const
 {
     if (quantize())
     {
@@ -62,8 +101,14 @@ void LinearAnimation::apply(Artboard* artboard, float time, float mix) const
     }
     for (const auto& object : m_KeyedObjects)
     {
-        object->apply(artboard, time, mix);
+        object->apply(artboard, time, mix, context);
     }
+#ifdef WITH_RIVE_EDITOR
+    for (auto* object : m_EditorKeyedObjects)
+    {
+        object->apply(artboard, time, mix, context);
+    }
+#endif
 }
 
 StatusCode LinearAnimation::import(ImportStack& importStack)
@@ -147,5 +192,14 @@ void LinearAnimation::reportKeyedCallbacks(KeyedCallbackReporter* reporter,
                                          secondsTo,
                                          isAtStartFrame);
         }
+#ifdef WITH_RIVE_EDITOR
+        for (auto* object : m_EditorKeyedObjects)
+        {
+            object->reportKeyedCallbacks(reporter,
+                                         secondsFrom,
+                                         secondsTo,
+                                         isAtStartFrame);
+        }
+#endif
     }
 }

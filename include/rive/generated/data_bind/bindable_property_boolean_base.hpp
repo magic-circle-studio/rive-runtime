@@ -41,8 +41,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(propertyValuePropertyKey,
+                             &m_PropertyValue,
+                             &value);
         m_PropertyValue = value;
-        propertyValueChanged();
+        RIVE_EDITOR_CHANGED(propertyValueChanged());
+        notifyPropertyChanged(propertyValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -65,6 +69,9 @@ public:
 
 protected:
     virtual void propertyValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/bindable_property_boolean_ext.inl"
+#endif
 };
 } // namespace rive
 

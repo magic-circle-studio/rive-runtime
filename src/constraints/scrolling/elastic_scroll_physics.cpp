@@ -3,18 +3,22 @@
 
 using namespace rive;
 
-ElasticScrollPhysics::~ElasticScrollPhysics()
-{
-    delete m_physicsX;
-    delete m_physicsY;
-}
-
 Vec2D ElasticScrollPhysics::advance(float elapsedSeconds)
 {
+    // Capture per-axis position before advancing so we can derive current
+    // velocity from the actual frame-to-frame motion and write it into the
+    // base m_speed (used for velocity reporting).
+    float prevX = m_physicsX != nullptr ? m_physicsX->current() : 0.0f;
+    float prevY = m_physicsY != nullptr ? m_physicsY->current() : 0.0f;
     float advanceX =
         m_physicsX != nullptr ? m_physicsX->advance(elapsedSeconds) : 0.0f;
     float advanceY =
         m_physicsY != nullptr ? m_physicsY->advance(elapsedSeconds) : 0.0f;
+    if (elapsedSeconds > 0)
+    {
+        m_speed = Vec2D((advanceX - prevX) / elapsedSeconds,
+                        (advanceY - prevY) / elapsedSeconds);
+    }
     bool isRunningX = m_physicsX != nullptr && m_physicsX->isRunning();
     bool isRunningY = m_physicsY != nullptr && m_physicsY->isRunning();
     if (!isRunningX && !isRunningY)
@@ -83,24 +87,26 @@ void ElasticScrollPhysics::prepare(DraggableConstraintDirection dir)
     if (dir == DraggableConstraintDirection::horizontal ||
         dir == DraggableConstraintDirection::all)
     {
-        m_physicsX = new ElasticScrollPhysicsHelper(friction(),
-                                                    speedMultiplier(),
-                                                    elasticFactor());
+        m_physicsX =
+            std::make_unique<ElasticScrollPhysicsHelper>(friction(),
+                                                         speedMultiplier(),
+                                                         elasticFactor());
     }
     if (dir == DraggableConstraintDirection::vertical ||
         dir == DraggableConstraintDirection::all)
     {
-        m_physicsY = new ElasticScrollPhysicsHelper(friction(),
-                                                    speedMultiplier(),
-                                                    elasticFactor());
+        m_physicsY =
+            std::make_unique<ElasticScrollPhysicsHelper>(friction(),
+                                                         speedMultiplier(),
+                                                         elasticFactor());
     }
 }
 
 void ElasticScrollPhysics::reset()
 {
     Super::reset();
-    m_physicsX = nullptr;
-    m_physicsY = nullptr;
+    m_physicsX.reset();
+    m_physicsY.reset();
 }
 
 float ElasticScrollPhysicsHelper::advance(float elapsedSeconds)
@@ -177,7 +183,13 @@ void ElasticScrollPhysicsHelper::run(float acceleration,
     m_isRunning = true;
     m_runRangeMin = rangeMin;
     m_runRangeMax = rangeMax;
-    if (abs(acceleration) > 100)
+    // An axis whose content fits its viewport has nowhere to fling to: every
+    // reachable target is the origin. Skip the velocity phase there so a
+    // release eases the overscroll back from wherever the pointer actually
+    // left it, rather than throwing it further out first. The elastic
+    // overscroll itself is untouched, so a short list still bounces.
+    bool canScroll = rangeMin < rangeMax;
+    if (canScroll && abs(acceleration) > 100)
     {
         m_speed = acceleration * 0.16f * 0.16f * 0.1f * m_speedMultiplier;
     }
@@ -199,20 +211,23 @@ void ElasticScrollPhysicsHelper::run(float acceleration,
     }
     m_current = value;
 
-    if (!snappingPoints.empty())
+    if (canScroll && !snappingPoints.empty())
     {
         float endTarget = -(m_current + m_speed / m_friction);
         float sectionSize = contentSize != 0 ? contentSize : 1;
-        float viewportSectionSize = viewportSize != 0 ? viewportSize : 1;
         int multiple = rangeMax == std::numeric_limits<float>::infinity()
                            ? std::floor(endTarget / sectionSize)
                            : 0;
         float modEndTarget = rangeMax == std::numeric_limits<float>::infinity()
-                                 ? std::fmod(endTarget, sectionSize)
+                                 ? math::positive_mod(endTarget, sectionSize)
                                  : endTarget;
+        // -rangeMin is the max positive scroll position. It already accounts
+        // for viewport trailing padding (rangeMin = maxOffset =
+        // viewportSize - contentSize - paddingEnd), whereas contentSize -
+        // viewportSize does not.
         float maxTarget = rangeMax == std::numeric_limits<float>::infinity()
                               ? std::numeric_limits<float>::infinity()
-                              : sectionSize - viewportSectionSize;
+                              : -rangeMin;
         float closest = std::numeric_limits<float>::max();
         float snapTarget = 0;
         for (auto snap : snappingPoints)
@@ -222,6 +237,18 @@ void ElasticScrollPhysicsHelper::run(float acceleration,
             {
                 closest = diff;
                 snapTarget = snap + (multiple * sectionSize);
+            }
+        }
+        // Treat the padded end-of-scroll as a candidate snap. Otherwise a
+        // fling past the last item snaps backward to that item's leading
+        // edge, dropping the trailing padding.
+        if (maxTarget != std::numeric_limits<float>::infinity())
+        {
+            float diff = std::abs(maxTarget - modEndTarget);
+            if (diff < closest)
+            {
+                closest = diff;
+                snapTarget = maxTarget;
             }
         }
         snapTarget = std::min(snapTarget, maxTarget);
@@ -258,15 +285,17 @@ void ElasticScrollPhysics::scrollToPosition(Vec2D current,
     // Create physics helpers if needed
     if (horizontal && m_physicsX == nullptr)
     {
-        m_physicsX = new ElasticScrollPhysicsHelper(friction(),
-                                                    speedMultiplier(),
-                                                    elasticFactor());
+        m_physicsX =
+            std::make_unique<ElasticScrollPhysicsHelper>(friction(),
+                                                         speedMultiplier(),
+                                                         elasticFactor());
     }
     if (vertical && m_physicsY == nullptr)
     {
-        m_physicsY = new ElasticScrollPhysicsHelper(friction(),
-                                                    speedMultiplier(),
-                                                    elasticFactor());
+        m_physicsY =
+            std::make_unique<ElasticScrollPhysicsHelper>(friction(),
+                                                         speedMultiplier(),
+                                                         elasticFactor());
     }
 
     // Initiate settling animation

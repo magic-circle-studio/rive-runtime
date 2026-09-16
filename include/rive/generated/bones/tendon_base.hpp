@@ -2,7 +2,8 @@
 #define _RIVE_TENDON_BASE_HPP_
 #include "rive/component.hpp"
 #include "rive/core/field_types/core_double_type.hpp"
-#include "rive/core/field_types/core_uint_type.hpp"
+#include "rive/core/field_types/core_id_type.hpp"
+#include "rive/core/id.hpp"
 namespace rive
 {
 class TendonBase : public Component
@@ -38,7 +39,7 @@ public:
     static const uint16_t tyPropertyKey = 101;
 
 protected:
-    uint32_t m_BoneId = -1;
+    Id m_BoneId = kEmptyId;
     float m_Xx = 1.0f;
     float m_Yx = 0.0f;
     float m_Xy = 0.0f;
@@ -47,15 +48,17 @@ protected:
     float m_Ty = 0.0f;
 
 public:
-    inline uint32_t boneId() const { return m_BoneId; }
-    void boneId(uint32_t value)
+    inline Id boneId() const { return m_BoneId; }
+    void boneId(Id value)
     {
         if (m_BoneId == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(boneIdPropertyKey, &m_BoneId, &value);
         m_BoneId = value;
-        boneIdChanged();
+        RIVE_EDITOR_CHANGED(boneIdChanged());
+        notifyPropertyChanged(boneIdPropertyKey);
     }
 
     inline float xx() const { return m_Xx; }
@@ -65,8 +68,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xxPropertyKey, &m_Xx, &value);
         m_Xx = value;
-        xxChanged();
+        RIVE_EDITOR_CHANGED(xxChanged());
+        notifyPropertyChanged(xxPropertyKey);
     }
 
     inline float yx() const { return m_Yx; }
@@ -76,8 +81,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yxPropertyKey, &m_Yx, &value);
         m_Yx = value;
-        yxChanged();
+        RIVE_EDITOR_CHANGED(yxChanged());
+        notifyPropertyChanged(yxPropertyKey);
     }
 
     inline float xy() const { return m_Xy; }
@@ -87,8 +94,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xyPropertyKey, &m_Xy, &value);
         m_Xy = value;
-        xyChanged();
+        RIVE_EDITOR_CHANGED(xyChanged());
+        notifyPropertyChanged(xyPropertyKey);
     }
 
     inline float yy() const { return m_Yy; }
@@ -98,8 +107,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yyPropertyKey, &m_Yy, &value);
         m_Yy = value;
-        yyChanged();
+        RIVE_EDITOR_CHANGED(yyChanged());
+        notifyPropertyChanged(yyPropertyKey);
     }
 
     inline float tx() const { return m_Tx; }
@@ -109,8 +120,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(txPropertyKey, &m_Tx, &value);
         m_Tx = value;
-        txChanged();
+        RIVE_EDITOR_CHANGED(txChanged());
+        notifyPropertyChanged(txPropertyKey);
     }
 
     inline float ty() const { return m_Ty; }
@@ -120,8 +133,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(tyPropertyKey, &m_Ty, &value);
         m_Ty = value;
-        tyChanged();
+        RIVE_EDITOR_CHANGED(tyChanged());
+        notifyPropertyChanged(tyPropertyKey);
     }
 
     Core* clone() const override;
@@ -142,7 +157,7 @@ public:
         switch (propertyKey)
         {
             case boneIdPropertyKey:
-                m_BoneId = CoreUintType::deserialize(reader);
+                m_BoneId = CoreIdType::runtimeDeserialize(reader);
                 return true;
             case xxPropertyKey:
                 m_Xx = CoreDoubleType::deserialize(reader);
@@ -174,6 +189,9 @@ protected:
     virtual void yyChanged() {}
     virtual void txChanged() {}
     virtual void tyChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/bones/tendon_ext.inl"
+#endif
 };
 } // namespace rive
 

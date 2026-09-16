@@ -26,7 +26,7 @@ void TrimPath::trimPath(ShapePaintPath* destination,
                         const RawPath* source,
                         ShapePaintType shapePaintType)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     auto rawPath = destination->mutableRawPath();
     auto renderOffset = std::fmod(std::fmod(offset(), 1.0f) + 1.0f, 1.0f);
     auto closeShape = shapePaintType == ShapePaintType::fill;
@@ -177,6 +177,10 @@ void TrimPath::trimPath(ShapePaintPath* destination,
         default:
             RIVE_UNREACHABLE();
     }
+
+    // getSegment has its own precision guards, but a tiny trim window can
+    // still land a segment on a single point.
+    rawPath->pruneEmptySegments();
 }
 
 void TrimPath::startChanged() { invalidateEffectFromLocal(); }

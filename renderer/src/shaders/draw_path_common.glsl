@@ -26,13 +26,13 @@
 
 #ifdef @VERTEX
 VERTEX_TEXTURE_BLOCK_BEGIN
-TEXTURE_TESSDATA4(PER_FLUSH_BINDINGS_SET,
-                  TESS_VERTEX_TEXTURE_IDX,
-                  @tessVertexTexture);
+TEXTURE_RGBA32UI(PER_FLUSH_BINDINGS_SET,
+                 TESS_VERTEX_TEXTURE_IDX,
+                 @tessVertexTexture);
 #ifdef @ENABLE_FEATHER
 TEXTURE_R16F_1D_ARRAY(PER_FLUSH_BINDINGS_SET,
-                      FEATHER_TEXTURE_IDX,
-                      @featherTexture);
+                      GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+                      @gaussianIntegralTexture);
 #endif
 VERTEX_TEXTURE_BLOCK_END
 
@@ -44,33 +44,27 @@ STORAGE_BUFFER_U32x4(CONTOUR_BUFFER_IDX, ContourBuffer, @contourBuffer);
 VERTEX_STORAGE_BUFFER_BLOCK_END
 #endif // @VERTEX
 
-#if defined(@ENABLE_FEATHER) || defined(@ATLAS_BLIT)
-SAMPLER_LINEAR(FEATHER_TEXTURE_IDX, featherSampler)
+#if defined(@ENABLE_FEATHER) || defined(@FEATHER_ATLAS_BLIT)
+SAMPLER_LINEAR(GAUSSIAN_INTEGRAL_TEXTURE_IDX, gaussianIntegralSampler)
 #endif
 
 #ifdef @FRAGMENT
 FRAG_TEXTURE_BLOCK_BEGIN
 TEXTURE_RGBA8(PER_FLUSH_BINDINGS_SET, GRAD_TEXTURE_IDX, @gradTexture);
-#if defined(@ENABLE_FEATHER) || defined(@ATLAS_BLIT)
+#if defined(@ENABLE_FEATHER) || defined(@FEATHER_ATLAS_BLIT)
 TEXTURE_R16F_1D_ARRAY(PER_FLUSH_BINDINGS_SET,
-                      FEATHER_TEXTURE_IDX,
-                      @featherTexture);
+                      GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+                      @gaussianIntegralTexture);
 #endif
-#ifdef @ATLAS_BLIT
-#ifdef @ATLAS_TEXTURE_R32UI_FLOAT_BITS
-TEXTURE_R32UI(PER_FLUSH_BINDINGS_SET, ATLAS_TEXTURE_IDX, @atlasTexture);
-#elif defined(@ATLAS_TEXTURE_R32I_FIXED_POINT)
-TEXTURE_R32I(PER_FLUSH_BINDINGS_SET, ATLAS_TEXTURE_IDX, @atlasTexture);
-#elif defined(@ATLAS_TEXTURE_RGBA8_UNORM)
-TEXTURE_RGBA8(PER_FLUSH_BINDINGS_SET, ATLAS_TEXTURE_IDX, @atlasTexture);
-#else
-TEXTURE_R16F(PER_FLUSH_BINDINGS_SET, ATLAS_TEXTURE_IDX, @atlasTexture);
-#endif
+#ifdef @FEATHER_ATLAS_BLIT
+TEXTURE_R16F(PER_FLUSH_BINDINGS_SET,
+             FEATHER_ATLAS_TEXTURE_IDX,
+             @featherAtlasTexture);
 #endif
 TEXTURE_RGBA8(PER_DRAW_BINDINGS_SET, IMAGE_TEXTURE_IDX, @imageTexture);
 // The Qualcomm compiler can't handle line breaks in #ifs.
 // clang-format off
-#if defined(@RENDER_MODE_MSAA) && defined(@ENABLE_ADVANCED_BLEND) && !defined(@FIXED_FUNCTION_COLOR_OUTPUT)
+#if defined(@RENDER_MODE_DEPTH_STENCIL) && defined(@ENABLE_ADVANCED_BLEND) && !defined(@FIXED_FUNCTION_COLOR_OUTPUT)
 // clang-format on
 DST_COLOR_TEXTURE(@dstColorTexture);
 #endif
@@ -78,12 +72,12 @@ FRAG_TEXTURE_BLOCK_END
 
 SAMPLER_LINEAR(GRAD_TEXTURE_IDX, gradSampler)
 // Metal defines @VERTEX and @FRAGMENT at the same time, so yield to the vertex
-// definition of featherSampler in this case.
-#ifdef @ATLAS_BLIT
-SAMPLER_LINEAR(ATLAS_TEXTURE_IDX, atlasSampler)
+// definition of gaussianIntegralSampler in this case.
+#ifdef @FEATHER_ATLAS_BLIT
+SAMPLER_LINEAR(FEATHER_ATLAS_TEXTURE_IDX, featherAtlasSampler)
 #endif
 DYNAMIC_SAMPLER_BLOCK_BEGIN
-SAMPLER_DYNAMIC(PER_DRAW_BINDINGS_SET, IMAGE_SAMPLER_IDX, imageSampler)
+SAMPLER_DYNAMIC_IMAGE(imageSampler)
 DYNAMIC_SAMPLER_BLOCK_END
 #endif // @FRAGMENT
 
@@ -191,7 +185,7 @@ INLINE half eval_feathered_fill(float4 coverages TEXTURE_CONTEXT_DECL)
     // NOTE: The derivative FEATHER'(t) is the normal distribution with:
     //
     //   mu = 1/2
-    //   sigma = 1 / (2 * FEATHER_TEXTURE_STDDEVS)
+    //   sigma = 1 / (2 * GAUSSIAN_INTEGRAL_TEXTURE_STDDEVS)
     //
     // We can evaluate this directly without a lookup table.
     //
@@ -264,74 +258,6 @@ INLINE half eval_feathered_stroke(float4 coverages TEXTURE_CONTEXT_DECL)
 }
 #endif // @ENABLE_FEATHER
 
-#if defined(@FRAGMENT) && defined(@ATLAS_BLIT)
-
-INLINE half filter_feather(half4 coverages,
-                           float2 atlasCoord,
-                           float2 atlasQuadCenter)
-{
-    coverages.xw = mix(coverages.xw,
-                       coverages.yz,
-                       make_half(atlasCoord.x + .5 - atlasQuadCenter.x));
-    coverages.x = mix(coverages.w,
-                      coverages.x,
-                      make_half(atlasCoord.y + .5 - atlasQuadCenter.y));
-    return clamp(coverages.x, make_half(0.0), make_half(1.0));
-}
-
-// Upscales a pre-rendered feather from the atlas, converting from gaussian
-// space to linear before doing a bilerp.
-INLINE half
-filter_feather_atlas(float2 atlasCoord,
-                     float2 atlasTextureInverseSize TEXTURE_CONTEXT_DECL)
-{
-    // Gather the quad of pixels we need to filter.
-    // Gather from the exact center of the quad to make sure there are no
-    // rounding differences between us and the texture unit.
-
-    half4 coverages;
-    float2 atlasQuadCenter = round(atlasCoord);
-
-#ifdef @ATLAS_TEXTURE_R32UI_FLOAT_BITS
-    coverages = uintBitsToFloat(uint4(TEXTURE_GATHER(@atlasTexture,
-                                                     atlasSampler,
-                                                     atlasQuadCenter,
-                                                     atlasTextureInverseSize)));
-    return filter_feather(coverages, atlasCoord, atlasQuadCenter);
-#elif defined(@ATLAS_TEXTURE_R32I_FIXED_POINT)
-    int4 coverages_i32 = int4(TEXTURE_GATHER(@atlasTexture,
-                                             atlasSampler,
-                                             atlasQuadCenter,
-                                             atlasTextureInverseSize));
-    coverages = float4(coverages_i32) * (1. / ATLAS_R32I_FIXED_POINT_FACTOR);
-    return filter_feather(coverages, atlasCoord, atlasQuadCenter);
-#elif defined(@ATLAS_TEXTURE_RGBA8_UNORM)
-    int2 coord = int2(atlasQuadCenter);
-    half4x4 coverages_u8x4 =
-        make_half4x4(TEXTURE_GATHER_MATRIX(@atlasTexture, coord, .rgba));
-    // Apply the following weights to the RGBA of each u8x4 coverage value:
-    //   - R counts fractional, positive coverage.
-    //   - G counts fractional, negative coverage.
-    //   - B counts integer, positive coverage.
-    //   - A counts integer, negative coverage.
-    coverages = make_half4(ATLAS_UNORM8_COVERAGE_SCALE_FACTOR,
-                           -ATLAS_UNORM8_COVERAGE_SCALE_FACTOR,
-                           255.,
-                           -255.) *
-                coverages_u8x4;
-    return filter_feather(coverages, atlasCoord, atlasQuadCenter);
-#else
-    half cov = TEXTURE_SAMPLE_LOD(@atlasTexture,
-                                  atlasSampler,
-                                  atlasCoord * atlasTextureInverseSize,
-                                  .0)
-                   .r;
-    return clamp(cov, make_half(0.0), make_half(1.0));
-#endif
-}
-
-#endif // @FRAGMENT && @ATLAS_BLIT
-
 #if defined(@VERTEX) && defined(@DRAW_PATH)
 INLINE int2 tess_texel_coord(int texelIndex)
 {
@@ -351,7 +277,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
                                            int _instanceID,
                                            OUT(uint) outPathID,
                                            OUT(float2) outVertexPosition
-#ifndef @RENDER_MODE_MSAA
+#ifndef @RENDER_MODE_DEPTH_STENCIL
                                            ,
                                            OUT(float4) outCoverages
 #else
@@ -370,9 +296,9 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
     // Fetch a vertex that definitely belongs to the contour we're drawing.
     int vertexIDOnContour = min(localVertexID, patchSegmentSpan - 1);
     int tessVertexIdx = _instanceID * patchSegmentSpan + vertexIDOnContour;
-    TESSDATA4 tessVertexData =
+    uint4 tessVertexData =
         TEXEL_FETCH(@tessVertexTexture, tess_texel_coord(tessVertexIdx));
-    uint contourIDWithFlags = TESSDATA_AS_UINT(tessVertexData.w);
+    uint contourIDWithFlags = tessVertexData.w;
 
     // Fetch and unpack the contour referenced by the tessellation vertex.
     // NOTE: The contourID is guaranteed to be >= 1 at this point, but clamp it
@@ -410,10 +336,10 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
         // the beginning and end of the data.
         int replacementTessVertexIdx =
             tessVertexIdx + localVertexID - vertexIDOnContour;
-        TESSDATA4 replacementTessVertexData =
+        uint4 replacementTessVertexData =
             TEXEL_FETCH(@tessVertexTexture,
                         tess_texel_coord(replacementTessVertexIdx));
-        if ((TESSDATA_AS_UINT(replacementTessVertexData.w) &
+        if ((replacementTessVertexData.w &
              (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)) !=
             (contourIDWithFlags & (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)))
         {
@@ -437,10 +363,12 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
         // MIRRORED_CONTOUR_CONTOUR_FLAG is not preserved at vertexIndex0.
         // Preserve it here. By not preserving this flag, the normal and
         // mirrored contour can both share the same contour record.
-        contourIDWithFlags = (TESSDATA_AS_UINT(tessVertexData.w) &
-                              ~MIRRORED_CONTOUR_CONTOUR_FLAG) |
-                             mirroredContourFlag;
+        contourIDWithFlags =
+            (tessVertexData.w & ~MIRRORED_CONTOUR_CONTOUR_FLAG) |
+            mirroredContourFlag;
     }
+
+    bool discardVertex = false;
 
     // Find the tangent angle of the curve at our vertex.
     float theta;
@@ -453,7 +381,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
         // Feather joins work out their stepping here in the vertex shader.
         // Instead of emitting just the tangent angle, the tessellation shader
         // gave us the original tessellation parameters.
-        uint joinDataPacked = TESSDATA_AS_UINT(tessVertexData.z);
+        uint joinDataPacked = tessVertexData.z;
         float joinVertexID = float(joinDataPacked & 0xffffu);
         float joinSegmentCount = float(joinDataPacked >> 16);
 
@@ -463,16 +391,14 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
             int2(-joinVertexID - 1., joinSegmentCount - joinVertexID + 1.);
         if ((contourIDWithFlags & MIRRORED_CONTOUR_CONTOUR_FLAG) != 0u)
             edgeVertexOffsets = -edgeVertexOffsets;
-        TESSDATA4 tessDataBeforeJoin =
+        uint4 tessDataBeforeJoin =
             TEXEL_FETCH(@tessVertexTexture,
                         tess_texel_coord(tessVertexIdx + edgeVertexOffsets.x));
-        TESSDATA4 tessDataAfterJoin =
+        uint4 tessDataAfterJoin =
             TEXEL_FETCH(@tessVertexTexture,
                         tess_texel_coord(tessVertexIdx + edgeVertexOffsets.y));
-        if ((TESSDATA_AS_UINT(tessDataAfterJoin.w) &
-             (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)) !=
-            (TESSDATA_AS_UINT(tessDataBeforeJoin.w) &
-             (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)))
+        if ((tessDataAfterJoin.w & (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)) !=
+            (tessDataBeforeJoin.w & (MIRRORED_CONTOUR_CONTOUR_FLAG | 0xffffu)))
         {
             // We reached over into a new contour. The edge immediately after
             // this feather join is actually the first vertex in the countour.
@@ -481,8 +407,8 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
                             tess_texel_coord(int(vertexIndex0)));
         }
 
-        featherJoinEdge0Theta = TESSDATA_AS_FLOAT(tessDataBeforeJoin.z);
-        float featherJoinEdge1Theta = TESSDATA_AS_FLOAT(tessDataAfterJoin.z);
+        featherJoinEdge0Theta = uintBitsToFloat(tessDataBeforeJoin.z);
+        float featherJoinEdge1Theta = uintBitsToFloat(tessDataAfterJoin.z);
         featherJoinCornerTheta = featherJoinEdge1Theta - featherJoinEdge0Theta;
         if (abs(featherJoinCornerTheta) > PI)
             featherJoinCornerTheta -= _2PI * sign(featherJoinCornerTheta);
@@ -543,10 +469,10 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
     else
 #endif // @ENABLE_FEATHER
     {
-        theta = TESSDATA_AS_FLOAT(tessVertexData.z);
+        theta = uintBitsToFloat(tessVertexData.z);
     }
     float2 norm = float2(sin(theta), -cos(theta));
-    float2 origin = TESSDATA_AS_FLOAT(tessVertexData.xy);
+    float2 origin = uintBitsToFloat(tessVertexData.xy);
     float2 postTransformVertexOffset = float2(0, 0);
 
     if (featherRadius != .0)
@@ -554,9 +480,9 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
         // Never use a feather harder than 1.5 standard deviations across a
         // radius of 1/2px. This is the point where feathering just looks like
         // antialiasing, and any harder looks aliased.
-        featherRadius =
-            max(featherRadius,
-                (FEATHER_TEXTURE_STDDEVS / 3.) / length(MUL(M, norm)));
+        featherRadius = max(featherRadius,
+                            (GAUSSIAN_INTEGRAL_TEXTURE_STDDEVS / 3.) /
+                                length(MUL(M, norm)));
     }
 
     if (strokeRadius != .0) // Is this a stroke?
@@ -588,7 +514,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
         float2 vertexOffset =
             norm * (strokeRadius + aaRadius); // Bloat stroke width for AA.
 
-#ifndef @RENDER_MODE_MSAA
+#ifndef @RENDER_MODE_DEPTH_STENCIL
         // Calculate the AA distance to both the outset and inset edges of the
         // stroke. The fragment shader will use whichever is lesser.
         float x = outset * (strokeRadius + aaRadius);
@@ -611,9 +537,9 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
                 peekDir = -peekDir;
             int2 otherJoinTexelCoord =
                 tess_texel_coord(tessVertexIdx + peekDir);
-            TESSDATA4 otherJoinData =
+            uint4 otherJoinData =
                 TEXEL_FETCH(@tessVertexTexture, otherJoinTexelCoord);
-            float otherJoinTheta = TESSDATA_AS_FLOAT(otherJoinData.z);
+            float otherJoinTheta = uintBitsToFloat(otherJoinData.z);
             float joinAngle = abs(otherJoinTheta - theta);
             if (joinAngle > PI)
                 joinAngle = _2PI - joinAngle;
@@ -695,7 +621,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
             float2 pt = abs(outset) * vertexOffset;
             float clipDistance = (clipAARadius - dot(pt, bisector)) /
                                  (bisectPixelWidth * (AA_RADIUS * 2.));
-#ifndef @RENDER_MODE_MSAA
+#ifndef @RENDER_MODE_DEPTH_STENCIL
             if ((contourIDWithFlags & LEFT_JOIN_CONTOUR_FLAG) != 0u)
                 outCoverages.y = clipDistance;
             else
@@ -703,7 +629,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
 #endif
         }
 
-#ifndef @RENDER_MODE_MSAA
+#ifndef @RENDER_MODE_DEPTH_STENCIL
         outCoverages.xy *= globalCoverage;
 
         // Bias outCoverages.y slightly upwards in order to guarantee
@@ -723,11 +649,11 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
 
         // Throw away the fan triangles since we're a stroke.
         if (vertexType != STROKE_VERTEX)
-            return false;
+            discardVertex = true;
     }
     else // This is a fill.
     {
-#ifndef @RENDER_MODE_MSAA
+#ifndef @RENDER_MODE_DEPTH_STENCIL
         // "outCoverages.y < 0" indicates to the fragment shader that this is
         // a fill, as opposed to a stroke.
         outCoverages = float4(fillCoverage, -1., .0, .0);
@@ -800,7 +726,7 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
                 float inverseFeather =
                     INVERSE_FEATHER(featherAtNStddevOutset);
                 float stddevsAwayFromCenter =
-                    (.5 - inverseFeather) * (FEATHER_TEXTURE_STDDEVS * 2.);
+                    (.5 - inverseFeather) * (GAUSSIAN_INTEGRAL_TEXTURE_STDDEVS * 2.);
                 float contraction = N / max(stddevsAwayFromCenter, N);
                 outset *= contraction;
 #endif
@@ -831,24 +757,24 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
             // compiler that also negates Y.
             outCoverages *= float4(-1., +1., +1., +1.);
         }
-#endif // !RENDER_MODE_MSAA
+#endif // !RENDER_MODE_DEPTH_STENCIL
 
         // Place the fan point.
         if (vertexType == FAN_MIDPOINT_VERTEX)
             origin = midpoint;
 
-        // If we're actually just drawing a triangle, throw away the entire
-        // patch except a single fan triangle.
-        if ((contourIDWithFlags & RETROFITTED_TRIANGLE_CONTOUR_FLAG) != 0u &&
+        // If we're actually drawing a triangle strip, throw away the entire
+        // patch except the fan triangles.
+        if ((contourIDWithFlags & RETROFIT_TRI_STRIP_CONTOUR_FLAG) != 0u &&
             vertexType != FAN_VERTEX)
         {
-            return false;
+            discardVertex = true;
         }
     }
 
     outVertexPosition = MUL(M, origin) + postTransformVertexOffset + translate;
 
-#ifdef @RENDER_MODE_MSAA
+#ifdef @RENDER_MODE_DEPTH_STENCIL
     uint4 pathData2 = STORAGE_BUFFER_LOAD4(@pathBuffer, outPathID * 4u + 2u);
     outPathZIndex = cast_uint_to_ushort(pathData2.r);
 #else
@@ -859,14 +785,14 @@ INLINE bool unpack_tessellated_path_vertex(float4 patchVertexData,
                           make_bool2(uniforms.wireframeEnabled != 0u));
 #endif
 
-    return true;
+    return !discardVertex;
 }
 #endif // @VERTEX && @DRAW_PATH
 
 #if defined(@VERTEX) && defined(@DRAW_INTERIOR_TRIANGLES)
 INLINE float2 unpack_interior_triangle_vertex(float3 triangleVertex,
                                               OUT(uint) outPathID
-#ifdef @RENDER_MODE_MSAA
+#ifdef @RENDER_MODE_DEPTH_STENCIL
                                               ,
                                               OUT(ushort) outPathZIndex
 #else
@@ -876,14 +802,14 @@ INLINE float2 unpack_interior_triangle_vertex(float3 triangleVertex,
                                                   VERTEX_CONTEXT_DECL)
 {
     outPathID = floatBitsToUint(triangleVertex.z) & 0xffffu;
-#ifdef @RENDER_MODE_MSAA
+#ifdef @RENDER_MODE_DEPTH_STENCIL
     uint4 pathData2 = STORAGE_BUFFER_LOAD4(@pathBuffer, outPathID * 4u + 2u);
     outPathZIndex = cast_uint_to_ushort(pathData2.x);
 #else
     outWindingWeight = cast_int_to_half(floatBitsToInt(triangleVertex.z) >> 16);
 #endif
     float2 vertexPos = triangleVertex.xy;
-    // ATLAS_BLIT draws vertices in screen space.
+    // FEATHER_ATLAS_BLIT draws vertices in screen space.
     float2x2 M = make_float2x2(
         uintBitsToFloat(STORAGE_BUFFER_LOAD4(@pathBuffer, outPathID * 4u)));
     uint4 pathData = STORAGE_BUFFER_LOAD4(@pathBuffer, outPathID * 4u + 1u);
@@ -893,40 +819,98 @@ INLINE float2 unpack_interior_triangle_vertex(float3 triangleVertex,
 }
 #endif // @VERTEX && @DRAW_INTERIOR_TRIANGLES
 
-#if defined(@VERTEX) && defined(@ATLAS_BLIT)
+#if defined(@VERTEX) && defined(@FEATHER_ATLAS_BLIT)
 INLINE float2
 unpack_atlas_coverage_vertex(float3 triangleVertex,
                              OUT(uint) outPathID,
-#ifdef @RENDER_MODE_MSAA
+#ifdef @RENDER_MODE_DEPTH_STENCIL
                              OUT(ushort) outPathZIndex,
 #endif
                              OUT(float2) outAtlasCoord VERTEX_CONTEXT_DECL)
 {
     outPathID = floatBitsToUint(triangleVertex.z) & 0xffffu;
     uint4 pathData2 = STORAGE_BUFFER_LOAD4(@pathBuffer, outPathID * 4u + 2u);
-#ifdef @RENDER_MODE_MSAA
+#ifdef @RENDER_MODE_DEPTH_STENCIL
     outPathZIndex = cast_uint_to_ushort(pathData2.x);
 #endif
     float2 vertexPos = triangleVertex.xy;
     // outAtlasCoord tells the fragment shader where to fetch coverage from the
     // atlas, when using atlas coverage.
     float3 atlasTransform = uintBitsToFloat(pathData2.yzw);
-    outAtlasCoord = vertexPos * atlasTransform.x + atlasTransform.yz;
+    outAtlasCoord = (vertexPos * atlasTransform.x + atlasTransform.yz) *
+                    uniforms.atlasTextureInverseSize;
     return vertexPos;
 }
-#endif // @VERTEX && @ATLAS_BLIT
+#endif // @VERTEX && @FEATHER_ATLAS_BLIT
 
-// Converts an x,y image coordinate into a buffer index, swizzling into 32x32
-// tiles for better cache performance.
-// imageWidth must be a multiple of 32.
-uint swizzle_buffer_idx_32x32(uint2 imageCoord, uint imageWidth)
+// Calculates a coverage value to multiply into the paintColor that will
+// convert the current framebuffer value from "paint blended on top with
+// coverage of c0" to "paint blended on top with coverage of c1".
+//
+// i.e., The paint has already been blended into the framebuffer with coverage
+// "c0". After this fragment blends, it will be equivalent to the paint having
+// been blended into the framebuffer with coverage "c1".
+//
+// NOTE: c1 must be > c0, which is why this is only applicable in clockwise
+// modes.
+INLINE half incremental_clockwise_coverage(half c0, half c1, half paintAlpha)
 {
-    uint idx = (imageCoord.y >> 5u) * (imageWidth << 5u) +
-               (imageCoord.x >> 5u) * (32u << 5u);
+    // NOTE: "max(, eps)" is just to avoid a divide by zero. When the
+    // denominator would be 0, c0 == 1, which also means c1 == 1, and there is
+    // no coverage to apply. Since c0 == c1 == 1, (c1 - c0) / eps == 0, which is
+    // the result we want in this case.
+    return (c1 - c0) / max(1. - c0 * paintAlpha, EPSILON_FP16_NON_DENORM);
+}
+
+#if defined(@RENDER_MODE_CLOCKWISE_ATOMIC) || defined(@PLS_IMPL_STORAGE_BUFFER)
+// Converts an x,y image coordinate into a buffer index, swizzling into
+// BUFFER_IMAGE_TILE_SIZE x BUFFER_IMAGE_TILE_SIZE tiles for better cache
+// performance.
+// imageWidth must be a multiple of BUFFER_IMAGE_TILE_SIZE.
+INLINE uint swizzle_image_buffer_idx(uint2 imageCoord, uint imageWidth)
+{
+    uint idx = (imageCoord.y >> BUFFER_IMAGE_TILE_SIZE_LOG2) *
+                   (imageWidth << BUFFER_IMAGE_TILE_SIZE_LOG2) +
+               ((imageCoord.x >> BUFFER_IMAGE_TILE_SIZE_LOG2)
+                << (BUFFER_IMAGE_TILE_SIZE_LOG2 << 1));
     // Subdivide each main tile into 4x4 column-major tiles.
-    idx += ((imageCoord.x & 0x1fu) >> 2u) * (32u << 2u) +
-           ((imageCoord.y & 0x1fu) >> 2u) * (4u << 2u);
+    idx += ((imageCoord.x & 0x1cu) << BUFFER_IMAGE_TILE_SIZE_LOG2) +
+           ((imageCoord.y & 0x1cu) << 2);
     // Let the 4x4 tiles be row-major.
-    idx += (imageCoord.y & 0x3u) * 4u + (imageCoord.x & 0x3u);
+    idx += ((imageCoord.y & 0x3u) << 2) + (imageCoord.x & 0x3u);
     return idx;
 }
+#endif // @RENDER_MODE_CLOCKWISE_ATOMIC || @PLS_IMPL_STORAGE_BUFFER
+
+#ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
+
+#ifdef @FIXED_FUNCTION_COLOR_OUTPUT
+#define CLOCKWISE_ATOMIC_PLS_MAIN PLS_FRAG_COLOR_MAIN
+#define EMIT_CLOCKWISE_ATOMIC_PLS(FRAG_COLOR)                                  \
+    _fragColor = FRAG_COLOR;                                                   \
+    EMIT_PLS_AND_FRAG_COLOR
+#else
+#define CLOCKWISE_ATOMIC_PLS_MAIN PLS_MAIN
+#define EMIT_CLOCKWISE_ATOMIC_PLS(FRAG_COLOR)                                  \
+    PLS_STORE4F(colorBuffer, FRAG_COLOR);                                      \
+    EMIT_PLS;
+#endif
+
+// Extracts coverage from its fixed-point encoding in a coverage buffer value.
+INLINE half clockwise_atomic_fixed_to_coverage(uint coverageFixed)
+{
+    return cast_int_to_half(int((coverageFixed & CLOCKWISE_COVERAGE_MASK) -
+                                CLOCKWISE_FILL_ZERO_VALUE)) *
+           CLOCKWISE_COVERAGE_INVERSE_PRECISION;
+}
+
+// Converts a coverage to a fixed point delta that may be added to a coverage
+// buffer value.
+// NOTE: This is not the same as converting it to a plain coverage value, since
+// those must be biased by CLOCKWISE_FILL_ZERO_VALUE.
+INLINE uint clockwise_atomic_coverage_delta_to_fixed(half coverage)
+{
+    return uint(coverage * CLOCKWISE_COVERAGE_PRECISION + .5);
+}
+
+#endif // @RENDER_MODE_CLOCKWISE_ATOMIC

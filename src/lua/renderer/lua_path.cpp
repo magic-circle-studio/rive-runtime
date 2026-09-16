@@ -16,15 +16,14 @@ RenderPath* ScriptedPathData::renderPath(lua_State* L)
     if (m_isRenderPathDirty)
     {
         m_isRenderPathDirty = false;
-        if (m_renderFrameId == Artboard::frameId())
-        {
-            luaL_error(L, "Path was modified between draws in the same frame.");
-        }
+        const bool sameFrameRebuild =
+            m_renderPath && m_renderFrameId == Artboard::frameId();
         m_renderFrameId = Artboard::frameId();
-        if (!m_renderPath)
+
+        ScriptingContext* context =
+            static_cast<ScriptingContext*>(lua_getthreaddata(L));
+        if (!m_renderPath || sameFrameRebuild)
         {
-            ScriptingContext* context =
-                static_cast<ScriptingContext*>(lua_getthreaddata(L));
             m_renderPath = context->factory()->makeEmptyRenderPath();
             m_renderPath->fillRule(FillRule::clockwise);
         }
@@ -32,7 +31,7 @@ RenderPath* ScriptedPathData::renderPath(lua_State* L)
         {
             m_renderPath->rewind();
         }
-        m_renderPath->addRawPath(rawPath);
+        m_renderPath->addUntrustedRawPath(rawPath);
     }
 
     return m_renderPath.get();
@@ -246,6 +245,34 @@ static int path_namecall(lua_State* L)
 
     luaL_error(L, "%s is not a valid method of %s", str, ScriptedPath::luaName);
     return 0;
+}
+
+static void contour_measure_direct_length(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedContourMeasure*)udata)->measure()->length());
+}
+
+static void contour_measure_direct_isClosed(void* udata, void* result)
+{
+    lua_userdatadirectfield_setboolean(
+        result,
+        ((ScriptedContourMeasure*)udata)->measure()->isClosed() ? 1 : 0);
+}
+
+static void path_measure_direct_length(void* udata, void* result)
+{
+    lua_userdatadirectfield_setnumber(
+        result,
+        ((ScriptedPathMeasure*)udata)->measure()->length());
+}
+
+static void path_measure_direct_isClosed(void* udata, void* result)
+{
+    lua_userdatadirectfield_setboolean(
+        result,
+        ((ScriptedPathMeasure*)udata)->measure()->isClosed() ? 1 : 0);
 }
 
 // ContourMeasure methods
@@ -641,6 +668,15 @@ int luaopen_rive_path(lua_State* L)
     lua_setreadonly(L, -1, true);
     lua_pop(L, 1); // pop the metatable
 
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedContourMeasure::luaTag,
+                                       "length",
+                                       contour_measure_direct_length);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedContourMeasure::luaTag,
+                                       "isClosed",
+                                       contour_measure_direct_isClosed);
+
     // Register PathMeasure
     lua_register_rive<ScriptedPathMeasure>(L);
     lua_pushcfunction(L, path_measure_index, nullptr);
@@ -649,6 +685,15 @@ int luaopen_rive_path(lua_State* L)
     lua_setfield(L, -2, "__namecall");
     lua_setreadonly(L, -1, true);
     lua_pop(L, 1); // pop the metatable
+
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedPathMeasure::luaTag,
+                                       "length",
+                                       path_measure_direct_length);
+    lua_registeruserdatadirectfieldget(L,
+                                       ScriptedPathMeasure::luaTag,
+                                       "isClosed",
+                                       path_measure_direct_isClosed);
 
     return 1;
 }

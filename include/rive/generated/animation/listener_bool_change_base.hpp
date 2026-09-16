@@ -42,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(valuePropertyKey, &m_Value, &value);
         m_Value = value;
-        valueChanged();
+        RIVE_EDITOR_CHANGED(valueChanged());
+        notifyPropertyChanged(valuePropertyKey);
     }
 
     Core* clone() const override;
@@ -66,6 +68,9 @@ public:
 
 protected:
     virtual void valueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/listener_bool_change_ext.inl"
+#endif
 };
 } // namespace rive
 

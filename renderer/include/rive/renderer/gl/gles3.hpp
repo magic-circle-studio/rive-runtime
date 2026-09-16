@@ -55,7 +55,8 @@ extern bool webgl_shader_pixel_local_storage_is_coherent();
 extern void glFramebufferTexturePixelLocalStorageANGLE(GLint plane,
                                                        GLuint backingtexture,
                                                        GLint level,
-                                                       GLint layer);
+                                                       GLint layer,
+                                                       GLenum usage);
 extern void glFramebufferPixelLocalClearValuefvANGLE(GLint plane,
                                                      const GLfloat value[4]);
 extern void glBeginPixelLocalStorageANGLE(GLsizei n, const GLenum loadops[]);
@@ -111,6 +112,25 @@ extern void glProvokingVertexANGLE(GLenum provokeMode);
 
 #endif // RIVE_WEBGL
 
+// KHR_texture_compression_astc_ldr is core on GLES 3.2 but ships as an
+// extension elsewhere. Some GL headers (e.g. unextended <GLES3/gl3.h>, and
+// the Windows release-clang config) define only a subset of the footprint
+// enums, so guard each symbol individually rather than via the extension
+// macro. UNORM enums are contiguous from 0x93B0 in spec order. Only the
+// footprints Rive currently uses are declared here.
+#ifndef GL_COMPRESSED_RGBA_ASTC_4x4_KHR
+#define GL_COMPRESSED_RGBA_ASTC_4x4_KHR 0x93B0
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_6x6_KHR
+#define GL_COMPRESSED_RGBA_ASTC_6x6_KHR 0x93B4
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_8x8_KHR
+#define GL_COMPRESSED_RGBA_ASTC_8x8_KHR 0x93B7
+#endif
+#ifndef GL_COMPRESSED_RGBA_ASTC_12x12_KHR
+#define GL_COMPRESSED_RGBA_ASTC_12x12_KHR 0x93BD
+#endif
+
 #if defined(RIVE_ANDROID) || defined(RIVE_WEBGL)
 // GLES 3.1 functionality is pulled in as an extension. Define these to avoid
 // compile errors, even if we won't use them.
@@ -155,6 +175,7 @@ struct GLCapabilities
     bool isAdreno : 1;
     bool isMali : 1;
     bool isPowerVR : 1;
+    bool isIntel : 1;
 
     // GL version.
     uint32_t contextVersionMajor;
@@ -167,12 +188,6 @@ struct GLCapabilities
     // Many devices crash on draw commands with a large instancecount, or when
     // drawing many instances without a glFlush to break them up.
     uint32_t maxSupportedInstancesPerFlush;
-    // Chrome 136 crashes when trying to run Rive because it attempts to enable
-    // blending on the tessellation texture, which is invalid for an integer
-    // render target. The workaround is to use a floating-point tessellation
-    // texture.
-    // https://issues.chromium.org/issues/416294709
-    bool needsFloatingPointTessellationTexture;
     // PowerVR Rogue GE8300, OpenGL ES 3.2 build 1.10@5187610 has severe pixel
     // local storage corruption issues with our renderer. Using some of the
     // EXT_shader_pixel_local_storage2 API is an apparent workaround that comes
@@ -181,6 +196,9 @@ struct GLCapabilities
     // ANGLE_shader_pixel_local_storage is currently broken with
     // GL_TEXTURE_2D_ARRAY on ANGLE's d3d11 renderer.
     bool avoidTexture2DArrayWithWebGLPLS;
+    // Android ANGLE backed by SwiftShader can corrupt memory when resolving
+    // partial framebuffer regions. Resolve the full target as a workaround.
+    bool avoidPartialFramebufferBlits;
 
     // Extensions
     bool ANGLE_base_vertex_base_instance_shader_builtin : 1;
@@ -199,6 +217,7 @@ struct GLCapabilities
     bool EXT_base_instance : 1;
     bool EXT_clip_cull_distance : 1;
     bool EXT_color_buffer_half_float : 1;
+    bool OES_texture_half_float_linear : 1;
     bool EXT_color_buffer_float : 1;
     bool EXT_float_blend : 1;
     bool EXT_multisampled_render_to_texture : 1;
@@ -207,6 +226,13 @@ struct GLCapabilities
     bool EXT_shader_pixel_local_storage2 : 1;
     bool INTEL_fragment_shader_ordering : 1;
     bool QCOM_shader_framebuffer_fetch_noncoherent : 1;
+
+    // Texture compression extensions.
+    bool EXT_texture_compression_s3tc : 1; // BC1/BC2/BC3
+    bool EXT_texture_compression_bptc : 1; // BC7
+    bool KHR_texture_compression_astc_ldr : 1;
+    // ETC2 is core in GLES 3.0+; tracked here for desktop GL (ARB_ES3_compat).
+    bool supportsETC2 : 1;
 };
 
 #ifdef RIVE_ANDROID

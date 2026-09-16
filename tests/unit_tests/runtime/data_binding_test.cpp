@@ -1,5 +1,6 @@
 #include <rive/file.hpp>
 #include <rive/node.hpp>
+#include <algorithm>
 #include <rive/shapes/rectangle.hpp>
 #include <rive/shapes/shape.hpp>
 #include <utils/no_op_renderer.hpp>
@@ -27,6 +28,7 @@
 #include <rive/viewmodel/viewmodel_instance_list_item.hpp>
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/nested_artboard.hpp"
+#include "rive/data_bind/data_bind.hpp"
 #include "utils/serializing_factory.hpp"
 #include "rive_file_reader.hpp"
 #include <catch.hpp>
@@ -177,6 +179,44 @@ TEST_CASE("state machine led by enums and triggers", "[data binding]")
     machine->advanceAndApply(0.0f);
     REQUIRE(shapeMapped->x() == 350);
     REQUIRE(shapeMapped->y() == 350);
+}
+
+// advanceAndApply(secs, advanceViewModels=false) runs the state machine but
+// must NOT consume the bound view model instances. This is what
+// ScriptedArtboard::advance uses so a script-driven nested artboard doesn't
+// reset view models owned by the host frame.
+TEST_CASE("advanceAndApply can skip view model reset", "[data binding]")
+{
+    auto file = ReadRiveFile("assets/data_binding_test.riv");
+
+    auto artboard = file->artboard("artboard-2")->instance();
+    REQUIRE(artboard != nullptr);
+    auto viewModelInstance =
+        file->createDefaultViewModelInstance(artboard.get());
+    REQUIRE(viewModelInstance != nullptr);
+    auto machine = artboard->defaultStateMachine();
+    REQUIRE(machine != nullptr);
+    machine->bindViewModelInstance(viewModelInstance);
+
+    auto triggerProperty = viewModelInstance->propertyValue("trigger-prop");
+    REQUIRE(triggerProperty != nullptr);
+    REQUIRE(triggerProperty->is<rive::ViewModelInstanceTrigger>());
+    auto trigger = triggerProperty->as<rive::ViewModelInstanceTrigger>();
+
+    // Settle initial state.
+    machine->advanceAndApply(0.0f);
+
+    // advanceViewModels=false: the bound view model is not consumed, so a
+    // trigger set before the advance is retained (the host frame will consume
+    // it, not this advance).
+    trigger->propertyValue(1);
+    machine->advanceAndApply(0.0f, false);
+    CHECK(trigger->propertyValue() == 1);
+
+    // The default (advanceViewModels=true) path consumes the trigger, resetting
+    // it to 0 via ViewModelInstance::advanced().
+    machine->advanceAndApply(0.0f, true);
+    CHECK(trigger->propertyValue() == 0);
 }
 
 TEST_CASE("calculate and to string converters with numbers", "[data binding]")
@@ -1390,6 +1430,9 @@ TEST_CASE("View model runtime properties", "[data binding]")
     REQUIRE(vm != nullptr);
     auto instance = vm->createDefaultInstance();
     REQUIRE(instance != nullptr);
+    // Grab ViewModel name from instance
+    auto viewModelName = instance->viewModelName();
+    REQUIRE(viewModelName == "vm");
     // Number
     auto num = instance->propertyNumber("num");
     REQUIRE(num != nullptr);
@@ -1434,6 +1477,26 @@ TEST_CASE("View model runtime properties", "[data binding]")
     auto numChi = instance->propertyNumber("chi/chi-num");
     REQUIRE(numChi != nullptr);
     REQUIRE(numChi->dataType() == rive::DataType::number);
+
+    // Enum properties expose the backing enum's name while non-enum properties
+    // leave enumName empty.
+    auto properties = instance->properties();
+    auto findProperty = [&properties](const std::string& name) {
+        return std::find_if(properties.begin(),
+                            properties.end(),
+                            [&name](const rive::PropertyData& data) {
+                                return data.name == name;
+                            });
+    };
+    auto enuData = findProperty("enu");
+    REQUIRE(enuData != properties.end());
+    REQUIRE(enuData->type == rive::DataType::enumType);
+    REQUIRE(enuData->enumName == "Horizontal Align");
+
+    auto numData = findProperty("num");
+    REQUIRE(numData != properties.end());
+    REQUIRE(numData->type == rive::DataType::number);
+    REQUIRE(numData->enumName.empty());
 }
 
 TEST_CASE("Trigger fires single change on listener", "[data binding]")
@@ -1942,6 +2005,73 @@ TEST_CASE("Bidirectional data binding with target to source precedence",
     CHECK(silver.matches("bidirectional_precedence-target_first"));
 }
 
+// End-to-end sanity for a source change on a target-first TwoWay bind: the
+// source value must reach the target and must not be reverted. (The full
+// clobber only bites when a converter's Dependents dirt invalidates the cached
+// target, re-opening the target→source apply — see the container-level guard
+// "source-originated dirt does not run target->source" in
+// data_bind_container_test.cpp, which fails without the origin gate. This asset
+// has no converter, so it exercises the source→target path through the real
+// apply machinery.)
+TEST_CASE("TwoWay source change reaches target under target-first precedence",
+          "[data binding]")
+{
+    auto file = ReadRiveFile("assets/bidirectional_precedence.riv");
+    auto artboard = file->artboardNamed("target_first");
+    REQUIRE(artboard != nullptr);
+    auto stateMachine = artboard->stateMachineAt(0);
+    int viewModelId = artboard.get()->viewModelId();
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+
+    auto xProp = vmi->propertyValue("x")->as<rive::ViewModelInstanceNumber>();
+    auto yProp = vmi->propertyValue("y")->as<rive::ViewModelInstanceNumber>();
+    xProp->propertyValue(100.0f);
+    yProp->propertyValue(100.0f);
+
+    stateMachine->bindViewModelInstance(vmi);
+    // Settle the initial sync — target-first precedence makes the authored
+    // target values win and flow back into the source.
+    stateMachine->advanceAndApply(0.0f);
+    for (int i = 0; i < 10; i++)
+    {
+        stateMachine->advanceAndApply(0.016f);
+    }
+
+    rive::Node* targetNode = nullptr;
+    for (auto* db : artboard->dataBinds())
+    {
+        if (db->target() != nullptr && db->target()->is<rive::Node>())
+        {
+            targetNode = db->target()->as<rive::Node>();
+            break;
+        }
+    }
+    REQUIRE(targetNode != nullptr);
+
+    // After settling the source mirrors the target (they are two-way bound and
+    // the target won the initial sync).
+    REQUIRE(xProp->propertyValue() == targetNode->x());
+    REQUIRE(yProp->propertyValue() == targetNode->y());
+
+    // Change the SOURCE to clearly distinct values. With the fix this
+    // propagates source→target only; the buggy behavior ran target→source first
+    // and reverted the source to the (stale) target value.
+    xProp->propertyValue(500.0f);
+    yProp->propertyValue(600.0f);
+    for (int i = 0; i < 20; i++)
+    {
+        stateMachine->advanceAndApply(0.016f);
+    }
+
+    // Source keeps its new value (not clobbered) and reaches the target.
+    CHECK(xProp->propertyValue() == 500.0f);
+    CHECK(yProp->propertyValue() == 600.0f);
+    CHECK(targetNode->x() == 500.0f);
+    CHECK(targetNode->y() == 600.0f);
+}
+
 TEST_CASE("Artboards as conditions", "[silver]")
 {
     SerializingFactory silver;
@@ -2142,6 +2272,9 @@ TEST_CASE("Relative data binding view model state machine fire trigger",
 
     CHECK(silver.matches("relative_data_bind_path-fire-trigger"));
 }
+// The test asset carries Luau bytecode scripts, which only the Luau
+// backend runs.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
 TEST_CASE("Relative data binding view model scripted input", "[silver]")
 {
     SerializingFactory silver;
@@ -2211,6 +2344,7 @@ TEST_CASE("Relative data binding view model scripted input", "[silver]")
 
     CHECK(silver.matches("relative_data_bind_path-scripted-input"));
 }
+#endif
 
 TEST_CASE("Listen to view model value changes in state machines", "[silver]")
 {
@@ -2267,4 +2401,61 @@ TEST_CASE("Artboard properties conditions work without binding", "[silver]")
     artboard->draw(renderer.get());
 
     CHECK(silver.matches("artboard_width_test"));
+}
+
+// Regression for the push-notifier TwoWay clobber. A target-property change
+// notifies the bind via Core::notifyPropertyChanged. Before the fix that set
+// ComponentDirt::Bindings, which also fired update() (source→target); under
+// source-to-target precedence that apply runs first and overwrites the
+// just-changed target with the stale source value, so the subsequent
+// target→source read sees the clobbered value and the change never reaches the
+// source. The fix marks the target trigger with ComponentDirt::BindingsTarget,
+// which update() ignores. Without it, the CHECKs below read 100 (the clobbering
+// source value) instead of the new target.
+TEST_CASE("TwoWay target change reaches source under source-first precedence",
+          "[data binding]")
+{
+    auto file = ReadRiveFile("assets/bidirectional_precedence.riv");
+    auto artboard = file->artboardNamed("source_first");
+    REQUIRE(artboard != nullptr);
+    auto stateMachine = artboard->stateMachineAt(0);
+    int viewModelId = artboard.get()->viewModelId();
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+
+    auto xProp = vmi->propertyValue("x")->as<rive::ViewModelInstanceNumber>();
+    auto yProp = vmi->propertyValue("y")->as<rive::ViewModelInstanceNumber>();
+    // Source values differ from the authored target; source-first precedence
+    // makes the source win on the initial sync, so the source value (100) is
+    // what a spurious source→target apply would clobber the target with.
+    xProp->propertyValue(100.0f);
+    yProp->propertyValue(100.0f);
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.0f);
+
+    // The two TwoWay binds target an (unnamed) node's x/y — reach it through a
+    // bind rather than by name.
+    rive::Node* targetNode = nullptr;
+    for (auto* db : artboard->dataBinds())
+    {
+        if (db->target() != nullptr && db->target()->is<rive::Node>())
+        {
+            targetNode = db->target()->as<rive::Node>();
+            break;
+        }
+    }
+    REQUIRE(targetNode != nullptr);
+
+    // Change the TARGET directly. This is the trigger that regressed: with the
+    // fix it propagates target→source; without it the source→target apply
+    // overwrites these with the source value (100) first.
+    targetNode->x(700.0f);
+    targetNode->y(800.0f);
+
+    stateMachine->advanceAndApply(0.016f);
+
+    CHECK(xProp->propertyValue() == 700.0f);
+    CHECK(yProp->propertyValue() == 800.0f);
 }

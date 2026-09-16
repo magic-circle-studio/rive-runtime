@@ -1,5 +1,6 @@
 import argparse
 import glob
+import io
 import os
 import re
 import sys
@@ -36,6 +37,7 @@ parser.add_argument("-o", "--outdir", required=True,
 parser.add_argument("-H", "--human-readable", action='store_true',
                     help="don't rename or strip out comments or whitespace")
 parser.add_argument("-p", "--ply-path", type=str, help="path to ply module")
+parser.add_argument("-m", "--msvc", action="store_true", help="set this to generate MSVC-compatible headers")
 
 args = parser.parse_args()
 
@@ -43,7 +45,7 @@ if args.ply_path:
     # --ply-path was specified, so add it to the sys path so we can locate the module.
     # (if it was not specified we'll assume that it's already reachable via the path)
 
-    # Convert posix path to windows 
+    # Convert posix path to windows
     convertedPath = args.ply_path
     if sys.platform.startswith('win32') and args.ply_path[:2] == '/c':
         convertedPath = 'C:\\' + args.ply_path[2:]
@@ -171,156 +173,79 @@ def t_error(tok):
 
 # identifier names that cannot be renamed
 glsl_reserved = {
-    "EmitStreamVertex", "EmitVertex", "EmitVertex", "EndPrimitive", "EndPrimitive",
-    "EndStreamPrimitive", "abs", "abs", "abs", "acos", "acosh", "all", "allInvocations",
-    "allInvocationsEqual", "any", "anyInvocation", "asin", "asinh", "atan", "atan", "atanh",
-    "atomicAdd", "atomicAdd", "atomicAnd", "atomicAnd", "atomicCompSwap", "atomicCompSwap",
-    "atomicCounter", "atomicCounterAdd", "atomicCounterAnd", "atomicCounterCompSwap",
-    "atomicCounterDecrement", "atomicCounterExchange", "atomicCounterIncrement", "atomicCounterMax",
-    "atomicCounterMin", "atomicCounterOr", "atomicCounterSubtract", "atomicCounterXor",
-    "atomicExchange", "atomicExchange", "atomicMax", "atomicMax", "atomicMin", "atomicMin",
-    "atomicOr", "atomicOr", "atomicXor", "atomicXor", "barrier", "barrier",
-    "beginFragmentShaderOrderingINTEL", "beginInvocationInterlockARB", "beginInvocationInterlockNV",
-    "binding", "bitCount", "bitCount", "bitfieldExtract", "bitfieldExtract", "bitfieldInsert",
-    "bitfieldInsert", "bitfieldReverse", "bitfieldReverse", "bool", "break", "bvec2", "bvec3",
-    "bvec4", "case", "ceil", "ceil", "centroid", "clamp", "clamp", "clamp", "clamp", "clamp",
-    "clamp", "clamp", "clamp", "coherent", "const", "continue", "cos", "cosh", "cross", "cross",
-    "dFdx", "dFdx", "dFdxCoarse", "dFdxFine", "dFdy", "dFdy", "dFdyCoarse", "dFdyFine", "default",
-    "degrees", "determinant", "determinant", "determinant", "discard", "distance", "distance", "do",
-    "dot", "dot", "else", "endInvocationInterlockARB", "endInvocationInterlockNV", "equal", "equal",
-    "equal", "equal", "exp", "exp2", "faceforward", "faceforward", "false", "findLSB", "findLSB",
-    "findMSB", "findMSB", "flat", "float", "floatBitsToInt", "floatBitsToUint", "floor", "floor",
-    "fma", "fma", "fma", "for", "fract", "fract", "frexp", "frexp", "ftransform", "fwidth",
-    "fwidth", "fwidthCoarse", "fwidthFine", "greaterThan", "greaterThan", "greaterThan",
-    "greaterThanEqual", "greaterThanEqual", "greaterThanEqual", "groupMemoryBarrier", "highp", "if",
-    "iimage2D", "image2D", "imageAtomicAdd", "imageAtomicAdd", "imageAtomicAdd", "imageAtomicAdd",
-    "imageAtomicAnd", "imageAtomicAnd", "imageAtomicAnd", "imageAtomicAnd", "imageAtomicCompSwap",
-    "imageAtomicCompSwap", "imageAtomicCompSwap", "imageAtomicCompSwap", "imageAtomicExchange",
-    "imageAtomicExchange", "imageAtomicExchange", "imageAtomicExchange", "imageAtomicExchange",
-    "imageAtomicMax", "imageAtomicMax", "imageAtomicMax", "imageAtomicMax", "imageAtomicMin",
-    "imageAtomicMin", "imageAtomicMin", "imageAtomicMin", "imageAtomicOr", "imageAtomicOr",
-    "imageAtomicOr", "imageAtomicOr", "imageAtomicXor", "imageAtomicXor", "imageAtomicXor",
-    "imageAtomicXor", "imageLoad", "imageLoad", "imageLoad", "imageLoad", "imageLoad", "imageLoad",
-    "imageLoad", "imageLoad", "imageSamples", "imageSamples", "imageSize", "imageSize", "imageSize",
-    "imageSize", "imageSize", "imageSize", "imageSize", "imageSize", "imageSize", "imageSize",
-    "imageSize", "imageSize", "imageSize", "imageSize", "imageSize", "imageSize", "imageSize",
-    "imageSize", "imageSize", "imageStore", "imageStore", "imageStore", "imageStore", "imageStore",
-    "imageStore", "imageStore", "imageStore", "imageStore", "imulExtended", "in", "inout", "int",
-    "intBitsToFloat", "interpolateAtCentroid", "interpolateAtCentroid", "interpolateAtCentroid",
-    "interpolateAtCentroid", "interpolateAtCentroid", "interpolateAtCentroid",
-    "interpolateAtCentroid", "interpolateAtCentroid", "interpolateAtOffset", "interpolateAtOffset",
-    "interpolateAtOffset", "interpolateAtOffset", "interpolateAtOffset", "interpolateAtOffset",
-    "interpolateAtOffset", "interpolateAtSample", "interpolateAtSample", "interpolateAtSample",
-    "interpolateAtSample", "interpolateAtSample", "interpolateAtSample", "interpolateAtSample",
-    "interpolateAtSample", "invariant", "inverse", "inverse", "inverse", "inversesqrt",
-    "inversesqrt", "isampler2D", "isampler2DArray", "isampler3D", "isamplerCube", "isinf", "isinf",
-    "isnan", "isnan", "ivec2", "ivec3", "ivec4", "layout", "ldexp", "ldexp", "length", "length",
-    "lessThan", "lessThan", "lessThan", "lessThanEqual", "lessThanEqual", "lessThanEqual",
-    "location", "log", "log2", "lowp", "main", "mat2", "mat2x2", "mat2x3", "mat2x4", "mat3",
-    "mat3x2", "mat3x3", "mat3x4", "mat4", "mat4x2", "mat4x3", "mat4x4", "matrixCompMult",
-    "matrixCompMult", "matrixCompMult", "matrixCompMult", "matrixCompMult", "matrixCompMult",
-    "matrixCompMult", "matrixCompMult", "matrixCompMult", "max", "max", "max", "max", "max", "max",
-    "max", "max", "mediump", "memoryBarrier", "memoryBarrierAtomicCounter", "memoryBarrierBuffer",
-    "memoryBarrierImage", "memoryBarrierShared", "min", "min", "min", "min", "min", "min", "min",
-    "min", "mix", "mix", "mix", "mix", "mix", "mix", "mix", "mix", "mix", "mod", "mod", "mod",
-    "mod", "modf", "modf", "noise1", "noise2", "noise3", "noise4", "noperspective", "normalize",
-    "normalize", "not", "notEqual", "notEqual", "notEqual", "notEqual", "out", "outerProduct",
-    "outerProduct", "outerProduct", "outerProduct", "outerProduct", "outerProduct", "outerProduct",
-    "outerProduct", "outerProduct", "packDouble2x32", "packHalf2x16", "packSnorm2x16",
-    "packSnorm4x8", "packUnorm2x16", "packUnorm4x8", "pixelLocalLoadANGLE", "pixelLocalStoreANGLE",
-    "pow", "precision", "r16f", "r32f", "r32i", "r32ui", "radians", "reflect", "reflect", "refract",
-    "refract", "return", "rg16f", "rgb_2_yuv", "rgba8", "rgba8i", "rgba8ui", "round", "round",
-    "roundEven", "roundEven", "sampler2D", "sampler2DArray", "sampler2DArrayShadow",
-    "sampler2DShadow", "sampler3D", "samplerCube", "samplerCubeShadow", "shadow1D", "shadow1DLod",
-    "shadow1DProj", "shadow1DProj", "shadow1DProjLod", "shadow2D", "shadow2D", "shadow2DEXT",
-    "shadow2DLod", "shadow2DProj", "shadow2DProj", "shadow2DProjEXT", "shadow2DProjLod", "sign",
-    "sign", "sign", "sin", "sinh", "smooth", "smoothstep", "smoothstep", "smoothstep", "smoothstep",
-    "sqrt", "sqrt", "std140", "std430", "step", "step", "step", "step", "struct", "subpassLoad",
-    "subpassLoad", "switch", "tan", "tanh", "texelFetch", "texelFetch", "texelFetch", "texelFetch",
-    "texelFetch", "texelFetch", "texelFetch", "texelFetch", "texelFetch", "texelFetch",
-    "texelFetch", "texelFetch", "texelFetch", "texelFetchOffset", "texelFetchOffset",
-    "texelFetchOffset", "texelFetchOffset", "texelFetchOffset", "texelFetchOffset", "texture",
-    "texture", "texture", "texture", "texture", "texture", "texture", "texture", "texture",
-    "texture", "texture", "texture", "texture", "texture", "texture", "texture", "texture",
-    "texture", "texture", "texture", "texture", "texture", "texture", "texture", "texture",
-    "texture", "texture", "texture", "texture", "texture", "texture", "texture", "texture",
-    "texture", "texture", "texture", "texture1D", "texture1D", "texture1DLod", "texture1DProj",
-    "texture1DProj", "texture1DProj", "texture1DProj", "texture1DProjLod", "texture1DProjLod",
-    "texture2D", "texture2D", "texture2D", "texture2DGradEXT", "texture2DLod", "texture2DLod",
-    "texture2DLodEXT", "texture2DProj", "texture2DProj", "texture2DProj", "texture2DProj",
-    "texture2DProj", "texture2DProj", "texture2DProjGradEXT", "texture2DProjGradEXT",
-    "texture2DProjLod", "texture2DProjLod", "texture2DProjLod", "texture2DProjLod",
-    "texture2DProjLodEXT", "texture2DProjLodEXT", "texture2DRect", "texture2DRectProj",
-    "texture2DRectProj", "texture3D", "texture3D", "texture3D", "texture3D", "texture3DLod",
-    "texture3DLod", "texture3DProj", "texture3DProj", "texture3DProj", "texture3DProj",
-    "texture3DProjLod", "texture3DProjLod", "textureCube", "textureCube", "textureCubeGradEXT",
-    "textureCubeLod", "textureCubeLod", "textureCubeLodEXT", "textureGather", "textureGather",
-    "textureGather", "textureGather", "textureGather", "textureGather", "textureGather",
-    "textureGather", "textureGather", "textureGather", "textureGather", "textureGather",
-    "textureGather", "textureGather", "textureGather", "textureGather", "textureGather",
-    "textureGather", "textureGather", "textureGather", "textureGather", "textureGatherOffset",
-    "textureGatherOffset", "textureGatherOffset", "textureGatherOffset", "textureGatherOffset",
-    "textureGatherOffset", "textureGatherOffset", "textureGatherOffset", "textureGatherOffset",
-    "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets",
-    "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets",
-    "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets",
-    "textureGatherOffsets", "textureGatherOffsets", "textureGatherOffsets", "textureGrad",
-    "textureGrad", "textureGrad", "textureGrad", "textureGrad", "textureGrad", "textureGrad",
-    "textureGrad", "textureGrad", "textureGrad", "textureGrad", "textureGrad", "textureGrad",
-    "textureGrad", "textureGrad", "textureGradOffset", "textureGradOffset", "textureGradOffset",
-    "textureGradOffset", "textureGradOffset", "textureGradOffset", "textureGradOffset",
-    "textureGradOffset", "textureGradOffset", "textureGradOffset", "textureGradOffset",
-    "textureLod", "textureLod", "textureLod", "textureLod", "textureLod", "textureLod",
-    "textureLod", "textureLod", "textureLod", "textureLod", "textureLod", "textureLodOffset",
-    "textureLodOffset", "textureLodOffset", "textureLodOffset", "textureLodOffset",
-    "textureLodOffset", "textureLodOffset", "textureLodOffset", "textureOffset", "textureOffset",
-    "textureOffset", "textureOffset", "textureOffset", "textureOffset", "textureOffset",
-    "textureOffset", "textureOffset", "textureOffset", "textureOffset", "textureOffset",
-    "textureOffset", "textureOffset", "textureOffset", "textureOffset", "textureOffset",
-    "textureOffset", "textureOffset", "textureProj", "textureProj", "textureProj", "textureProj",
-    "textureProj", "textureProj", "textureProj", "textureProj", "textureProj", "textureProj",
-    "textureProj", "textureProj", "textureProj", "textureProj", "textureProj", "textureProj",
-    "textureProj", "textureProj", "textureProj", "textureProj", "textureProj", "textureProj",
-    "textureProj", "textureProj", "textureProj", "textureProj", "textureProjGrad",
-    "textureProjGrad", "textureProjGrad", "textureProjGrad", "textureProjGrad", "textureProjGrad",
-    "textureProjGrad", "textureProjGrad", "textureProjGrad", "textureProjGrad",
-    "textureProjGradOffset", "textureProjGradOffset", "textureProjGradOffset",
-    "textureProjGradOffset", "textureProjGradOffset", "textureProjGradOffset",
-    "textureProjGradOffset", "textureProjGradOffset", "textureProjGradOffset",
-    "textureProjGradOffset", "textureProjLod", "textureProjLod", "textureProjLod", "textureProjLod",
-    "textureProjLod", "textureProjLod", "textureProjLod", "textureProjLodOffset",
-    "textureProjLodOffset", "textureProjLodOffset", "textureProjLodOffset", "textureProjLodOffset",
-    "textureProjLodOffset", "textureProjLodOffset", "textureProjOffset", "textureProjOffset",
-    "textureProjOffset", "textureProjOffset", "textureProjOffset", "textureProjOffset",
-    "textureProjOffset", "textureProjOffset", "textureProjOffset", "textureProjOffset",
-    "textureProjOffset", "textureProjOffset", "textureProjOffset", "textureProjOffset",
-    "textureProjOffset", "textureProjOffset", "textureProjOffset", "textureQueryLevels",
-    "textureQueryLevels", "textureQueryLevels", "textureQueryLevels", "textureQueryLevels",
-    "textureQueryLevels", "textureQueryLevels", "textureQueryLevels", "textureQueryLevels",
-    "textureQueryLevels", "textureQueryLevels", "textureQueryLevels", "textureQueryLevels",
-    "textureQueryLod", "textureQueryLod", "textureQueryLod", "textureQueryLod", "textureQueryLod",
-    "textureQueryLod", "textureQueryLod", "textureQueryLod", "textureQueryLod", "textureQueryLod",
-    "textureQueryLod", "textureQueryLod", "textureQueryLod", "textureSamples", "textureSamples",
-    "textureSize", "textureSize", "textureSize", "textureSize", "textureSize", "textureSize",
-    "textureSize", "textureSize", "textureSize", "textureSize", "textureSize", "textureSize",
-    "textureSize", "textureSize", "textureSize", "textureSize", "textureSize", "textureSize",
-    "textureSize", "textureSize", "textureSize", "textureSize", "textureSize", "textureSize",
-    "textureVideoWEBGL", "transpose", "transpose", "transpose", "transpose", "transpose",
-    "transpose", "transpose", "transpose", "transpose", "true", "trunc", "trunc", "uaddCarry",
-    "uimage2D", "uint", "uintBitsToFloat", "umulExtended", "uniform", "unpackDouble2x32",
-    "unpackHalf2x16", "unpackSnorm2x16", "unpackSnorm4x8", "unpackUnorm2x16", "usampler2D",
-    "usampler2DArray", "usampler3D", "usamplerCube", "usubBorrow", "uvec2", "uvec3", "uvec4",
-    "vec2", "vec3", "vec4", "void", "volatile", "while", "yuv_2_rgb", "__pixel_localEXT",
-    "__pixel_local_inEXT", "__pixel_local_outEXT", "set", "texture2D", "utexture2D", "sampler",
-    "subpassInput", "subpassInputMS", "usubpassInput", "input_attachment_index",
-    "readonly", "buffer", "unpackUnorm4x8", "defined", "elif", "extension",
-    "enable", "require", "endif", "undef", "pragma", "__VERSION__",
-    "constant_id", "blend_support_all_equations", "blend_support_multiply",
-    "blend_support_screen", "blend_support_overlay", "blend_support_darken",
-    "blend_support_lighten", "blend_support_colordodge",
-    "blend_support_colorburn", "blend_support_hardlight",
-    "blend_support_softlight", "blend_support_difference",
-    "blend_support_exclusion", "rgb10_a2",
+    'EmitStreamVertex', 'EmitVertex', 'EndPrimitive', 'EndStreamPrimitive',
+    '__VERSION__', '__pixel_localEXT', '__pixel_local_inEXT',
+    '__pixel_local_outEXT', 'abs', 'acos', 'acosh', 'all', 'allInvocations',
+    'allInvocationsEqual', 'any', 'anyInvocation', 'asin', 'asinh', 'atan',
+    'atanh', 'atomicAdd', 'atomicAnd', 'atomicCompSwap', 'atomicCounter',
+    'atomicCounterAdd', 'atomicCounterAnd', 'atomicCounterCompSwap',
+    'atomicCounterDecrement', 'atomicCounterExchange', 'atomicCounterIncrement',
+    'atomicCounterMax', 'atomicCounterMin', 'atomicCounterOr',
+    'atomicCounterSubtract', 'atomicCounterXor', 'atomicExchange', 'atomicMax',
+    'atomicMin', 'atomicOr', 'atomicXor', 'barrier',
+    'beginFragmentShaderOrderingINTEL', 'beginInvocationInterlockARB',
+    'beginInvocationInterlockNV', 'binding', 'bitCount', 'bitfieldExtract',
+    'bitfieldInsert', 'bitfieldReverse', 'blend_support_all_equations',
+    'blend_support_colorburn', 'blend_support_colordodge',
+    'blend_support_darken', 'blend_support_difference',
+    'blend_support_exclusion', 'blend_support_hardlight',
+    'blend_support_lighten', 'blend_support_multiply', 'blend_support_overlay',
+    'blend_support_screen', 'blend_support_softlight', 'bool', 'break',
+    'buffer', 'bvec2', 'bvec3', 'bvec4', 'case', 'ceil', 'centroid', 'clamp',
+    'coherent', 'const', 'constant_id', 'continue', 'cos', 'cosh', 'cross',
+    'dFdx', 'dFdxCoarse', 'dFdxFine', 'dFdy', 'dFdyCoarse', 'dFdyFine',
+    'default', 'defined', 'degrees', 'determinant', 'discard', 'distance', 'do',
+    'dot', 'elif', 'else', 'enable', 'endInvocationInterlockARB',
+    'endInvocationInterlockNV', 'endif', 'equal', 'exp', 'exp2', 'extension',
+    'faceforward', 'false', 'findLSB', 'findMSB', 'flat', 'float',
+    'floatBitsToInt', 'floatBitsToUint', 'floor', 'fma', 'for', 'fract',
+    'frexp', 'ftransform', 'fwidth', 'fwidthCoarse', 'fwidthFine',
+    'greaterThan', 'greaterThanEqual', 'groupMemoryBarrier', 'highp', 'if',
+    'iimage2D', 'image2D', 'imageAtomicAdd', 'imageAtomicAnd',
+    'imageAtomicCompSwap', 'imageAtomicExchange', 'imageAtomicMax',
+    'imageAtomicMin', 'imageAtomicOr', 'imageAtomicXor', 'imageLoad',
+    'imageSamples', 'imageSize', 'imageStore', 'imulExtended', 'in', 'inout',
+    'input_attachment_index', 'int', 'intBitsToFloat', 'interpolateAtCentroid',
+    'interpolateAtOffset', 'interpolateAtSample', 'invariant', 'inverse',
+    'inversesqrt', 'isampler2D', 'isampler2DArray', 'isampler3D',
+    'isamplerCube', 'isinf', 'isnan', 'ivec2', 'ivec3', 'ivec4', 'layout',
+    'ldexp', 'length', 'lessThan', 'lessThanEqual', 'location', 'log', 'log2',
+    'lowp', 'main', 'mat2', 'mat2x2', 'mat2x3', 'mat2x4', 'mat3', 'mat3x2',
+    'mat3x3', 'mat3x4', 'mat4', 'mat4x2', 'mat4x3', 'mat4x4', 'matrixCompMult',
+    'max', 'mediump', 'memoryBarrier', 'memoryBarrierAtomicCounter',
+    'memoryBarrierBuffer', 'memoryBarrierImage', 'memoryBarrierShared', 'min',
+    'mix', 'mod', 'modf', 'noise1', 'noise2', 'noise3', 'noise4',
+    'noperspective', 'normalize', 'not', 'notEqual', 'out', 'outerProduct',
+    'packDouble2x32', 'packHalf2x16', 'packSnorm2x16', 'packSnorm4x8',
+    'packUnorm2x16', 'packUnorm4x8', 'pixelLocalLoadANGLE',
+    'pixelLocalStoreANGLE', 'pow', 'pragma', 'precision', 'push_constant',
+    'r16f', 'r32f', 'r32i', 'r32ui', 'radians', 'readonly', 'reflect',
+    'refract', 'require', 'return', 'rg16f', 'rgb10_a2', 'rgb_2_yuv', 'rgba8',
+    'rgba8i', 'rgba8ui', 'round', 'roundEven', 'sampler', 'sampler2D',
+    'sampler2DArray', 'sampler2DArrayShadow', 'sampler2DShadow', 'sampler3D',
+    'samplerCube', 'samplerCubeShadow', 'set', 'shadow1D', 'shadow1DLod',
+    'shadow1DProj', 'shadow1DProjLod', 'shadow2D', 'shadow2DEXT', 'shadow2DLod',
+    'shadow2DProj', 'shadow2DProjEXT', 'shadow2DProjLod', 'sign', 'sin', 'sinh',
+    'smooth', 'smoothstep', 'sqrt', 'std140', 'std430', 'step', 'struct',
+    'subpassInput', 'subpassInputMS', 'subpassLoad', 'switch', 'tan', 'tanh',
+    'texelFetch', 'texelFetchOffset', 'texture', 'texture1D', 'texture1DLod',
+    'texture1DProj', 'texture1DProjLod', 'texture2D', 'texture2DGradEXT',
+    'texture2DLod', 'texture2DLodEXT', 'texture2DProj', 'texture2DProjGradEXT',
+    'texture2DProjLod', 'texture2DProjLodEXT', 'texture2DRect',
+    'texture2DRectProj', 'texture3D', 'texture3DLod', 'texture3DProj',
+    'texture3DProjLod', 'textureCube', 'textureCubeGradEXT', 'textureCubeLod',
+    'textureCubeLodEXT', 'textureGather', 'textureGatherOffset',
+    'textureGatherOffsets', 'textureGrad', 'textureGradOffset', 'textureLod',
+    'textureLodOffset', 'textureOffset', 'textureProj', 'textureProjGrad',
+    'textureProjGradOffset', 'textureProjLod', 'textureProjLodOffset',
+    'textureProjOffset', 'textureQueryLevels', 'textureQueryLod',
+    'textureSamples', 'textureSize', 'textureVideoWEBGL', 'transpose', 'true',
+    'trunc', 'uaddCarry', 'uimage2D', 'uint', 'uintBitsToFloat', 'umulExtended',
+    'undef', 'uniform', 'unpackDouble2x32', 'unpackHalf2x16', 'unpackSnorm2x16',
+    'unpackSnorm4x8', 'unpackUnorm2x16', 'unpackUnorm4x8', 'usampler2D',
+    'usampler2DArray', 'usampler3D', 'usamplerCube', 'usubBorrow',
+    'usubpassInput', 'utexture2D', 'uvec2', 'uvec3', 'uvec4', 'vec2', 'vec3',
+    'vec4', 'void', 'volatile', 'while', 'yuv_2_rgb'
 }
 
 # rgba and stpq get rewritten to xyzw, so we only need to check xyzw here. This way we can keep
@@ -455,7 +380,7 @@ class Minifier:
 
 
     # generates rewritten glsl from our tokens.
-    def emit_tokens_to_rewritten_glsl(self, out, *, preserve_exported_switches):
+    def emit_tokens_to_rewritten_glsl(self, out, *, preserve_exported_switches, calling_token_type:str=None):
         # stand-in for a null token.
         lasttoken = lambda : None
         lasttoken.type = ""
@@ -474,7 +399,8 @@ class Minifier:
 
             is_directive = tok.type in ["DEFINE", "IFDEF", "DIRECTIVE"]
             needs_whitespace = tok.type in ["FLOAT", "INT", "HEX", "ID", "DEFINED_ID"]
-            if is_directive and not is_newline:
+            # Adding this calling_token_type != 'DEFINE' prevents us from adding a new line to stringify macros
+            if is_directive and not is_newline and calling_token_type != 'DEFINE':
                 out.write('\n')
             elif needs_whitespace and lasttoken_needs_whitespace:
                 out.write(' ')
@@ -498,13 +424,15 @@ class Minifier:
                 if tok.define_arglist != None:
                     is_newline = tok.define_arglist.emit_tokens_to_rewritten_glsl(\
                         out,\
-                        preserve_exported_switches=preserve_exported_switches)
+                        preserve_exported_switches=preserve_exported_switches,\
+                        calling_token_type=tok.type)
                     assert(not is_newline)
                 if tok.define_val != None:
                     out.write(' ')
                     is_newline = tok.define_val.emit_tokens_to_rewritten_glsl(\
                         out,\
-                        preserve_exported_switches=preserve_exported_switches)
+                        preserve_exported_switches=preserve_exported_switches,\
+                        calling_token_type=tok.type)
 
             elif tok.type == "IFDEF":
                 out.write('#')
@@ -522,7 +450,8 @@ class Minifier:
                 if tok.directive_val != None:
                     is_newline = tok.directive_val.emit_tokens_to_rewritten_glsl(\
                         out,\
-                        preserve_exported_switches=preserve_exported_switches)
+                        preserve_exported_switches=preserve_exported_switches,\
+                        calling_token_type=tok.type)
 
             else:
                 out.write(tok.value)
@@ -575,13 +504,38 @@ class Minifier:
         out.write("namespace rive {\n")
         out.write("namespace gpu {\n")
         out.write("namespace glsl {\n")
-        out.write(f'const char {cpp_name}[] = R"===(')
+        if args.msvc:
+            # MSVC cannot compile raw shaders as strings because of an internal
+            # string length limit. There is, however, no limit on arrays so
+            # instead write it out as an array of individual characters.
+            out.write(f'const char {cpp_name}[] = {{\n   ')
 
-        is_newline = self.emit_tokens_to_rewritten_glsl(out, preserve_exported_switches=False)
-        if not is_newline:
-            out.write('\n')
+            codeIO = io.StringIO()
+            self.emit_tokens_to_rewritten_glsl(codeIO, preserve_exported_switches=False)
 
-        out.write(')===";\n')
+            out_ch_count = 0
+            for ch in codeIO.getvalue():
+                # use `repr` to escape the characters (but we need to handle single
+                # quote manually, since it will represent that as "'" - which will
+                # definitely not compile)
+
+                out.write(f" {repr(ch)},") if ch != "'" else out.write(" '\\'',")
+                out_ch_count = out_ch_count + 1
+                CHAR_COUNT_PER_LINE = 12
+                if (out_ch_count % CHAR_COUNT_PER_LINE) == 0:
+                    out.write('\n   ')
+            # Null-terminate so the array is a valid C-string when passed to
+            # APIs like ostream::operator<<(const char*), which read until '\0'.
+            out.write(" '\\0'\n};\n")
+        else:
+            # For non-MSVC outputs just output as a raw string
+            out.write(f'const char {cpp_name}[] = R"===(')
+
+            is_newline = self.emit_tokens_to_rewritten_glsl(out, preserve_exported_switches=False)
+            if not is_newline:
+                out.write('\n')
+
+            out.write(')===";\n')
         out.write("} // namespace glsl\n")
         out.write("} // namespace gpu\n")
         out.write("} // namespace rive")

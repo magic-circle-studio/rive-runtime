@@ -22,11 +22,17 @@ public:
         // Turn on synchronous shader compilations to ensure deterministic
         // rendering and to make sure we test every unique shader.
         metalOptions.shaderCompilationMode =
-            ShaderCompilationMode::alwaysSynchronous;
+            backendParams.shaderCompilationMode;
         metalOptions.disableFramebufferReads = backendParams.atomic;
         m_renderContext =
             RenderContextMetalImpl::MakeContext(m_gpu, metalOptions);
-        printf("==== MTLDevice: %s ====\n", m_gpu.name.UTF8String);
+        m_renderContext->static_impl_cast<RenderContextMetalImpl>()
+            ->setCommandQueue(m_queue);
+        printf("==== MTLDevice: %s (%s) ====\n",
+               m_gpu.name.UTF8String,
+               // MTLDebugDevice when API validation is on, the real driver
+               // class when it isn't.
+               NSStringFromClass([m_gpu class]).UTF8String);
     }
 
     rive::Factory* factory() override { return m_renderContext.get(); }
@@ -47,6 +53,7 @@ public:
                               : rive::gpu::LoadAction::preserveRenderTarget,
             .clearColor = options.clearColor,
             .disableRasterOrdering = options.disableRasterOrdering,
+            .triangulationThresholds = options.triangulationThresholds,
             .wireframe = options.wireframe,
             .fillsDisabled = options.fillsDisabled,
             .strokesDisabled = options.strokesDisabled,
@@ -87,6 +94,12 @@ public:
                                 : m_renderTarget.get(),
             .externalCommandBuffer = (__bridge void*)m_flushCommandBuffer,
         });
+        // Commit the command buffer now so the buffer ring lock is released
+        // immediately (via the completed handler). Allocate a fresh one for
+        // any subsequent work in endFrame(). Without this, multiple canvas
+        // flushes before endFrame() would deadlock on the buffer ring.
+        [m_flushCommandBuffer commit];
+        m_flushCommandBuffer = [m_queue commandBuffer];
     }
 
     void endFrame(std::vector<uint8_t>* pixelData) override
@@ -142,6 +155,37 @@ public:
         }
 
         m_flushCommandBuffer = nil;
+    }
+
+#if defined(__APPLE__) && !defined(RIVE_UNREAL)
+    // Returns the Metal command queue as void* to avoid <Metal/Metal.h> in
+    // this cross-platform header (same pattern as externalCommandBuffer).
+    void* metalQueue() const override { return (__bridge void*)m_queue; }
+#endif
+
+    void* getCurrentCommandBuffer() const override
+    {
+        return (__bridge void*)m_queue;
+    }
+
+    void* getOreContext() const override
+    {
+        return m_renderContext->getOreContext();
+    }
+
+    void beginOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+
+        oreContext->beginFrame({});
+    }
+    void endOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+
+        oreContext->endFrame();
     }
 
 private:

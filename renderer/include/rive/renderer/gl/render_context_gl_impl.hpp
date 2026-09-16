@@ -9,6 +9,9 @@
 #include "rive/renderer/gl/gl_utils.hpp"
 #include "rive/renderer/render_context_helper_impl.hpp"
 
+#include <unordered_map>
+#include <vector>
+
 namespace rive
 {
 class RiveRenderPath;
@@ -48,17 +51,33 @@ public:
     rcp<Texture> makeImageTexture(uint32_t width,
                                   uint32_t height,
                                   uint32_t mipLevelCount,
-                                  const uint8_t imageDataRGBAPremul[]) override;
+                                  GPUTextureFormat format,
+                                  const uint8_t imageData[],
+                                  uint8_t blockWidth = 1,
+                                  uint8_t blockHeight = 1,
+                                  bool srgb = false,
+                                  bool generateRemainingMips = false) override;
 
     // Takes ownership of textureID and responsibility for deleting it.
     rcp<Texture> adoptImageTexture(uint32_t width,
                                    uint32_t height,
                                    GLuint textureID);
 
+#ifdef RIVE_CANVAS
+    void ensureCanvasBacking(gpu::RenderCanvas* canvas) override;
+
+    std::unique_ptr<rive::ore::Context> makeOreContext() override;
+
+#endif
+
     // Called *after* the GL context has been modified externally.
     // Re-binds Rive internal resources and invalidates the internal cache of GL
     // state.
     void invalidateGLState();
+
+    // Sampler objects and texture unit bindings are global state no FBO or VAO
+    // restores, so Ore's leftovers would override our sampling parameters.
+    void scrubStateAfterOre() override;
 
     // Called *before* the GL context will be modified externally.
     // Unbinds Rive internal resources before yielding control of the GL
@@ -69,7 +88,8 @@ public:
     // glBlitFramebuffer() doesn't support copying non-MSAA to MSAA.
     void blitTextureToFramebufferAsDraw(GLuint textureID,
                                         const IAABB& bounds,
-                                        uint32_t renderTargetHeight);
+                                        uint32_t renderTargetHeight,
+                                        bool bottomUp);
 
     GLState* state() const { return m_state.get(); }
 
@@ -79,13 +99,14 @@ public:
     // buffers are only supported via extensions in GL.
     //
     // These are sorted with the most preferred types higher up in the list.
-    enum class AtlasType
+    enum class FeatherAtlasRenderType
     {
         r16f, // Most preferred. Balances performances with precision.
         r32f, // Uses HW blending to count coverage.
 
         r32uiFramebufferFetch, // Stores coverage as fp32 bits in a uint.
-        r32uiPixelLocalStorage,
+        r8PixelLocalStorageEXT,
+        r32uiPixelLocalStorageANGLE,
 
         r32iAtomicTexture, // Stores coverage as 16:16 fixed point.
 
@@ -93,16 +114,27 @@ public:
                // up coverage into all 4 components of an RGBA texture.
     };
 
-    AtlasType atlasType() const { return m_atlasType; }
+    FeatherAtlasRenderType featherAtlasRenderType() const
+    {
+        return m_featherAtlasRenderType;
+    }
 
 #ifdef WITH_RIVE_TOOLS
-    // Changes the context's AtlasType for testing purposes. If atlasDesiredType
-    // is not supported, the next supported AtlasType down the list is chosen.
+    // Changes the context's FeatherAtlasRenderType for testing purposes. If
+    // atlasDesiredRenderType is not supported, the next supported
+    // AtlasRenderType down the list is chosen.
+    //
+    // Returns the original FeatherAtlasRenderType from before this call was
+    // made.
     //
     // NOTE: this also calls releaseResources() on the owning RenderContext to
     // ensure the atlas texture gets reallocated.
-    void testingOnly_resetAtlasDesiredType(RenderContext* owningRenderContext,
-                                           AtlasType atlasDesiredType);
+    FeatherAtlasRenderType testingOnly_resetFeatherAtlasDesiredRenderType(
+        RenderContext* owningRenderContext,
+        FeatherAtlasRenderType desiredRenderType);
+
+    bool testingOnly_setBlendAdvancedCoherentKHRSupported(bool supported);
+    bool testingOnly_setBlendAdvancedKHRSupported(bool supported);
 #endif
 
 private:
@@ -199,7 +231,7 @@ private:
                         std::unique_ptr<PixelLocalStorageImpl>,
                         ShaderCompilationMode);
 
-    void buildAtlasRenderPipelines();
+    void buildFeatherAtlasRenderPipelines();
 
     std::unique_ptr<BufferRing> makeUniformBufferRing(
         size_t capacityInBytes) override;
@@ -211,7 +243,7 @@ private:
 
     void resizeGradientTexture(uint32_t width, uint32_t height) override;
     void resizeTessellationTexture(uint32_t width, uint32_t height) override;
-    void resizeAtlasTexture(uint32_t width, uint32_t height) override;
+    void resizeFeatherAtlasTexture(uint32_t width, uint32_t height) override;
     void resizeTransientPLSBacking(uint32_t width,
                                    uint32_t height,
                                    uint32_t planeCount) override;
@@ -275,7 +307,7 @@ private:
     GLuint m_gradientTexture = 0;
 
     // Gaussian integral table for feathering.
-    glutils::Texture m_featherTexture;
+    glutils::Texture m_gaussianIntegralTexture;
 
     // Tessellation texture rendering.
     glutils::Program m_tessellateProgram;
@@ -284,8 +316,8 @@ private:
     glutils::Framebuffer m_tessellateFBO;
     GLuint m_tessVertexTexture = 0;
 
-    // Renders feathers to the atlas texture.
-    class AtlasProgram
+    // Renders feathers to the feather atlas texture.
+    class FeatherAtlasProgram
     {
     public:
         void compile(GLuint vertexShaderID,
@@ -309,21 +341,23 @@ private:
     };
 
     // Atlas rendering pipelines.
-    AtlasType m_atlasType;
-    glutils::Shader m_atlasVertexShader;
-    AtlasProgram m_atlasFillProgram;
-    AtlasProgram m_atlasStrokeProgram;
-    gpu::PipelineState m_atlasFillPipelineState;
-    gpu::PipelineState m_atlasStrokePipelineState;
-#ifdef RIVE_ANDROID
-    // Pipelines for clearing and resolving EXT_shader_pixel_local_storage.
-    glutils::Shader m_atlasResolveVertexShader;
-    glutils::Program m_atlasClearProgram = glutils::Program::Zero();
-    glutils::Program m_atlasResolveProgram = glutils::Program::Zero();
-    glutils::VAO m_atlasResolveVAO;
-#endif
-    glutils::Texture m_atlasTexture = glutils::Texture::Zero();
-    glutils::Framebuffer m_atlasFBO;
+    FeatherAtlasRenderType m_featherAtlasRenderType;
+    glutils::Shader m_featherAtlasVertexShader;
+    FeatherAtlasProgram m_featherAtlasFillProgram;
+    FeatherAtlasProgram m_featherAtlasStrokeProgram;
+    gpu::PipelineState m_featherAtlasFillPipelineState;
+    gpu::PipelineState m_featherAtlasStrokePipelineState;
+    // Pipelines for clearing and resolving atlases into a GL_R8 texture for
+    // sampling.
+    glutils::Shader m_featherAtlasResolveVertexShader;
+    glutils::Program m_featherAtlasClearProgram = glutils::Program::Zero();
+    glutils::Program m_featherAtlasResolveProgram = glutils::Program::Zero();
+    glutils::VAO m_featherAtlasResolveVAO;
+    glutils::Texture m_featherAtlasRenderTexture = glutils::Texture::Zero();
+    glutils::Texture m_featherAtlasTexture = glutils::Texture::Zero();
+    glutils::Framebuffer m_featherAtlasRenderFBO = glutils::Framebuffer::Zero();
+    glutils::Framebuffer m_featherAtlasResolveFBO =
+        glutils::Framebuffer::Zero();
 
     // Wraps a compiled GL "draw" shader, either vertex or fragment, with a
     // specific set of features enabled via #define. The set of features to
@@ -427,7 +461,8 @@ private:
         virtual std::unique_ptr<DrawProgram> createPipeline(
             PipelineCreateType createType,
             uint32_t key,
-            const PipelineProps&) override;
+            const PipelineProps&,
+            const PlatformFeatures&) override;
 
         virtual PipelineStatus getPipelineStatus(
             const DrawProgram& state) const override;
@@ -440,6 +475,14 @@ private:
     };
 
     GLPipelineManager m_pipelineManager;
+
+#ifdef WITH_RIVE_TOOLS
+    ShaderCompilationMode testingOnly_setShaderCompilationMode(
+        ShaderCompilationMode mode) override
+    {
+        return m_pipelineManager.testingOnly_setShaderCompilationMode(mode);
+    }
+#endif
 
     // Vertex/index buffers for drawing paths.
     glutils::VAO m_drawVAO;

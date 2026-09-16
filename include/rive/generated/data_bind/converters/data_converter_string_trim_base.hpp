@@ -41,8 +41,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(trimTypePropertyKey, &m_TrimType, &value);
         m_TrimType = value;
-        trimTypeChanged();
+        RIVE_EDITOR_CHANGED(trimTypeChanged());
+        notifyPropertyChanged(trimTypePropertyKey);
     }
 
     Core* clone() const override;
@@ -65,6 +67,9 @@ public:
 
 protected:
     virtual void trimTypeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/converters/data_converter_string_trim_ext.inl"
+#endif
 };
 } // namespace rive
 

@@ -47,8 +47,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(rotationPropertyKey, &m_Rotation, &value);
         m_Rotation = value;
-        rotationChanged();
+        RIVE_EDITOR_CHANGED(rotationChanged());
+        notifyPropertyChanged(rotationPropertyKey);
     }
 
     inline float distance() const { return m_Distance; }
@@ -58,8 +60,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distancePropertyKey, &m_Distance, &value);
         m_Distance = value;
-        distanceChanged();
+        RIVE_EDITOR_CHANGED(distanceChanged());
+        notifyPropertyChanged(distancePropertyKey);
     }
 
     Core* clone() const override;
@@ -87,6 +91,9 @@ public:
 protected:
     virtual void rotationChanged() {}
     virtual void distanceChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/cubic_mirrored_vertex_ext.inl"
+#endif
 };
 } // namespace rive
 

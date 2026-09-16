@@ -151,10 +151,12 @@ public:
     }
 
     void rewind() override { m_path.reset(CGPathCreateMutable()); }
-    void addRenderPath(RenderPath* path, const Mat2D& mx) override
+    void addRenderPath(const RenderPath* path, const Mat2D& mx) override
     {
         auto transform = convert(mx);
-        CGPathAddPath(m_path, &transform, ((CGRenderPath*)path)->path());
+        CGPathAddPath(m_path,
+                      &transform,
+                      static_cast<const CGRenderPath*>(path)->path());
     }
     void fillRule(FillRule value) override
     {
@@ -607,7 +609,8 @@ AutoCF<CGImageRef> CGRenderer::FlipCGImageInY(AutoCF<CGImageRef> image)
     auto w = CGImageGetWidth(image);
     auto h = CGImageGetHeight(image);
     AutoCF space = CGColorSpaceCreateDeviceRGB();
-    auto info = kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast;
+    auto info = static_cast<uint>(kCGBitmapByteOrder32Big) |
+                static_cast<uint>(kCGImageAlphaPremultipliedLast);
     AutoCF ctx = CGBitmapContextCreate(nullptr, w, h, 8, 0, space, info);
     CGContextConcatCTM(ctx, CGAffineTransformMake(1, 0, 0, -1, 0, h));
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);

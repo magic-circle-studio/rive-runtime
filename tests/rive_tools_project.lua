@@ -1,26 +1,54 @@
 dofile('rive_build_config.lua')
 defines({ 'WITH_RIVE_TOOLS' })
 
-RIVE_RUNTIME_DIR = path.getabsolute('..')
-RIVE_PLS_DIR = path.getabsolute('../renderer')
+WITH_RIVE_TOOLS = true
 
-dofile(RIVE_RUNTIME_DIR .. '/premake5_v2.lua')
-dofile(RIVE_RUNTIME_DIR .. '/cg_renderer/premake5.lua')
-dofile(RIVE_RUNTIME_DIR .. '/dependencies/premake5_libpng_v2.lua')
-dofile(RIVE_RUNTIME_DIR .. '/dependencies/premake5_glfw_v2.lua')
-dofile(RIVE_RUNTIME_DIR .. '/decoders/premake5_v2.lua')
-dofile(RIVE_PLS_DIR .. '/premake5_pls_renderer.lua')
+-- Several of the scripts below assign RIVE_RUNTIME_DIR and RIVE_PLS_DIR
+-- themselves, so ours would not survive the dofiles. Keep a private copy to
+-- reach them with, and set the shared globals once every dofile has run.
+RIVE_RUNTIME_DOFILE_DIR = path.getabsolute('..')
+
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/premake5_v2.lua')
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/cg_renderer/premake5.lua')
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/dependencies/premake5_libpng_v2.lua')
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/dependencies/premake5_glfw_v2.lua')
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/decoders/premake5_v2.lua')
+dofile(RIVE_RUNTIME_DOFILE_DIR .. '/renderer/premake5_pls_renderer.lua')
 
 newoption({ trigger = 'with-skia', description = 'use skia' })
 if _OPTIONS['with-skia'] then
-    dofile(RIVE_RUNTIME_DIR .. '/skia/renderer/premake5_v2.lua')
+    dofile(RIVE_RUNTIME_DOFILE_DIR .. '/skia/renderer/premake5_v2.lua')
 end
+
+newoption({
+    trigger = 'with-canvas-2d',
+    description = 'build the Canvas2D renderer from packages/runtime_wasm',
+})
+
+-- The Canvas2D testing window imports canvas_advanced.mjs at runtime rather
+-- than linking it, so it has to sit beside the tool. Building rive_wasm in this
+-- workspace puts it there directly: it links to RIVE_BUILD_OUT, which is the
+-- tools' own target directory.
+if _OPTIONS['with-canvas-2d'] then
+    if rive_target_os ~= 'emscripten' then
+        error('--with-canvas-2d requires --arch=wasm')
+    end
+    dofile(RIVE_RUNTIME_DOFILE_DIR .. '/../runtime_wasm/wasm/premake5.lua')
+end
+
+newoption({ trigger = 'with-svg', description = 'use the SVG renderer' })
+
+RIVE_RUNTIME_DIR = RIVE_RUNTIME_DOFILE_DIR
+RIVE_PLS_DIR = path.getabsolute('../renderer')
+
+newoption({trigger = 'all_tools_as_static', description = 'force all RiveTool projects to be static libs'})
 
 function rive_tools_project(name, project_kind)
     project(name)
     if project_kind == 'RiveTool' then
         kind(
             _OPTIONS['for_unreal'] and 'StaticLib'
+                or _OPTIONS['all_tools_as_static'] and 'StaticLib'
                 or _OPTIONS['for_android'] and 'SharedLib'
                 or _OPTIONS['os'] == 'ios' and 'StaticLib'
                 or 'ConsoleApp'
@@ -56,6 +84,13 @@ function rive_tools_project(name, project_kind)
 
     fatalwarnings { "All" }
 
+    -- Solves link order issue on linux
+    filter({ 'system:linux'})
+    do
+        linkgroups("On")
+    end
+    filter({ })
+    
     defines({
         'SK_GL',
         'GL_SILENCE_DEPRECATION', -- For glReadPixels()
@@ -70,6 +105,7 @@ function rive_tools_project(name, project_kind)
         RIVE_PLS_DIR .. '/src',
         RIVE_RUNTIME_DIR .. '/include',
         RIVE_RUNTIME_DIR .. '/cg_renderer/include',
+        RIVE_RUNTIME_DIR .. '/decoders/include',
         'unit_tests',
         '%{cfg.targetdir}/include/libpng',
     })
@@ -81,6 +117,7 @@ function rive_tools_project(name, project_kind)
         yoga,
         libpng,
         zlib,
+        miniaudio,
     })
 
     if ndk then
@@ -88,15 +125,48 @@ function rive_tools_project(name, project_kind)
         links({ 'log', 'android' })
     end
 
-    if _OPTIONS['with_vulkan'] then
+    if _OPTIONS['with_vulkan'] and not _OPTIONS['_console_only_ore_vk'] then
+        -- Skip bootstrap on platforms that supply the Vulkan loader directly.
         dofile(RIVE_PLS_DIR .. '/rive_vk_bootstrap/bootstrap_project.lua')
     end
 
-    filter({ 'options:with_rive_scripting' })
-    do
-        includedirs({
-            luau .. '/VM/include',
+    -- Tools projects compile separately from rive_pls_renderer and need
+    -- their own externalincludedirs for ORE Vulkan headers.
+    if _OPTIONS['with_vulkan'] and _OPTIONS['_console_only_ore_vk'] then
+        externalincludedirs({
+            vulkan_headers .. '/include',
+            vulkan_memory_allocator .. '/include',
         })
+    end
+
+    if _OPTIONS['scripting_vm'] ~= 'wasm' then
+        filter({ 'options:with_rive_scripting' })
+        do
+            includedirs({
+                luau .. '/VM/include',
+            })
+        end
+
+        -- When scripting is enabled, librive.a contains lua_promise.o and
+        -- lua_image_decode.o which reference luau symbols.
+        filter({ 'kind:ConsoleApp or SharedLib or WindowedApp', 'options:with_rive_scripting' })
+        do
+            links({ 'luau_vm' })
+        end
+    end
+    if _OPTIONS['scripting_vm'] == 'wasm' or _OPTIONS['scripting_vm'] == 'both'
+    then
+        -- librive.a's WasmScriptingVM needs the WAMR runtime.
+        filter({ 'kind:ConsoleApp or SharedLib or WindowedApp', 'options:with_rive_scripting' })
+        do
+            links({ 'wamr' })
+        end
+        -- Ladder and transplant tests speak the public wamr API directly.
+        filter({ 'options:with_rive_scripting' })
+        do
+            includedirs({ wamr .. '/core/iwasm/include' })
+        end
+        filter({})
     end
 
     filter({ 'system:windows or macosx or linux', 'options:not for_unreal'  })
@@ -117,6 +187,11 @@ function rive_tools_project(name, project_kind)
         libdirs({ RIVE_RUNTIME_DIR .. '/skia/dependencies/skia/out/static' })
     end
 
+    filter('options:with-svg')
+    do
+        defines({ 'RIVE_SVG' })
+    end
+
     filter({ 'toolset:not msc' })
     do
         buildoptions({ '-Wshorten-64-to-32' })
@@ -132,6 +207,11 @@ function rive_tools_project(name, project_kind)
             '_WINSOCK_DEPRECATED_NO_WARNINGS',
             'UNICODE',
         })
+        if rive_target_os == 'windows' and _OPTIONS['for_unreal'] == nil then
+            externalincludedirs({
+                dx12_headers .. '/include/directx',
+            })
+        end
     end
 
     filter('system:android')
@@ -232,6 +312,10 @@ function rive_tools_project(name, project_kind)
             'Dbghelp',
             'd3dcompiler',
             'ws2_32',
+            'gdi32',
+            'shell32',
+            'advapi32',
+            'user32',
         })
     end
 
@@ -264,6 +348,14 @@ function rive_tools_project(name, project_kind)
     filter({ 'kind:ConsoleApp or SharedLib or WindowedApp', 'system:android' })
     do
         links({ 'EGL', 'GLESv3', 'log' })
+        -- Support 16 KB page sizes
+        -- Necessary for NDK r27, can remove when upgrading to r28+
+            -- See: https://developer.android.com/guide/practices/page-sizes#compile-r27-lower
+        -- See: https://android.googlesource.com/platform/ndk/+/master/docs/BuildSystemMaintainers.md#page-sizes
+        linkoptions({
+            '-Wl,-z,max-page-size=16384',
+            '-Wl,-z,common-page-size=16384',
+        })
     end
 
     filter({ 'kind:ConsoleApp or SharedLib or WindowedApp', 'options:with-dawn' })
@@ -289,7 +381,7 @@ function rive_tools_project(name, project_kind)
         'system:windows',
     })
     do
-        links({ 'dxguid' })
+        links({ 'dxguid', 'onecore' })
     end
 
     filter({
@@ -306,12 +398,22 @@ function rive_tools_project(name, project_kind)
         links({ 'skia', 'rive_skia_renderer' })
     end
 
+    filter({ 'options:for_unreal' })
+    do
+        defines({ 'RIVE_UNREAL', 'RIVE_TOOLS_NO_GLFW', 'RIVE_TOOLS_NO_GL' })
+    end
+
     filter('system:emscripten')
     do
         targetextension('.js')
+        defines({ 'EMSCRIPTEN_HAS_UNBOUND_TYPE_NAMES=0' })
         linkoptions({
+            '--bind',
+            -- Must be repeated at link time, not just when compiling. emcc
+            -- picks the libembind variant from the link command line.
+            '-fno-rtti',
             '-sEXPORTED_FUNCTIONS=_main,_rive_print_message_on_server,_malloc,_free',
-            '-sEXPORTED_RUNTIME_METHODS=ccall,cwrap',
+            '-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAPU32',
             '-sENVIRONMENT=web',
             '-sUSE_GLFW=3',
             '-sMIN_WEBGL_VERSION=2',
@@ -326,11 +428,28 @@ function rive_tools_project(name, project_kind)
         })
     end
 
-    filter({ 'system:emscripten', 'options:with-webgpu', 'options:not with_wagyu' })
+    filter({
+        'system:emscripten',
+        'options:with-webgpu',
+        'options:not with_wagyu',
+        'options:webgpu-version=1',
+    })
     do
-        linkoptions({
-            '-sUSE_WEBGPU',
-        })
+        -- webgpu-version=1 keeps the legacy -sUSE_WEBGPU library.
+        linkoptions({ '-sUSE_WEBGPU' })
+    end
+
+    filter({
+        'system:emscripten',
+        'options:with-webgpu',
+        'options:not with_wagyu',
+        'options:webgpu-version=2',
+    })
+    do
+        -- webgpu-version=2 uses Dawn's emdawnwebgpu port (the new "future"
+        -- webgpu.h API) so it runs in a real browser.
+        buildoptions({ '--use-port=emdawnwebgpu' })
+        linkoptions({ '--use-port=emdawnwebgpu' })
     end
 
     filter('files:**.html')
@@ -338,6 +457,12 @@ function rive_tools_project(name, project_kind)
         buildmessage('Copying %{file.relpath} to %{cfg.targetdir}')
         buildcommands({ 'cp %{file.relpath} %{cfg.targetdir}/%{file.name}' })
         buildoutputs({ '%{cfg.targetdir}/%{file.name}' })
+    end
+
+    filter({ 'options:with-canvas-2d' })
+    do
+        defines({ 'RIVE_CANVAS_2D' })
+        dependson({ 'rive_wasm' })
     end
 
     filter({})
@@ -353,6 +478,7 @@ do
     files({
         'common/*.cpp',
         'unit_tests/assets/*.cpp',
+        RIVE_PLS_DIR .. '/path_fiddle/fiddle_context.cpp',
         RIVE_PLS_DIR .. '/path_fiddle/fiddle_context_gl.cpp',
         RIVE_PLS_DIR .. '/path_fiddle/fiddle_context_d3d.cpp',
         RIVE_PLS_DIR .. '/path_fiddle/fiddle_context_d3d12.cpp',
@@ -360,20 +486,28 @@ do
         RIVE_PLS_DIR .. '/path_fiddle/fiddle_context_dawn.cpp',
     })
 
+    filter('options:with-svg')
+    do
+        files({
+            RIVE_RUNTIME_DIR .. '/utils/svg_factory.cpp',
+            RIVE_RUNTIME_DIR .. '/utils/svg_renderer.cpp',
+        })
+    end
+
+    filter({'options:for_unreal'})
+    do
+        removefiles({'common/offscreen_render_target_*', 'common/offscreen_rendertarget_*',})
+    end
+
     filter({ 'options:not no_tools_shader_hotloading' })
     do
      files({ RIVE_PLS_DIR .. '/shader_hotload/**.cpp'} )
     end
     
-    if rive_target_os == 'windows' then
+    if rive_target_os == 'windows' and _OPTIONS['for_unreal'] == nil then
         externalincludedirs({
             dx12_headers .. '/include/directx',
         })
-    end
-
-    filter({ 'options:for_unreal' })
-    do
-        defines({ 'RIVE_UNREAL', 'RIVE_TOOLS_NO_GLFW', 'RIVE_TOOLS_NO_GL' })
     end
 
     filter({ 'toolset:not msc' })

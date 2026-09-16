@@ -48,7 +48,7 @@ void ViewModelInstanceList::addItem(rcp<ViewModelInstanceListItem> item)
 bool ViewModelInstanceList::addItemAt(rcp<ViewModelInstanceListItem> item,
                                       int index)
 {
-    if (index <= m_ListItems.size())
+    if (index >= 0 && index <= m_ListItems.size())
     {
         m_ListItems.insert(m_ListItems.begin() + index, item);
 
@@ -126,6 +126,51 @@ void ViewModelInstanceList::removeItem(rcp<ViewModelInstanceListItem> listItem)
     propertyValueChanged();
 }
 
+void ViewModelInstanceList::removeAllItems()
+{
+    if (m_ListItems.size() > 0)
+    {
+        for (auto& listItem : m_ListItems)
+        {
+            if (listItem->viewModelInstance())
+            {
+                listItem->viewModelInstance()->removeParent(
+                    parentViewModelInstance());
+            }
+        }
+        m_ListItems.clear();
+        propertyValueChanged();
+    }
+}
+
+void ViewModelInstanceList::removeAllItemsWithViewModelInstance(
+    ViewModelInstance* viewModelInstance)
+{
+    if (viewModelInstance == nullptr || m_ListItems.empty())
+    {
+        return;
+    }
+
+    bool changed = false;
+    for (auto it = m_ListItems.begin(); it != m_ListItems.end();)
+    {
+        if ((*it)->viewModelInstance().get() == viewModelInstance)
+        {
+            (*it)->viewModelInstance()->removeParent(parentViewModelInstance());
+            it = m_ListItems.erase(it);
+            changed = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    if (changed)
+    {
+        propertyValueChanged();
+    }
+}
+
 rcp<ViewModelInstanceListItem> ViewModelInstanceList::item(uint32_t index)
 {
     if (index < m_ListItems.size())
@@ -143,6 +188,40 @@ void ViewModelInstanceList::swap(uint32_t index1, uint32_t index2)
                        m_ListItems.begin() + index2);
         propertyValueChanged();
     }
+}
+
+void ViewModelInstanceList::updateList(
+    std::vector<rcp<ViewModelInstanceListItem>>* list)
+{
+    if (list == nullptr)
+    {
+        return;
+    }
+
+    // Detach old children from this host instance before replacing the list.
+    if (parentViewModelInstance())
+    {
+        for (auto& item : m_ListItems)
+        {
+            if (item->viewModelInstance() != nullptr)
+            {
+                item->viewModelInstance()->removeParent(
+                    parentViewModelInstance());
+            }
+        }
+    }
+
+    m_ListItems.clear();
+    m_ListItems.reserve(list->size());
+    for (auto& item : *list)
+    {
+        m_ListItems.push_back(item);
+        if (parentViewModelInstance() && item->viewModelInstance() != nullptr)
+        {
+            item->viewModelInstance()->addParent(parentViewModelInstance());
+        }
+    }
+    propertyValueChanged();
 }
 
 Core* ViewModelInstanceList::clone() const

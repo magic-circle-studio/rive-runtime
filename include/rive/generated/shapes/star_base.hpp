@@ -48,8 +48,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(innerRadiusPropertyKey, &m_InnerRadius, &value);
         m_InnerRadius = value;
-        innerRadiusChanged();
+        RIVE_EDITOR_CHANGED(innerRadiusChanged());
+        notifyPropertyChanged(innerRadiusPropertyKey);
     }
 
     Core* clone() const override;
@@ -72,6 +74,9 @@ public:
 
 protected:
     virtual void innerRadiusChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/star_ext.inl"
+#endif
 };
 } // namespace rive
 

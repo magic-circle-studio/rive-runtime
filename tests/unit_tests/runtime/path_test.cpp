@@ -74,7 +74,7 @@ public:
                                               0.0f,
                                               0.0f});
     }
-    void addRenderPath(rive::RenderPath* path,
+    void addRenderPath(const rive::RenderPath* path,
                        const rive::Mat2D& transform) override
     {}
 
@@ -598,6 +598,9 @@ TEST_CASE("Apply trim path effect to fill", "[silver]")
     CHECK(silver.matches("fill_trim_path"));
 }
 
+// The test asset carries Luau bytecode scripts, which only the Luau
+// backend runs.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
 TEST_CASE("Apply group effect to multiple paths", "[silver]")
 {
     rive::SerializingFactory silver;
@@ -674,6 +677,7 @@ TEST_CASE("Apply group effect to multiple paths", "[silver]")
 
     CHECK(silver.matches("group_effect"));
 }
+#endif
 
 TEST_CASE("Apply group effect with missing items", "[silver]")
 {
@@ -699,3 +703,33 @@ TEST_CASE("Apply group effect with missing items", "[silver]")
 
     CHECK(silver.matches("group_effect-main-missing-targets"));
 }
+
+// The test asset carries Luau bytecode scripts, which only the Luau
+// backend runs.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
+TEST_CASE("Path effects with inner & outer feathers", "[silver]")
+{
+    rive::SerializingFactory silver;
+    auto file = ReadRiveFile("assets/path_effect_with_feathers.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    stateMachine->advanceAndApply(0.0f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+
+    int frames = 60;
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("path_effect_with_feathers"));
+}
+#endif

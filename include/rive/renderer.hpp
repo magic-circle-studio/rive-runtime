@@ -5,7 +5,7 @@
 #ifndef _RIVE_RENDERER_HPP_
 #define _RIVE_RENDERER_HPP_
 
-#include "rive/enum_bitset.hpp"
+#include "rive/enums.hpp"
 #include "rive/shapes/paint/color.hpp"
 #include "rive/command_path.hpp"
 #include "rive/layout.hpp"
@@ -16,6 +16,7 @@
 #include "rive/shapes/paint/image_sampler.hpp"
 #include "rive/shapes/paint/stroke_cap.hpp"
 #include "rive/shapes/paint/stroke_join.hpp"
+#include "rive/surface_material.hpp"
 #include "utils/lite_rtti.hpp"
 #include "rive/math/raw_path.hpp"
 #include <stdio.h>
@@ -24,6 +25,7 @@
 namespace rive
 {
 class Vec2D;
+class RenderImage;
 
 // Helper that computes a matrix to "align" content (source) to fit inside frame
 // (destination).
@@ -32,6 +34,14 @@ Mat2D computeAlignment(Fit,
                        const AABB& frame,
                        const AABB& content,
                        const float scaleFactor = 1.0f);
+
+// Common parameters to describe a path's stroke.
+struct StrokeParams
+{
+    float thickness = 1.0f;
+    StrokeJoin join = StrokeJoin::miter;
+    StrokeCap cap = StrokeCap::butt;
+};
 
 enum class RenderBufferType
 {
@@ -46,7 +56,6 @@ enum class RenderBufferFlags
         1 << 0, // The client will map the buffer exactly one time, before
                 // rendering, and will never update it again.
 };
-RIVE_MAKE_ENUM_BITSET(RenderBufferFlags)
 
 class RenderBuffer : public RefCnt<RenderBuffer>,
                      public ENABLE_LITE_RTTI(RenderBuffer)
@@ -122,10 +131,23 @@ public:
     virtual void thickness(float value) = 0;
     virtual void join(StrokeJoin value) = 0;
     virtual void cap(StrokeCap value) = 0;
-    virtual void feather(float value) {} // Not supported on all renderers.
+    virtual void feather(float value) {}      // Not supported on all renderers.
+    virtual void additiveness(float value) {} // Only used for srcOver
     virtual void blendMode(BlendMode value) = 0;
     virtual void shader(rcp<RenderShader>) = 0;
     virtual void invalidateStroke() = 0;
+    virtual void modulatedImage(const RenderImage*, ImageSampler, const Mat2D&)
+    {} // TODO: Implement on others
+
+    // Set the style to stroke and update all of the stroke parameters with a
+    // single update.
+    void stroke(const StrokeParams& params)
+    {
+        style(RenderPaintStyle::stroke);
+        thickness(params.thickness);
+        join(params.join);
+        cap(params.cap);
+    }
 };
 
 #if defined(__EMSCRIPTEN__)
@@ -187,14 +209,21 @@ public:
         addRenderPath(path->renderPath(), transform);
     }
 
-    virtual void addRenderPath(RenderPath* path, const Mat2D& transform) = 0;
-    virtual void addRenderPathBackwards(RenderPath* path,
+    virtual void addRenderPath(const RenderPath* path,
+                               const Mat2D& transform) = 0;
+    virtual void addRenderPathBackwards(const RenderPath* path,
                                         const Mat2D& transform)
     {
         // No-op on non rive renderer.
     }
 
+    // The caller is expected to provide a valid path with no zero length
+    // segments.
     virtual void addRawPath(const RawPath& path) = 0;
+
+    // Same, but prunes zero length segments first, for paths we did not build
+    // like scripted ones.
+    void addUntrustedRawPath(const RawPath& path);
 };
 
 class Renderer
@@ -206,6 +235,13 @@ public:
     virtual void transform(const Mat2D& transform) = 0;
     virtual void drawPath(RenderPath* path, RenderPaint* paint) = 0;
     virtual void clipPath(RenderPath* path) = 0;
+
+    // Not implementable on some backends so default to nothing
+    virtual void clipStroke(RenderPath*, const StrokeParams&) {}
+
+    // Selects the material for one nested draw. Renderers without surface
+    // material support intentionally ignore it.
+    virtual void setSurfaceMaterialOverride(SurfaceMaterial) {}
     virtual void drawImage(const RenderImage*,
                            ImageSampler,
                            BlendMode,
@@ -220,11 +256,58 @@ public:
                                BlendMode,
                                float opacity) = 0;
 
+    // Variants with additiveness (0 = normal srcOver, 1 = fully additive).
+    // Renderers that don't support it fall back on the plain overloads and
+    // render normal srcOver.
+    virtual void drawImage(const RenderImage* image,
+                           ImageSampler sampler,
+                           BlendMode blendMode,
+                           float opacity,
+                           float additiveness)
+    {
+        drawImage(image, sampler, blendMode, opacity);
+    }
+    virtual void drawImageMesh(const RenderImage* image,
+                               ImageSampler sampler,
+                               rcp<RenderBuffer> vertices_f32,
+                               rcp<RenderBuffer> uvCoords_f32,
+                               rcp<RenderBuffer> indices_u16,
+                               uint32_t vertexCount,
+                               uint32_t indexCount,
+                               BlendMode blendMode,
+                               float opacity,
+                               float additiveness)
+    {
+        drawImageMesh(image,
+                      sampler,
+                      std::move(vertices_f32),
+                      std::move(uvCoords_f32),
+                      std::move(indices_u16),
+                      vertexCount,
+                      indexCount,
+                      blendMode,
+                      opacity);
+    }
+
     // Modulate the opacity of subsequent draw calls. The opacity is stacked
     // multiplicatively (e.g., modulateOpacity(0.5) followed by
     // modulateOpacity(0.2) = 0.1 effective opacity). The modulated opacity is
     // captured by save() and restored by restore().
     virtual void modulateOpacity(float opacity) = 0;
+
+    // Reports the renderer's current transform (CTM) into *out, if the
+    // renderer tracks one. Returns false and leaves *out untouched otherwise.
+    // Needed when a draw has to be re-issued through a different renderer that
+    // does not share this one's state.
+    virtual bool currentTransform(Mat2D* out) const { return false; }
+
+    // Reports the opacity accumulated by modulateOpacity() into *out, if the
+    // renderer tracks it. Returns false and leaves *out untouched otherwise.
+    // The companion to currentTransform(): a draw re-issued through a fresh
+    // renderer starts at opacity 1, so an enclosing modulateOpacity() scope
+    // (a ScriptedDrawable fading its children, say) has to be carried across
+    // by hand or the re-issued draw comes out too opaque.
+    virtual bool currentModulatedOpacity(float* out) const { return false; }
 
     // helpers
 

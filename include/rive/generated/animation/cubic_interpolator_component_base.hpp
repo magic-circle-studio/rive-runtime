@@ -47,8 +47,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(x1PropertyKey, &m_X1, &value);
         m_X1 = value;
-        x1Changed();
+        RIVE_EDITOR_CHANGED(x1Changed());
+        notifyPropertyChanged(x1PropertyKey);
     }
 
     inline float y1() const { return m_Y1; }
@@ -58,8 +60,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(y1PropertyKey, &m_Y1, &value);
         m_Y1 = value;
-        y1Changed();
+        RIVE_EDITOR_CHANGED(y1Changed());
+        notifyPropertyChanged(y1PropertyKey);
     }
 
     inline float x2() const { return m_X2; }
@@ -69,8 +73,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(x2PropertyKey, &m_X2, &value);
         m_X2 = value;
-        x2Changed();
+        RIVE_EDITOR_CHANGED(x2Changed());
+        notifyPropertyChanged(x2PropertyKey);
     }
 
     inline float y2() const { return m_Y2; }
@@ -80,8 +86,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(y2PropertyKey, &m_Y2, &value);
         m_Y2 = value;
-        y2Changed();
+        RIVE_EDITOR_CHANGED(y2Changed());
+        notifyPropertyChanged(y2PropertyKey);
     }
 
     Core* clone() const override;
@@ -119,6 +127,9 @@ protected:
     virtual void y1Changed() {}
     virtual void x2Changed() {}
     virtual void y2Changed() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/cubic_interpolator_component_ext.inl"
+#endif
 };
 } // namespace rive
 

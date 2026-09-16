@@ -5,10 +5,6 @@
 // Provides GLSL-specific #defines and declarations that enable our shaders to
 // be compiled as C++ and unit tested.
 
-#ifdef _MSC_VER
-#error glsl cross-compiling requires the clang/gcc vector extension
-#else
-
 #include "rive/math/simd.hpp"
 #include "rive/math/math_types.hpp"
 #include <array>
@@ -28,6 +24,7 @@ using simd::clamp;
 using simd::dot;
 using simd::max;
 using simd::min;
+using simd::mix;
 using simd::sqrt;
 using std::sqrt;
 using float3 = vec<3>;
@@ -46,6 +43,7 @@ inline half3 make_half3(half x, half y, half z) { return {x, y, z}; }
 inline half3 make_half3(half x) { return {x, x, x}; }
 inline half2 make_half2(half x, half y) { return {x, y}; }
 inline half2 make_half2(half x) { return {x, x}; }
+inline half make_half(float x) { return x; }
 
 using half2x3 = std::array<half3, 2>;
 inline half2x3 make_half2x3(half3 c0, half3 c1) { return {c0, c1}; }
@@ -95,13 +93,6 @@ template <int N> vec<N> mix(vec<N> a, vec<N> b, ivec<N> t)
     return simd::if_then_else(t, b, a);
 }
 
-template <int N> vec<N> mix(vec<N> a, vec<N> b, vec<N> t)
-{
-    // Do the lerp using this form which is always correct at the endpoints
-    // (t == 0 or 1)
-    return a * (1 - t) + b * t;
-}
-
 template <typename T, int N>
 ivec<N> equal(simd::gvec<T, N> x, simd::gvec<T, N> y)
 {
@@ -137,5 +128,3 @@ ivec<N> greaterThan(simd::gvec<T, N> x, simd::gvec<T, N> y)
 {
     return x > y;
 }
-
-#endif

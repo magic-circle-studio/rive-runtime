@@ -195,13 +195,36 @@ void D3D12DescriptorHeap::markSrvToIndex(ID3D12Device* device,
 {
     assert(m_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
+    // Honor caller-supplied SRV format override (e.g. picking sRGB for an
+    // externally-adopted Unity RT); otherwise map TYPELESS to its UNORM
+    // variant since CreateShaderResourceView rejects TYPELESS sources.
+    DXGI_FORMAT viewFormat = resource->srvViewFormat();
+    if (viewFormat == DXGI_FORMAT_UNKNOWN)
+    {
+        viewFormat = resource->desc().Format;
+        switch (viewFormat)
+        {
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+                viewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                break;
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+                viewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                break;
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+                viewFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                break;
+            default:
+                break;
+        }
+    }
+
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Texture2D.MipLevels = resource->desc().MipLevels;
     srvDesc.Texture2D.PlaneSlice = 0;
-    srvDesc.Format = resource->desc().Format;
+    srvDesc.Format = viewFormat;
 
     CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
         m_heap->GetCPUDescriptorHandleForHeapStart(),
@@ -209,6 +232,51 @@ void D3D12DescriptorHeap::markSrvToIndex(ID3D12Device* device,
         m_heapDescriptorSize);
 
     device->CreateShaderResourceView(resource->resource(), &srvDesc, srvHandle);
+}
+
+void D3D12DescriptorHeap::markNullTexture2DSrvToIndex(ID3D12Device* device,
+                                                      UINT index,
+                                                      DXGI_FORMAT format)
+{
+    assert(m_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Format = format;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.PlaneSlice = 0;
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
+        m_heap->GetCPUDescriptorHandleForHeapStart(),
+        index,
+        m_heapDescriptorSize);
+
+    device->CreateShaderResourceView(nullptr, &srvDesc, srvHandle);
+}
+
+void D3D12DescriptorHeap::markNullStructuredBufferSrvToIndex(
+    ID3D12Device* device,
+    UINT index,
+    UINT elementByteStride)
+{
+    assert(m_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.NumElements = 0;
+    srvDesc.Buffer.StructureByteStride = elementByteStride;
+    srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    CD3DX12_CPU_DESCRIPTOR_HANDLE srvHandle(
+        m_heap->GetCPUDescriptorHandleForHeapStart(),
+        index,
+        m_heapDescriptorSize);
+
+    device->CreateShaderResourceView(nullptr, &srvDesc, srvHandle);
 }
 
 void D3D12DescriptorHeap::markSrvToIndex(ID3D12Device* device,
@@ -415,7 +483,7 @@ void D3D12VolatileBuffer::resizeBuffers(UINT newSize)
 {
     m_uploadBuffer = d3d()->makeUploadBuffer(newSize,
                                              D3D12_RESOURCE_FLAG_NONE,
-                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+                                             D3D12_RESOURCE_STATE_GENERIC_READ);
     m_gpuBuffer = d3d()->makeBuffer(newSize,
                                     m_bindFlags,
                                     D3D12_RESOURCE_STATE_COMMON,
@@ -613,8 +681,8 @@ D3D12VolatileBufferPool::D3D12VolatileBufferPool(
     UINT alignment,
     UINT size) :
     GPUResourcePool(std::move(manager), MAX_POOL_SIZE),
-    m_targetSize(std::max<UINT>(size, m_alignment)),
-    m_alignment(alignment)
+    m_alignment(alignment),
+    m_targetSize(std::max<UINT>(size, m_alignment))
 {}
 
 inline D3D12ResourceManager* D3D12VolatileBufferPool::d3d() const

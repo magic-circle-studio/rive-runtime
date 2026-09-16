@@ -48,8 +48,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(inValuesPropertyKey, &m_InValues, &value);
         m_InValues = value;
-        inValuesChanged();
+        RIVE_EDITOR_CHANGED(inValuesChanged());
+        notifyPropertyChanged(inValuesPropertyKey);
     }
 
     inline uint32_t inIndices() const { return m_InIndices; }
@@ -59,8 +61,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(inIndicesPropertyKey, &m_InIndices, &value);
         m_InIndices = value;
-        inIndicesChanged();
+        RIVE_EDITOR_CHANGED(inIndicesChanged());
+        notifyPropertyChanged(inIndicesPropertyKey);
     }
 
     inline uint32_t outValues() const { return m_OutValues; }
@@ -70,8 +74,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(outValuesPropertyKey, &m_OutValues, &value);
         m_OutValues = value;
-        outValuesChanged();
+        RIVE_EDITOR_CHANGED(outValuesChanged());
+        notifyPropertyChanged(outValuesPropertyKey);
     }
 
     inline uint32_t outIndices() const { return m_OutIndices; }
@@ -81,8 +87,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(outIndicesPropertyKey, &m_OutIndices, &value);
         m_OutIndices = value;
-        outIndicesChanged();
+        RIVE_EDITOR_CHANGED(outIndicesChanged());
+        notifyPropertyChanged(outIndicesPropertyKey);
     }
 
     Core* clone() const override;
@@ -120,6 +128,9 @@ protected:
     virtual void inIndicesChanged() {}
     virtual void outValuesChanged() {}
     virtual void outIndicesChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/bones/cubic_weight_ext.inl"
+#endif
 };
 } // namespace rive
 

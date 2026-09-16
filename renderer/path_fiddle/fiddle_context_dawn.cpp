@@ -66,12 +66,11 @@ class FiddleContextDawnPLS : public FiddleContext
 public:
     FiddleContextDawnPLS(FiddleContextOptions options) : m_options(options)
     {
-        // optionally use WGPUInstanceDescriptor::nextInChain for
-        // WGPUDawnTogglesDescriptor with various toggles enabled or
-        // disabled:
-        // https://dawn.googlesource.com/dawn/+/refs/heads/main/src/dawn/native/Toggles.cpp
+        // Enable blocking waits to simplify our Dawn backend.
+        constexpr auto timedWaitAny = WGPUInstanceFeatureName_TimedWaitAny;
         WGPUInstanceDescriptor instanceDescriptor = {
-            .capabilities = {.timedWaitAnyEnable = true},
+            .requiredFeatureCount = 1,
+            .requiredFeatures = &timedWaitAny,
         };
         m_instance =
             wgpu::Instance::Acquire(wgpuCreateInstance(&instanceDescriptor));
@@ -115,6 +114,24 @@ public:
         return m_renderTarget.get();
     }
 
+    void* getCommandBuffer() override { return &m_commandEncoder; }
+
+    void beginOreFrame(rive::ore::Context* oreContext) override
+    {
+        m_commandEncoder = m_device.CreateCommandEncoder();
+        // Ore move-takes the encoder, pass a copy so we retain our ref.
+        wgpu::CommandEncoder borrowed = m_commandEncoder;
+        oreContext->beginFrame({.externalCommandBuffer = &borrowed});
+    }
+
+    void endOreFrame(rive::ore::Context* oreContext) override
+    {
+        FiddleContext::endOreFrame(oreContext);
+        auto commands = m_commandEncoder.Finish();
+        m_queue.Submit(1, &commands);
+        m_commandEncoder = nullptr;
+    }
+
     void onSizeChanged(GLFWwindow* window,
                        int width,
                        int height,
@@ -135,8 +152,15 @@ public:
             assert(m_surface && "Failed to create WebGPU surface");
 
             WGPURequestAdapterOptions options = {
+                .powerPreference =
+                    strcmp(m_options.gpuNameFilter, "i") == 0 ||
+                            strcmp(m_options.gpuNameFilter, "integrated") == 0
+                        ? WGPUPowerPreference_LowPower
+                        : WGPUPowerPreference_HighPerformance,
+                // If desired, this is where we can select different backends
+                // for testing purposes.
+                // .backendType = WGPUBackendType_Vulkan,
                 .compatibleSurface = m_surface.Get(),
-                .powerPreference = WGPUPowerPreference_HighPerformance,
             };
 
             WGPUAdapter adapter = nullptr;
@@ -159,7 +183,43 @@ public:
 
             WGPUAdapterInfo info = {0};
             wgpuAdapterGetInfo(m_adapter.Get(), &info);
-            printf("WebGPU GPU: %s\n", info.description.data);
+            const char* backendName = "Unknown";
+            switch (info.backendType)
+            {
+                case WGPUBackendType_D3D11:
+                    backendName = "D3D11";
+                    break;
+                case WGPUBackendType_D3D12:
+                    backendName = "D3D12";
+                    break;
+                case WGPUBackendType_Metal:
+                    backendName = "Metal";
+                    break;
+                case WGPUBackendType_Vulkan:
+                    backendName = "Vulkan";
+                    break;
+                case WGPUBackendType_OpenGL:
+                    backendName = "OpenGL";
+                    break;
+                case WGPUBackendType_OpenGLES:
+                    backendName = "OpenGLES";
+                    break;
+                default:
+                    break;
+            }
+            if (info.description.length == WGPU_STRLEN)
+            {
+                printf("=== Dawn GPU (%s): %s ===\n",
+                       backendName,
+                       info.description.data);
+            }
+            else
+            {
+                printf("=== Dawn GPU (%s): %.*s ===\n",
+                       backendName,
+                       (int)info.description.length,
+                       info.description.data);
+            }
 #if 0
             const char* adapter_types[] = {
                 [WGPUAdapterType_DiscreteGPU] = "Discrete GPU",
@@ -205,16 +265,22 @@ public:
             // color supported.limits.maxVertexBufferArrayStride =
             // kVertexStride; supported.limits.maxColorAttachments = 1;
 
-            WGPUDeviceDescriptor deviceDesc = {
-                // notify on errors
-                .uncapturedErrorCallbackInfo = {.callback = &on_device_error},
+            std::vector<WGPUFeatureName> requiredFeatures;
+            if (m_adapter.HasFeature(wgpu::FeatureName::ClipDistances))
+            {
+                requiredFeatures.push_back(WGPUFeatureName_ClipDistances);
+            }
 
+            WGPUDeviceDescriptor deviceDesc = {
                 // extra features:
                 // https://dawn.googlesource.com/dawn/+/refs/heads/main/src/dawn/native/Features.cpp
-                //.requiredFeaturesCount = n
-                //.requiredFeatures = (WGPUFeatureName[]) { ... }
+                .requiredFeatureCount = requiredFeatures.size(),
+                .requiredFeatures = requiredFeatures.data(),
                 //.requiredLimits = &(WGPURequiredLimits) { .limits =
                 // supported.limits },
+
+                // notify on errors
+                .uncapturedErrorCallbackInfo = {.callback = &on_device_error},
             };
 
             m_device = wgpu::Device::Acquire(
@@ -241,8 +307,9 @@ public:
         WGPUSurfaceConfiguration surfaceConfig = {
             .device = m_device.Get(),
             .format = SWAPCHAIN_FORMAT,
-            .usage =
-                WGPUTextureUsage_CopySrc | WGPUTextureUsage_RenderAttachment,
+            .usage = WGPUTextureUsage_CopySrc |
+                     WGPUTextureUsage_RenderAttachment |
+                     WGPUTextureUsage_TextureBinding,
             // .alphaMode = WGPUCompositeAlphaMode_Premultiplied,
             .width = static_cast<uint32_t>(width),
             .height = static_cast<uint32_t>(height),
@@ -281,8 +348,9 @@ public:
             .baseArrayLayer = 0,
             .arrayLayerCount = 1,
             .aspect = WGPUTextureAspect_All,
-            .usage =
-                WGPUTextureUsage_CopySrc | WGPUTextureUsage_RenderAttachment,
+            .usage = WGPUTextureUsage_CopySrc |
+                     WGPUTextureUsage_RenderAttachment |
+                     WGPUTextureUsage_TextureBinding,
         };
         m_currentSurfaceTextureView =
             wgpuTextureCreateView(m_currentSurfaceTexture.texture,
@@ -411,6 +479,7 @@ private:
     wgpu::Adapter m_adapter = nullptr;
     wgpu::Device m_device = nullptr;
     wgpu::Queue m_queue = nullptr;
+    wgpu::CommandEncoder m_commandEncoder = nullptr;
     bool m_surfaceIsConfigured = false;
 
     WGPUSurfaceTexture m_currentSurfaceTexture = {};

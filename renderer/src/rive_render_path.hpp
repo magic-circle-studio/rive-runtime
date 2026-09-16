@@ -6,9 +6,16 @@
 
 #include "rive/math/raw_path.hpp"
 #include "rive/renderer.hpp"
+#include "rive/renderer/trivial_block_allocator.hpp"
+
+#include <memory>
+#include <optional>
 
 namespace rive
 {
+class GrInnerFanTriangulator;
+struct StrokeParams;
+
 // RenderPath implementation for Rive's pixel local storage renderer.
 class RiveRenderPath : public LITE_RTTI_OVERRIDE(RenderPath, RiveRenderPath)
 {
@@ -29,8 +36,8 @@ public:
     {
         addRenderPath(p->renderPath(), m);
     }
-    void addRenderPath(RenderPath* path, const Mat2D& matrix) override;
-    void addRenderPathBackwards(RenderPath* path,
+    void addRenderPath(const RenderPath* path, const Mat2D& matrix) override;
+    void addRenderPathBackwards(const RenderPath* path,
                                 const Mat2D& transform) override;
     void addRawPath(const RawPath& path) override;
     const RawPath& getRawPath() const { return m_rawPath; }
@@ -44,6 +51,42 @@ public:
     // Determine if the path's signed, post-transform area is positive.
     bool isClockwiseDominant(const Mat2D& viewMatrix) const;
     uint64_t getRawPathMutationID() const;
+
+    // Returns this path's cached triangulation, or null if it doesn't have one
+    // for its current geometry.
+    // NOTE: An inner-fan triangulation of this path is transform- and
+    // fill-rule-independent (both are applied when its output is emitted), so
+    // one instance serves every draw and transform.
+    GrInnerFanTriangulator* cachedTriangulator() const;
+
+    // Builds a triangulation.
+    //
+    // Generational: the first sighting for a given geometry builds it in
+    // 'perFrameAllocator', where it dies with the frame, so a path that mutates
+    // every frame is never charged for retaining a triangulation it can't
+    // reuse. Only on the second sighting does the path allocate persistent
+    // storage of its own and cache the triangulator.
+    //
+    // Costs real CPU time, so callers gate this; see cachedTriangulator().
+    GrInnerFanTriangulator* createTriangulator(
+        TrivialBlockAllocator& perFrameAllocator) const;
+
+    bool hasSurfaceMaterialBinding() const
+    {
+        return m_hasSurfaceMaterialBinding;
+    }
+    const Mat2D& surfaceMaterialLocalToUV() const
+    {
+        return m_surfaceMaterialLocalToUV;
+    }
+    void captureSurfaceMaterialBinding(const Mat2D& localToUV)
+    {
+        if (!m_hasSurfaceMaterialBinding)
+        {
+            m_surfaceMaterialLocalToUV = localToUV;
+            m_hasSurfaceMaterialBinding = true;
+        }
+    }
 
     // 1-dimensional feathering along the normal vector quits looking like a
     // blur when there is strong curvature. This method returns a copy of the
@@ -65,12 +108,32 @@ public:
     }
 #endif
 
+    static float calculateBoundsOutset(const std::optional<StrokeParams>&,
+                                       float feather);
+
+    IAABB calculatePixelBounds(const Mat2D& matrix,
+                               const std::optional<StrokeParams>& strokeParams,
+                               float feather) const;
+
 private:
     FillRule m_fillRule = FillRule::nonZero;
     RawPath m_rawPath;
     mutable AABB m_bounds;
     mutable float m_coarseArea;
     mutable uint64_t m_rawPathMutationID;
+    Mat2D m_surfaceMaterialLocalToUV;
+    bool m_hasSurfaceMaterialBinding = false;
+
+    // Cached inner-fan triangulation, in a dedicated allocator so it outlives
+    // any single frame. Allocated only once a path has been asked to
+    // triangulate the same geometry twice; invalidated when
+    // m_rawPathMutationID changes. See createTriangulator().
+    mutable std::unique_ptr<TrivialBlockAllocator> m_triangulatorAllocator;
+    mutable GrInnerFanTriangulator* m_cachedTriangulator = nullptr;
+    mutable uint64_t m_cachedTriangulatorMutationID = 0;
+    // Geometry seen once, but not yet a second time, so not cached yet.
+    // Mutation IDs start at 1, so 0 means "nothing seen".
+    mutable uint64_t m_triangulatorFirstSightingMutationID = 0;
 
     enum Dirt
     {

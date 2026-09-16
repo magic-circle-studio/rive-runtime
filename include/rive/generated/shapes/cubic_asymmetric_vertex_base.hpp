@@ -49,8 +49,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(rotationPropertyKey, &m_Rotation, &value);
         m_Rotation = value;
-        rotationChanged();
+        RIVE_EDITOR_CHANGED(rotationChanged());
+        notifyPropertyChanged(rotationPropertyKey);
     }
 
     inline float inDistance() const { return m_InDistance; }
@@ -60,8 +62,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(inDistancePropertyKey, &m_InDistance, &value);
         m_InDistance = value;
-        inDistanceChanged();
+        RIVE_EDITOR_CHANGED(inDistanceChanged());
+        notifyPropertyChanged(inDistancePropertyKey);
     }
 
     inline float outDistance() const { return m_OutDistance; }
@@ -71,8 +75,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(outDistancePropertyKey, &m_OutDistance, &value);
         m_OutDistance = value;
-        outDistanceChanged();
+        RIVE_EDITOR_CHANGED(outDistanceChanged());
+        notifyPropertyChanged(outDistancePropertyKey);
     }
 
     Core* clone() const override;
@@ -105,6 +111,9 @@ protected:
     virtual void rotationChanged() {}
     virtual void inDistanceChanged() {}
     virtual void outDistanceChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/cubic_asymmetric_vertex_ext.inl"
+#endif
 };
 } // namespace rive
 

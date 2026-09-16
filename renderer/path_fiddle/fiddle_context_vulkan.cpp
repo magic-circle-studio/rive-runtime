@@ -124,6 +124,35 @@ public:
         return m_renderTarget.get();
     }
 
+    void* getCommandBuffer() override
+    {
+        return m_swapchain->currentCommandBuffer();
+    }
+
+    void beginOreFrame(rive::ore::Context* oreContext) override
+    {
+        if (!m_swapchain->isFrameStarted())
+        {
+            VK_ABORT_ON_FAIL(m_swapchain->beginFrame());
+
+            m_renderTarget->setTargetImageView(
+                m_swapchain->currentVkImageView(),
+                m_swapchain->currentVkImage(),
+                m_swapchain->currentLastAccess());
+        }
+
+        oreContext->beginFrame(
+            {.externalCommandBuffer = m_swapchain->currentCommandBuffer(),
+             .safeFrameNumber = m_swapchain->safeFrameNumber(),
+             .currentFrameNumber = m_swapchain->currentFrameNumber()});
+    }
+    void endOreFrame(rive::ore::Context* oreContext) override
+    {
+        FiddleContext::endOreFrame(oreContext);
+        auto lastAccess = m_renderTarget->targetLastAccess();
+        VK_ABORT_ON_FAIL(m_swapchain->endFrame(lastAccess));
+    }
+
     void onSizeChanged(GLFWwindow* window,
                        int width,
                        int height,
@@ -143,17 +172,17 @@ public:
                                   nullptr);
         }
 
-        VK_CHECK(glfwCreateWindowSurface(m_instance->vkInstance(),
-                                         window,
-                                         nullptr,
-                                         &m_windowSurface));
+        VK_ABORT_ON_FAIL(glfwCreateWindowSurface(m_instance->vkInstance(),
+                                                 window,
+                                                 nullptr,
+                                                 &m_windowSurface));
 
         auto vkGetPhysicalDeviceSurfaceCapabilitiesKHR =
             m_instance->loadInstanceFunc<
                 PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
                 "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
         VkSurfaceCapabilitiesKHR windowCapabilities{};
-        VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        VK_ABORT_ON_FAIL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
             m_device->vkPhysicalDevice(),
             m_windowSurface,
             &windowCapabilities));
@@ -213,6 +242,13 @@ public:
                                                         swapOpts);
         assert(m_swapchain != nullptr);
 
+        // Enable canvas pre-pass support
+        // (makeCommandBuffer/commitCommandBuffer) by providing a command queue
+        // for canvas rendering.
+        renderContextVulkanImpl()->setCanvasQueue(
+            m_swapchain->graphicsQueue(),
+            m_device->graphicsQueueFamilyIndex());
+
         m_renderTarget = renderContextVulkanImpl()->makeRenderTarget(
             width,
             height,
@@ -247,7 +283,7 @@ public:
     {
         if (!m_swapchain->isFrameStarted())
         {
-            VK_CHECK(m_swapchain->beginFrame());
+            VK_ABORT_ON_FAIL(m_swapchain->beginFrame());
 
             m_renderTarget->setTargetImageView(
                 m_swapchain->currentVkImageView(),
@@ -277,11 +313,12 @@ public:
                 rive::IAABB::MakeWH(m_renderTarget->width(),
                                     m_renderTarget->height()));
         }
-        VK_CHECK(m_swapchain->endFrame(lastAccess));
+        VK_ABORT_ON_FAIL(m_swapchain->endFrame(lastAccess));
 
         if (pixelData != nullptr)
         {
-            VK_CHECK(m_swapchain->getPixelsFromLastImageCopy(pixelData));
+            VK_ABORT_ON_FAIL(
+                m_swapchain->getPixelsFromLastImageCopy(pixelData));
         }
     }
 

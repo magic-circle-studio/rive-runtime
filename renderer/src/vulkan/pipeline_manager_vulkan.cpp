@@ -2,6 +2,7 @@
  * Copyright 2025 Rive
  */
 
+#include "rive/math/bitwise.hpp"
 #include "rive/renderer/vulkan/render_context_vulkan_impl.hpp"
 #include "shaders/constants.glsl"
 #include "draw_pipeline_layout_vulkan.hpp"
@@ -49,10 +50,26 @@ static VkFilter vk_filter(rive::ImageFilter option)
     RIVE_UNREACHABLE();
 }
 
+std::unique_ptr<PipelineManagerVulkan> PipelineManagerVulkan::make(
+    rcp<VulkanContext> vk,
+    ShaderCompilationMode mode,
+    VkImageView nullTextureView)
+{
+    std::unique_ptr<PipelineManagerVulkan> pipelineManager(
+        new PipelineManagerVulkan(std::move(vk), mode));
+    if (!pipelineManager->init(nullTextureView))
+    {
+        return nullptr;
+    }
+    return pipelineManager;
+}
+
 PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
-                                             ShaderCompilationMode mode,
-                                             VkImageView nullTextureView) :
-    Super(mode), m_vk(std::move(vk)), m_atlasFormat(VK_FORMAT_R16_SFLOAT)
+                                             ShaderCompilationMode mode) :
+    Super(mode), m_vk(std::move(vk)), m_featherAtlasFormat(VK_FORMAT_R16_SFLOAT)
+{}
+
+bool PipelineManagerVulkan::init(VkImageView nullTextureView)
 {
     // Create the immutable samplers.
     VkSamplerCreateInfo linearSamplerCreateInfo = {
@@ -66,10 +83,12 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .maxLod = 0,
     };
 
-    VK_CHECK(m_vk->CreateSampler(m_vk->device,
-                                 &linearSamplerCreateInfo,
-                                 nullptr,
-                                 &m_linearSampler));
+    m_linearSampler =
+        VK_CREATE_HANDLE(m_vk, CreateSampler, &linearSamplerCreateInfo);
+    if (m_linearSampler == VK_NULL_HANDLE)
+    {
+        return false;
+    }
 
     for (size_t i = 0; i < ImageSampler::MAX_SAMPLER_PERMUTATIONS; ++i)
     {
@@ -89,10 +108,12 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
             .maxLod = VK_LOD_CLAMP_NONE,
         };
 
-        VK_CHECK(m_vk->CreateSampler(m_vk->device,
-                                     &samplerCreateInfo,
-                                     nullptr,
-                                     m_imageSamplers + i));
+        m_imageSamplers[i] =
+            VK_CREATE_HANDLE(m_vk, CreateSampler, &samplerCreateInfo);
+        if (m_imageSamplers[i] == VK_NULL_HANDLE)
+        {
+            return false;
+        }
     }
 
     // All pipelines share the same perFlush bindings.
@@ -100,13 +121,6 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         {
             .binding = FLUSH_UNIFORM_BUFFER_IDX,
             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags =
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        {
-            .binding = IMAGE_DRAW_UNIFORM_BUFFER_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
             .descriptorCount = 1,
             .stageFlags =
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -151,22 +165,25 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         },
         {
             .binding = GRAD_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = &m_linearSampler,
         },
         {
-            .binding = FEATHER_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .binding = GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1,
             .stageFlags =
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = &m_linearSampler,
         },
         {
-            .binding = ATLAS_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .binding = FEATHER_ATLAS_TEXTURE_IDX,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .pImmutableSamplers = &m_linearSampler,
         },
     };
 
@@ -176,22 +193,18 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .pBindings = perFlushLayoutBindings,
     };
 
-    VK_CHECK(m_vk->CreateDescriptorSetLayout(m_vk->device,
-                                             &perFlushLayoutInfo,
-                                             nullptr,
-                                             &m_perFlushDescriptorSetLayout));
+    m_perFlushDescriptorSetLayout =
+        VK_CREATE_HANDLE(m_vk, CreateDescriptorSetLayout, &perFlushLayoutInfo);
+    if (m_perFlushDescriptorSetLayout == VK_NULL_HANDLE)
+    {
+        return false;
+    }
 
     // The imageTexture gets updated with every draw that uses it.
     VkDescriptorSetLayoutBinding perDrawLayoutBindings[] = {
         {
             .binding = IMAGE_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-        },
-        {
-            .binding = IMAGE_SAMPLER_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1,
             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
         },
@@ -203,48 +216,12 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .pBindings = perDrawLayoutBindings,
     };
 
-    VK_CHECK(m_vk->CreateDescriptorSetLayout(m_vk->device,
-                                             &perDrawLayoutInfo,
-                                             nullptr,
-                                             &m_perDrawDescriptorSetLayout));
-
-    // Every shader uses the same immutable sampler layout.
-    VkDescriptorSetLayoutBinding immutableSamplerLayoutBindings[] = {
-        {
-            .binding = GRAD_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .pImmutableSamplers = &m_linearSampler,
-        },
-        {
-            .binding = FEATHER_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags =
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            .pImmutableSamplers = &m_linearSampler,
-        },
-        {
-            .binding = ATLAS_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-            .descriptorCount = 1,
-            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .pImmutableSamplers = &m_linearSampler,
-        },
-    };
-
-    VkDescriptorSetLayoutCreateInfo immutableSamplerLayoutInfo = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = std::size(immutableSamplerLayoutBindings),
-        .pBindings = immutableSamplerLayoutBindings,
-    };
-
-    VK_CHECK(m_vk->CreateDescriptorSetLayout(
-        m_vk->device,
-        &immutableSamplerLayoutInfo,
-        nullptr,
-        &m_immutableSamplerDescriptorSetLayout));
+    m_perDrawDescriptorSetLayout =
+        VK_CREATE_HANDLE(m_vk, CreateDescriptorSetLayout, &perDrawLayoutInfo);
+    if (m_perDrawDescriptorSetLayout == VK_NULL_HANDLE)
+    {
+        return false;
+    }
 
     // For when a set isn't used at all by a shader.
     VkDescriptorSetLayoutCreateInfo emptyLayoutInfo = {
@@ -252,20 +229,18 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .bindingCount = 0,
     };
 
-    VK_CHECK(m_vk->CreateDescriptorSetLayout(m_vk->device,
-                                             &emptyLayoutInfo,
-                                             nullptr,
-                                             &m_emptyDescriptorSetLayout));
+    m_emptyDescriptorSetLayout =
+        VK_CREATE_HANDLE(m_vk, CreateDescriptorSetLayout, &emptyLayoutInfo);
+    if (m_emptyDescriptorSetLayout == VK_NULL_HANDLE)
+    {
+        return false;
+    }
 
     // Create static descriptor sets.
     VkDescriptorPoolSize staticDescriptorPoolSizes[] = {
         {
-            .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             .descriptorCount = 1, // m_nullImageTexture
-        },
-        {
-            .type = VK_DESCRIPTOR_TYPE_SAMPLER,
-            .descriptorCount = 4, // grad, feather, atlas, image samplers
         },
     };
 
@@ -277,10 +252,13 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .pPoolSizes = staticDescriptorPoolSizes,
     };
 
-    VK_CHECK(m_vk->CreateDescriptorPool(m_vk->device,
-                                        &staticDescriptorPoolCreateInfo,
-                                        nullptr,
-                                        &m_staticDescriptorPool));
+    m_staticDescriptorPool = VK_CREATE_HANDLE(m_vk,
+                                              CreateDescriptorPool,
+                                              &staticDescriptorPoolCreateInfo);
+    if (m_staticDescriptorPool == VK_NULL_HANDLE)
+    {
+        return false;
+    }
 
     // Create a descriptor set to bind m_nullImageTexture when there is no image
     // paint.
@@ -291,55 +269,35 @@ PipelineManagerVulkan::PipelineManagerVulkan(rcp<VulkanContext> vk,
         .pSetLayouts = &m_perDrawDescriptorSetLayout,
     };
 
-    VK_CHECK(m_vk->AllocateDescriptorSets(m_vk->device,
-                                          &nullImageDescriptorSetInfo,
-                                          &m_nullImageDescriptorSet));
+    VK_RETURN_FALSE_ON_FAIL(
+        m_vk->AllocateDescriptorSets(m_vk->device,
+                                     &nullImageDescriptorSetInfo,
+                                     &m_nullImageDescriptorSet));
 
     m_vk->updateImageDescriptorSets(
         m_nullImageDescriptorSet,
         {
             .dstBinding = IMAGE_TEXTURE_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         },
         {{
+            .sampler = m_imageSamplers[ImageSampler::LINEAR_CLAMP_SAMPLER_KEY],
             .imageView = nullTextureView,
             .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         }});
 
-    m_vk->updateImageDescriptorSets(
-        m_nullImageDescriptorSet,
-        {
-            .dstBinding = IMAGE_SAMPLER_IDX,
-            .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-        },
-        {{
-            .sampler = m_imageSamplers[ImageSampler::LINEAR_CLAMP_SAMPLER_KEY],
-        }});
-
-    // Create an empty descriptor set for IMMUTABLE_SAMPLER_BINDINGS_SET. Vulkan
-    // requires this even though the samplers are all immutable.
-    VkDescriptorSetAllocateInfo immutableSamplerDescriptorSetInfo = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = m_staticDescriptorPool,
-        .descriptorSetCount = 1,
-        .pSetLayouts = &m_immutableSamplerDescriptorSetLayout,
-    };
-
-    VK_CHECK(m_vk->AllocateDescriptorSets(m_vk->device,
-                                          &immutableSamplerDescriptorSetInfo,
-                                          &m_immutableSamplerDescriptorSet));
+    return true;
 }
 
 PipelineManagerVulkan::~PipelineManagerVulkan()
 {
+    shutdownBackgroundThread();
+
     m_vk->DestroyDescriptorSetLayout(m_vk->device,
                                      m_perFlushDescriptorSetLayout,
                                      nullptr);
     m_vk->DestroyDescriptorSetLayout(m_vk->device,
                                      m_perDrawDescriptorSetLayout,
-                                     nullptr);
-    m_vk->DestroyDescriptorSetLayout(m_vk->device,
-                                     m_immutableSamplerDescriptorSetLayout,
                                      nullptr);
     m_vk->DestroyDescriptorSetLayout(m_vk->device,
                                      m_emptyDescriptorSetLayout,
@@ -425,18 +383,27 @@ RenderPassVulkan& PipelineManagerVulkan::getRenderPassSynchronous(
 std::unique_ptr<DrawPipelineVulkan> PipelineManagerVulkan::createPipeline(
     PipelineCreateType createType,
     uint64_t key,
-    const PipelineProps& props)
+    const PipelineProps& props,
+    const PlatformFeatures& platformFeatures)
 {
+    if (createType == PipelineCreateType::async)
+    {
+        this->queueBackgroundJob(key, props, platformFeatures);
+        return nullptr;
+    }
+
     auto& renderPass = getRenderPassSynchronous(props.interlockMode,
                                                 props.renderPassOptions,
                                                 props.renderTargetFormat,
                                                 props.colorLoadAction);
 
+    assert(createType == PipelineCreateType::sync);
     return std::make_unique<DrawPipelineVulkan>(
         this,
         *renderPass.drawPipelineLayout(),
         props,
-        renderPass
+        renderPass,
+        platformFeatures
 #ifdef WITH_RIVE_TOOLS
         ,
         props.synthesizedFailureType
@@ -456,4 +423,291 @@ void PipelineManagerVulkan::clearCacheInternal()
     m_drawPipelineLayouts.clear();
     m_renderPasses.clear();
 }
+
+static Span<const BlendMode> get_relevant_blend_modes_for_pipeline_creation(
+    InterlockMode interlockMode,
+    DrawType drawType,
+    ShaderMiscFlags miscFlags,
+    DrawContents drawContents,
+    const PlatformFeatures& platformFeatures)
+{
+    constexpr BlendMode SRC_OVER_ONLY[] = {BlendMode::srcOver};
+
+    switch (interlockMode)
+    {
+        case InterlockMode::rasterOrdering:
+        case InterlockMode::atomics:
+        case InterlockMode::clockwise:
+        case InterlockMode::clockwiseAtomic:
+            return make_span(SRC_OVER_ONLY);
+
+        case InterlockMode::depthStencil:
+            // If this assert ever fires (i.e. if we ever support GPU fixed-
+            // function advanced blend in Vulkan), we'll need to return a list
+            // of all blend modes instead of just srcOver.
+            assert(
+                enums::is_flag_set(drawContents, DrawContents::opaquePaint) ||
+                !platformFeatures.supportsBlendAdvancedKHR);
+            return make_span(SRC_OVER_ONLY);
+    }
+
+    RIVE_UNREACHABLE();
+}
+
+void PipelineManagerVulkan::forEachUbershaderPermutation(
+    InterlockMode interlockMode,
+    VkFormat renderTargetFormat,
+    VkImageUsageFlags renderTargetUsage,
+    LoadAction colorLoadAction,
+    DrawPipelineVulkan::Options drawPipelineOptions,
+    const PlatformFeatures& platformFeatures,
+    const std::function<bool(const PipelineProps&)>& func)
+{
+    ForEachUbershaderPermutation(
+        interlockMode,
+        platformFeatures,
+        [&](DrawType drawType,
+            ShaderFeatures shaderFeatures,
+            ShaderMiscFlags shaderMiscFlags) {
+            PipelineProps props{
+                .drawType = drawType,
+                .shaderFeatures = shaderFeatures,
+                .interlockMode = interlockMode,
+                .shaderMiscFlags = shaderMiscFlags,
+                .drawPipelineOptions = drawPipelineOptions,
+                .renderTargetFormat = renderTargetFormat,
+                .colorLoadAction = colorLoadAction,
+            };
+
+            // only depthStencil has draw contents options that are relevant to
+            // pipeline creation
+            const auto validDrawContents =
+                (interlockMode == InterlockMode::depthStencil)
+                    ? DrawContentsForDepthStencilPipelineState
+                    : DrawContents::none;
+
+            RenderPassOptionsVulkan fixedPassOptions =
+                RenderPassOptionsVulkan::none;
+
+            if (interlockMode != InterlockMode::clockwiseAtomic &&
+                interlockMode != InterlockMode::depthStencil &&
+                enums::is_flag_set(shaderMiscFlags,
+                                   ShaderMiscFlags::fixedFunctionColorOutput))
+            {
+                // In non-clockwiseAtomic mode, the render pass
+                // fixedFunctionColorOutput should match the one in
+                // shaderMiscFlags
+                fixedPassOptions |=
+                    RenderPassOptionsVulkan::fixedFunctionColorOutput;
+            }
+
+            RenderPassOptionsVulkan validPassOptions =
+                RenderPassOptionsVulkan::none;
+
+            switch (interlockMode)
+            {
+                case InterlockMode::rasterOrdering:
+                    validPassOptions |=
+                        RenderPassOptionsVulkan::manuallyResolved |
+                        RenderPassOptionsVulkan::rasterOrderingInterruptible |
+                        RenderPassOptionsVulkan::rasterOrderingResume;
+                    break;
+                case InterlockMode::atomics:
+                    if (!(renderTargetUsage &
+                          VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+                        !enums::is_flag_set(
+                            shaderMiscFlags,
+                            ShaderMiscFlags::fixedFunctionColorOutput))
+                    {
+                        fixedPassOptions |= RenderPassOptionsVulkan::
+                            atomicCoalescedResolveAndTransfer;
+                    }
+                    break;
+                case InterlockMode::clockwise:
+                    // no additional options
+                    break;
+                case InterlockMode::clockwiseAtomic:
+#ifdef WITH_VULKAN_ATOMICS
+                    // Clockwise atomic render passes are allowed to (not) have
+                    // this flag even if the shader has it specified (a shader
+                    // is allowed to say "I don't read from the framebuffer"
+                    // even if something else in the pipleine does)
+                    if (enums::is_flag_set(
+                            shaderMiscFlags,
+                            ShaderMiscFlags::fixedFunctionColorOutput))
+                    {
+                        validPassOptions |=
+                            RenderPassOptionsVulkan::fixedFunctionColorOutput;
+                    }
+                    break;
+#else
+                    RIVE_UNREACHABLE();
+#endif
+
+                case InterlockMode::depthStencil:
+                    validPassOptions |=
+                        RenderPassOptionsVulkan::manuallyResolved |
+                        RenderPassOptionsVulkan::msaaSeedFromOffscreenTexture |
+                        RenderPassOptionsVulkan::msaa;
+
+                    if (enums::is_flag_set(
+                            shaderMiscFlags,
+                            ShaderMiscFlags::fixedFunctionColorOutput))
+                    {
+                        // Like clockwiseAtomic, depthStencil render passes are
+                        // allowed to not have this flag even if a specific
+                        // shader specifies it.
+                        validPassOptions |=
+                            RenderPassOptionsVulkan::fixedFunctionColorOutput;
+                    }
+                    break;
+            }
+
+            for (auto drawContents :
+                 math::iterate_bit_combinations_in_mask(validDrawContents))
+            {
+                const auto stencilInfo =
+                    get_stencil_info(interlockMode, drawType, drawContents);
+                if (!stencilInfo.areDrawContentsValid)
+                {
+                    continue;
+                }
+
+                props.drawContents = drawContents;
+                for (auto variableRenderPassOptions :
+                     math::iterate_bit_combinations_in_mask(validPassOptions))
+                {
+                    props.renderPassOptions =
+                        variableRenderPassOptions | fixedPassOptions;
+                    if (enums::is_flag_set(
+                            props.renderPassOptions,
+                            RenderPassOptionsVulkan::manuallyResolved) &&
+                        enums::any_flag_set(
+                            props.renderPassOptions,
+                            RenderPassOptionsVulkan::fixedFunctionColorOutput |
+                                RenderPassOptionsVulkan::
+                                    rasterOrderingInterruptible))
+                    {
+                        // manuallyResolved and these other flags are mutually
+                        // exclusive
+                        continue;
+                    }
+
+                    if (interlockMode == InterlockMode::depthStencil)
+                    {
+                        if (enums::is_flag_set(
+                                props.renderPassOptions,
+                                RenderPassOptionsVulkan::
+                                    msaaSeedFromOffscreenTexture) &&
+                            !enums::is_flag_set(props.renderPassOptions,
+                                                RenderPassOptionsVulkan::msaa))
+                        {
+                            // Single-sampled preserves via
+                            // VK_ATTACHMENT_LOAD_OP_LOAD, so
+                            // msaaSeedFromOffscreenTexture is invalid.
+                            continue;
+                        }
+                    }
+
+                    if (enums::is_flag_set(
+                            props.renderPassOptions,
+                            RenderPassOptionsVulkan::
+                                atomicCoalescedResolveAndTransfer))
+                    {
+                        if (enums::is_flag_set(props.renderPassOptions,
+                                               RenderPassOptionsVulkan::
+                                                   fixedFunctionColorOutput))
+                        {
+                            // atomicCoalescedResolveAndTransfer should never be
+                            // set when fixedFunctionColorOutput is set.
+                            continue;
+                        }
+
+                        if (drawType == DrawType::renderPassResolve &&
+                            !enums::is_flag_set(
+                                props.shaderMiscFlags,
+                                ShaderMiscFlags::coalescedResolveAndTransfer))
+                        {
+                            // ShaderMiscFlags::coalescedResolveAndTransfer will
+                            // never be set if atomicCoalescedResolveAndTransfer
+                            // is not set on the render pass
+                            continue;
+                        }
+                    }
+
+                    auto blendModes =
+                        get_relevant_blend_modes_for_pipeline_creation(
+                            interlockMode,
+                            drawType,
+                            shaderMiscFlags,
+                            props.drawContents,
+                            platformFeatures);
+                    for (auto blendMode : blendModes)
+                    {
+                        props.blendMode = blendMode;
+                        if (!func(props))
+                        {
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        });
+}
+
+#if !defined(NDEBUG)
+bool PipelineManagerVulkan::isValidUbershaderPipelineProps(
+    const PipelineProps& props,
+    const PlatformFeatures& platformFeatures)
+{
+    bool found = false;
+    auto curKey = props.createKey(platformFeatures);
+
+    forEachUbershaderPermutation(
+        props.interlockMode,
+        props.renderTargetFormat,
+        enums::is_flag_set(
+            props.renderPassOptions,
+            RenderPassOptionsVulkan::atomicCoalescedResolveAndTransfer)
+            ? VkImageUsageFlagBits(0)
+            : VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT,
+        props.colorLoadAction,
+        props.drawPipelineOptions,
+        platformFeatures,
+        [&found, curKey, &platformFeatures](const PipelineProps& validProps) {
+            auto testKey = validProps.createKey(platformFeatures);
+            if (testKey == curKey)
+            {
+                found = true;
+            }
+
+            return !found; // Keep iterating if not found.
+        });
+
+    return found;
+}
+#endif
+
+void PipelineManagerVulkan::queueUbershaderPipelineCreation(
+    InterlockMode interlockMode,
+    VkFormat renderTargetFormat,
+    VkImageUsageFlags renderTargetUsage,
+    LoadAction colorLoadAction,
+    const PlatformFeatures& platformFeatures)
+{
+    forEachUbershaderPermutation(
+        interlockMode,
+        renderTargetFormat,
+        renderTargetUsage,
+        colorLoadAction,
+        DrawPipelineVulkan::Options::none,
+        platformFeatures,
+        [this, &platformFeatures](const PipelineProps& props) {
+            queuePipelineIfNotFound(props, platformFeatures);
+            return true;
+        });
+}
+
 } // namespace rive::gpu

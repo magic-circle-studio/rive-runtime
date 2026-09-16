@@ -3,6 +3,7 @@
  */
 
 #include "rive/renderer/gl/gl_utils.hpp"
+#include "rive/rive_types.hpp"
 #include "rive/shapes/paint/image_sampler.hpp"
 
 #include <stdio.h>
@@ -11,6 +12,13 @@
 #include <vector>
 
 #include "generated/shaders/glsl.glsl.hpp"
+
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+#include <atomic>
+#include <mutex>
+#include <unordered_map>
+#include <emscripten/html5.h>
+#endif
 
 #ifdef BYPASS_EMSCRIPTEN_SHADER_PARSER
 #include <emscripten/emscripten.h>
@@ -31,6 +39,137 @@ EM_JS(void,
 
 namespace glutils
 {
+static void delete_name(GLObjectType type, GLuint id)
+{
+    switch (type)
+    {
+        case GLObjectType::buffer:
+            glDeleteBuffers(1, &id);
+            return;
+        case GLObjectType::texture:
+            glDeleteTextures(1, &id);
+            return;
+        case GLObjectType::framebuffer:
+            glDeleteFramebuffers(1, &id);
+            return;
+        case GLObjectType::renderbuffer:
+            glDeleteRenderbuffers(1, &id);
+            return;
+        case GLObjectType::vertexArray:
+            glDeleteVertexArrays(1, &id);
+            return;
+        case GLObjectType::shader:
+            glDeleteShader(id);
+            return;
+        case GLObjectType::program:
+            glDeleteProgram(id);
+            return;
+    }
+    RIVE_UNREACHABLE();
+}
+
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+namespace
+{
+struct AbandonedName
+{
+    GLObjectType type;
+    GLuint id;
+};
+
+std::mutex g_abandonedMutex;
+std::unordered_map<GLContextID, std::vector<AbandonedName>> g_abandonedNames;
+std::atomic<uint32_t> g_abandonedCount{0};
+std::atomic<uint32_t> g_reclaimedCount{0};
+} // namespace
+
+GLContextID CurrentContextID()
+{
+    return static_cast<GLContextID>(emscripten_webgl_get_current_context());
+}
+
+static void abandon_name(GLObjectType type, GLuint id, GLContextID owner)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_abandonedMutex);
+        g_abandonedNames[owner].push_back({type, id});
+    }
+    g_abandonedCount.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReclaimAbandonedNames()
+{
+    if (g_abandonedCount.load(std::memory_order_acquire) ==
+        g_reclaimedCount.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+    std::vector<AbandonedName> mine;
+    {
+        std::lock_guard<std::mutex> lock(g_abandonedMutex);
+        auto it = g_abandonedNames.find(CurrentContextID());
+        if (it == g_abandonedNames.end())
+        {
+            return;
+        }
+        mine.swap(it->second);
+        g_abandonedNames.erase(it);
+    }
+    for (const AbandonedName& name : mine)
+    {
+        delete_name(name.type, name.id);
+    }
+    g_reclaimedCount.fetch_add(static_cast<uint32_t>(mine.size()),
+                               std::memory_order_release);
+}
+
+uint32_t AbandonedNameCount()
+{
+    return g_abandonedCount.load(std::memory_order_relaxed);
+}
+
+uint32_t ReclaimedNameCount()
+{
+    return g_reclaimedCount.load(std::memory_order_relaxed);
+}
+#endif
+
+void GLObject::destroy(GLObjectType type)
+{
+    if (m_id == 0)
+    {
+        return;
+    }
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+    if (m_context != CurrentContextID())
+    {
+        abandon_name(type, m_id, m_context);
+        m_id = 0;
+        return;
+    }
+#endif
+    delete_name(type, m_id);
+    m_id = 0;
+}
+
+void GLObject::adopt(GLObjectType type, GLObject&& rhs)
+{
+    destroy(type);
+    m_id = std::exchange(rhs.m_id, 0);
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+    m_context = rhs.m_context;
+#endif
+}
+
+void GLObject::adoptName(GLObjectType type, GLuint adoptedID)
+{
+    destroy(type);
+    m_id = adoptedID;
+#ifdef RIVE_GL_NAMES_ARE_PER_CONTEXT
+    m_context = CurrentContextID();
+#endif
+}
+
 void CompileAndAttachShader(GLuint program,
                             GLenum type,
                             const char* source,
@@ -119,10 +258,6 @@ GLuint CompileShader(GLuint type,
     {
         shaderSource << "#define " << GLSL_BASE_INSTANCE_UNIFORM_NAME << ' '
                      << BASE_INSTANCE_UNIFORM_NAME << '\n';
-    }
-    if (capabilities.needsFloatingPointTessellationTexture)
-    {
-        shaderSource << "#define " << GLSL_TESS_TEXTURE_FLOATING_POINT << '\n';
     }
     if (capabilities.isMali)
     {
@@ -242,17 +377,6 @@ void LinkProgram(GLuint program,
 #endif
 }
 
-void Program::reset(GLuint adoptedProgramID)
-{
-    m_fragmentShader.reset();
-    m_vertexShader.reset();
-    if (m_id != 0)
-    {
-        glDeleteProgram(m_id);
-    }
-    m_id = adoptedProgramID;
-}
-
 void Program::compileAndAttachShader(GLuint type,
                                      const char* defines[],
                                      size_t numDefines,
@@ -350,13 +474,14 @@ void SetTexture2DSamplingParams(rive::ImageSampler samplingParams)
 
 void BlitFramebuffer(rive::IAABB bounds,
                      uint32_t renderTargetHeight,
+                     bool bottomUp,
                      GLbitfield mask)
 {
-    // glBlitFramebuffer is oriented bottom-up.
+    // glBlitFramebuffer addresses rows from memory row 0.
     uint32_t l = bounds.left;
-    uint32_t b = renderTargetHeight - bounds.bottom;
+    uint32_t b = bottomUp ? renderTargetHeight - bounds.bottom : bounds.top;
     uint32_t r = bounds.right;
-    uint32_t t = renderTargetHeight - bounds.top;
+    uint32_t t = bottomUp ? renderTargetHeight - bounds.top : bounds.bottom;
     glBlitFramebuffer(l, b, r, t, l, b, r, t, mask, GL_NEAREST);
 }
 
@@ -369,35 +494,5 @@ void Uniform1iByName(GLuint programID, const char* name, GLint value)
     // performance reasons.
     assert(location != -1);
     glUniform1i(location, value);
-}
-
-// Setup a small test to verify that GL_PIXEL_LOCAL_FORMAT_ANGLE has the correct
-// value.
-bool validate_pixel_local_storage_angle()
-{
-#if defined(RIVE_DESKTOP_GL) || defined(RIVE_WEBGL)
-    glutils::Texture tex;
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
-
-    glutils::Framebuffer fbo;
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexturePixelLocalStorageANGLE(0, tex, 0, 0);
-
-    // Clear the error queue. (Should already be empty.)
-    while (GLenum err = glGetError())
-    {
-        fprintf(stderr, "WARNING: unhandled GL error 0x%x\n", err);
-    }
-
-    GLint format = GL_NONE;
-    glGetFramebufferPixelLocalStorageParameterivANGLE(
-        0,
-        GL_PIXEL_LOCAL_FORMAT_ANGLE,
-        &format);
-    return glGetError() == GL_NONE && format == GL_R32UI;
-#else
-    return false;
-#endif
 }
 } // namespace glutils

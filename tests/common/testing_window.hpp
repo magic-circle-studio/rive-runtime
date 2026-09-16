@@ -7,10 +7,30 @@
 
 #include "common/offscreen_render_target.hpp"
 #include "rive/renderer/gpu.hpp"
+#include "rive/renderer/shader_compilation_mode.hpp"
+#include "rive/renderer/triangulation_controller.hpp"
 #include "rive/refcnt.hpp"
+#include <limits>
 #include <memory>
 #include <vector>
 #include <string>
+
+// Every harness that compares rendered pixels against a baseline (gms,
+// goldens) must render deterministically, so none of them impose a frame-time
+// limit on triangulation: a path meant to exercise triangulation has to do so
+// on every run and machine. The guards still apply -- GMs can tune those per
+// test in updateFrameOptions().
+//
+// Every frame a harness opens has to use these, not just the ones that look
+// like they matter: goldens' immediate and deferred paths only produce
+// identical pixels if both do.
+//
+// Interactive tools (the player) deliberately don't use this; they want
+// production budgeting behavior.
+constexpr rive::gpu::TriangulationThresholds
+    DeterministicTriangulationThresholds = {
+        .frameBudgetMs = std::numeric_limits<float>::infinity(),
+};
 
 namespace rive
 {
@@ -58,10 +78,28 @@ public:
         angle,
         dawn,
         wgpu,
-        rhi,
+        external,
         coregraphics,
         skia,
+        canvas2d,
+        svg,
         null,
+        invalid,
+    };
+
+    enum class Target
+    {
+        host,
+        android,
+        ios,
+        iossim,
+        unreal,
+        unreal_android,
+        webbrowser,
+        webserver,
+        webbrowserandroid,
+        webserverandroid,
+        console,
     };
 
     enum class ANGLERenderer
@@ -77,12 +115,19 @@ public:
     {
         bool atomic = false;
         bool core = false;
-        bool msaa = false;
         bool srgb = false;
         bool clockwise = false;
         bool disableValidationLayers = false;
         bool disableDebugCallbacks = false;
         bool wantVulkanSynchronizationValidation = false;
+
+        //  0 => non-depthStencil mode (if supported; else 4x MSAA)
+        //  1 => depthStencil w/o MSAA
+        // >1 => depthStencil with MSAA
+        uint32_t msaaSampleCount = 0;
+
+        rive::gpu::ShaderCompilationMode shaderCompilationMode =
+            rive::gpu::ShaderCompilationMode::standard;
 
         ANGLERenderer angleRenderer =
 #ifdef __APPLE__
@@ -151,6 +196,7 @@ public:
 
     static const char* BackendName(Backend);
 
+    static Backend TryParseBackend(const char* name, BackendParams*);
     static Backend ParseBackend(const char* name, BackendParams*);
     static TestingWindow* Init(Backend,
                                const BackendParams&,
@@ -159,6 +205,13 @@ public:
     static TestingWindow* Get();
     static void Set(TestingWindow* inWindow);
     static void Destroy();
+    static Backend backend() { return s_Backend; }
+    static Target target() { return s_Target; }
+    static void SetTarget(Target target) { s_Target = target; }
+    static bool isUnreal()
+    {
+        return s_Target == Target::unreal || s_Target == Target::unreal_android;
+    }
 
     uint32_t width() const { return m_width; }
     uint32_t height() const { return m_height; }
@@ -175,6 +228,7 @@ public:
 
     struct FrameOptions
     {
+        const char* name;
         uint32_t clearColor;
         bool doClear = true;
         bool forceMSAA = false;
@@ -183,9 +237,12 @@ public:
         bool fillsDisabled = false;
         bool strokesDisabled = false;
         bool clockwiseFillOverride = false;
+        rive::gpu::TriangulationThresholds triangulationThresholds;
 #ifdef WITH_RIVE_TOOLS
         rive::gpu::SynthesizedFailureType synthesizedFailureType =
             rive::gpu::SynthesizedFailureType::none;
+        rive::gpu::ShaderCompilationMode shaderCompilationMode =
+            rive::gpu::ShaderCompilationMode::standard;
 #endif
     };
     virtual std::unique_ptr<rive::Renderer> beginFrame(const FrameOptions&) = 0;
@@ -228,6 +285,31 @@ public:
 
     virtual void hotloadShaders() {}
 
+#if defined(__APPLE__)
+    // Returns the Metal command queue as void* to avoid <Metal/Metal.h> in
+    // this cross-platform header (same pattern as externalCommandBuffer).
+    virtual void* metalQueue() const { return nullptr; }
+#endif
+
+#ifdef RIVE_VULKAN
+    // Vulkan accessors for ORE VK backend initialization in GMs.
+    virtual void* vulkanGraphicsQueue() const { return nullptr; }
+    virtual uint32_t vulkanGraphicsQueueFamilyIndex() const { return 0; }
+    virtual void* vulkanGetInstanceProcAddr() const { return nullptr; }
+#endif
+
+    // Returns the host's currently-recording command buffer (as
+    // void*) Returns nullptr on backends that don't use command buffers / lists
+    virtual void* getCurrentCommandBuffer() const { return nullptr; }
+
+    // Host-managed ore::Context, or nullptr. Player wires into the file's
+    // ScriptingContext for GPUCanvas content.
+    virtual void* getOreContext() const { return nullptr; }
+
+    // Per-frame ORE driving; no-op on non-ORE harnesses.
+    virtual void beginOreFrame() {}
+    virtual void endOreFrame() {}
+
     virtual ~TestingWindow() {}
 
     static TestingWindow* MakeEGL(Backend,
@@ -244,13 +326,22 @@ public:
     static TestingWindow* MakeVulkanTexture(const BackendParams&);
     static TestingWindow* MakeAndroidVulkan(const BackendParams&,
                                             void* platformWindow);
+    // Hook for platforms without rive_vk_bootstrap; default returns nullptr.
+    // Platform packages override in their own TU + define
+    // RIVE_PLATFORM_TESTING_WINDOW.
+    static TestingWindow* MakePlatformVulkan(const BackendParams&);
     static TestingWindow* MakeWGPU(const BackendParams&);
+    static TestingWindow* MakeSVG();
     static TestingWindow* MakeSkia();
+    static TestingWindow* MakeCanvas2D();
     static TestingWindow* MakeNULL();
 
 protected:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+
+    static Backend s_Backend;
+    static Target s_Target;
 };
 
 #endif

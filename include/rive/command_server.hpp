@@ -5,6 +5,8 @@
 #pragma once
 
 #include "rive/command_queue.hpp"
+#include "rive/hit_result.hpp"
+#include "rive/math/mat2d.hpp"
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -13,21 +15,46 @@
 
 namespace rive
 {
+class ScriptingContext;
+class GlobalAssetRegistry;
 
 // Server-side worker that executes commands from a CommandQueue.
 class CommandServer
 {
 public:
-    CommandServer(rcp<CommandQueue>, Factory*);
+    /**
+     * Creates the server that executes commands from commandQueue.
+     *
+     * @param commandQueue The queue from which commands are read.
+     * @param factory The factory used to create runtime resources.
+     * @param internalFileAssetLoader An optional FileAssetLoader for loading
+     * out-of-band asset contents without using command-queue global assets.
+     * Provide a loader that recognizes and loads the assets it owns, returning
+     * true from FileAssetLoader::loadContents for those assets. This is
+     * typically used by an embedder that already has its own asset-loading
+     * path. Leave it null when out-of-band images, audio, and fonts should be
+     * handled through the command queue.
+     */
+    CommandServer(rcp<CommandQueue> commandQueue,
+                  Factory* factory,
+                  rcp<rive::FileAssetLoader> internalFileAssetLoader = nullptr);
     virtual ~CommandServer();
 
     Factory* factory() const { return m_factory; }
+
+    rive::HitResult pointerDownSynchronized(StateMachineHandle,
+                                            const CommandQueue::PointerEvent&);
+    rive::HitResult pointerMoveSynchronized(StateMachineHandle,
+                                            const CommandQueue::PointerEvent&);
+    rive::HitResult pointerUpSynchronized(StateMachineHandle,
+                                          const CommandQueue::PointerEvent&);
 
     File* getFile(FileHandle) const;
     bool getWasDisconnected() const { return m_wasDisconnectReceived; }
     RenderImage* getImage(RenderImageHandle) const;
     AudioSource* getAudioSource(AudioSourceHandle) const;
     Font* getFont(FontHandle) const;
+    BlobAsset* getBlob(BlobAssetHandle) const;
     ArtboardInstance* getArtboardInstance(ArtboardHandle) const;
     rcp<BindableArtboard> getBindableArtboard(ArtboardHandle) const;
     StateMachineInstance* getStateMachineInstance(StateMachineHandle) const;
@@ -73,7 +100,19 @@ public:
     bool testing_globalImageContains(std::string name);
     bool testing_globalAudioContains(std::string name);
     bool testing_globalFontContains(std::string name);
+
+#ifndef NDEBUG
+    // Used because "sync pointer events" test needs to be able to
+    // make the server on one thread but access it from another
+    void testing_overrideThreadID(std::thread::id threadID)
+    {
+        m_threadID = threadID;
+    }
 #endif
+#endif
+
+    bool focusNextSynchronized(StateMachineHandle);
+    bool focusPreviousSynchronized(StateMachineHandle);
 
 private:
     friend class CommandQueue;
@@ -163,11 +202,35 @@ private:
         }
     }
 
+    struct SynchronizedStateMachine : RefCnt<SynchronizedStateMachine>
+    {
+        // Kept out of line to avoid including StateMachineInstance in the main
+        // CommandServer header.
+        ~SynchronizedStateMachine();
+        SynchronizedStateMachine& operator=(SynchronizedStateMachine&& other);
+        SynchronizedStateMachine() = default;
+        SynchronizedStateMachine(
+            std::unique_ptr<StateMachineInstance> instance);
+        std::unique_ptr<StateMachineInstance> instance;
+        Mat2D m_lastSemanticsTransform;
+        bool m_hasLastSemanticsTransform = false;
+        // This mutex ensures that a specific state machine instance is not
+        // advanced while a synchronized input or focus operation is running.
+        std::mutex m_mutex;
+    };
+
+    rcp<CommandServer::SynchronizedStateMachine> getStateMachineWrapper(
+        StateMachineHandle handle);
+
     bool m_wasDisconnectReceived = false;
     const rcp<CommandQueue> m_commandQueue;
     Factory* const m_factory;
 #ifndef NDEBUG
+#ifdef TESTING
+    std::thread::id m_threadID;
+#else
     const std::thread::id m_threadID;
+#endif
 #endif
 
     // Vector to iterate on for subscriptions. This is a vector instead of a map
@@ -189,17 +252,19 @@ private:
     std::unordered_map<FileHandle, rcp<File>> m_files;
     std::unordered_map<FontHandle, rcp<Font>> m_fonts;
     std::unordered_map<RenderImageHandle, rcp<RenderImage>> m_images;
+    std::unordered_map<BlobAssetHandle, rcp<BlobAsset>> m_blobs;
     std::unordered_map<AudioSourceHandle, rcp<AudioSource>> m_audioSources;
     std::unordered_map<ArtboardHandle, rcp<BindableArtboard>> m_artboards;
     std::unordered_map<ViewModelInstanceHandle, rcp<ViewModelInstanceRuntime>>
         m_viewModels;
-    std::unordered_map<StateMachineHandle,
-                       std::unique_ptr<StateMachineInstance>>
+    std::unordered_map<StateMachineHandle, rcp<SynchronizedStateMachine>>
         m_stateMachines;
+    std::mutex m_stateMachineAccessMutex;
 
     std::unordered_map<DrawKey, CommandServerDrawCallback> m_uniqueDraws;
 
     class CommandFileAssetLoader;
-    rcp<CommandFileAssetLoader> m_fileAssetLoader;
+    rcp<GlobalAssetRegistry> m_globalAssetRegistry;
+    rcp<FileAssetLoader> m_internalFileAssetLoader;
 };
 }; // namespace rive

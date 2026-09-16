@@ -53,23 +53,23 @@ $typedef float3 packed_float3;
 
 #ifdef @ENABLE_MIN_16_PRECISION
 
-#if NEEDS_USHORT_DEFINE
+#ifdef @NEEDS_USHORT_DEFINE
 
 $typedef $min16uint ushort;
 
-#endif // NEEDS_USHORT_DEFINE
+#endif // @NEEDS_USHORT_DEFINE
 
 #else
 
-#if NEEDS_USHORT_DEFINE
+#ifdef @NEEDS_USHORT_DEFINE
 
 $typedef $uint ushort;
 
-#endif // NEEDS_USHORT_DEFINE
+#endif // @NEEDS_USHORT_DEFINE
 
 #endif // ENABLE_MIN_16_PRECISION
 
-#define SPLAT(A, B) A##B
+#define CONCAT(A, B) A##B
 
 #define INLINE $inline
 #define OUT(ARG_TYPE) out ARG_TYPE
@@ -78,7 +78,7 @@ $typedef $uint ushort;
 #define ATTR_BLOCK_BEGIN(NAME)                                                 \
     struct NAME                                                                \
     {
-#define ATTR(IDX, TYPE, NAME) TYPE NAME : SPLAT(ATTRIBUTE, IDX)
+#define ATTR(IDX, TYPE, NAME) TYPE NAME : CONCAT(ATTRIBUTE, IDX)
 #define ATTR_BLOCK_END                                                         \
     }                                                                          \
     ;
@@ -96,6 +96,17 @@ $typedef $uint ushort;
     NAME;                                                                      \
     }
 
+#define PUSH_CONSTANT_BLOCK_BEGIN(NAME)                                        \
+    struct NAME                                                                \
+    {
+
+#define PUSH_CONSTANT(TYPE, NAME) TYPE NAME;
+
+#define PUSH_CONSTANT_BLOCK_END(NAME)                                          \
+    }                                                                          \
+    ;                                                                          \
+    [[$vk::$push_constant]] $ConstantBuffer<PushConstants> NAME;
+
 #define VARYING_BLOCK_BEGIN                                                    \
     struct Varyings                                                            \
     {
@@ -103,7 +114,7 @@ $typedef $uint ushort;
 #define NO_PERSPECTIVE $noperspective
 #define @OPTIONALLY_FLAT $nointerpolation
 #define FLAT $nointerpolation
-#define VARYING(IDX, TYPE, NAME) TYPE NAME : SPLAT($TEXCOORD, IDX)
+#define VARYING(IDX, TYPE, NAME) TYPE NAME : CONCAT($TEXCOORD, IDX)
 
 #ifdef @NEEDS_CLIP_DISTANCE
 #define VARYING_BLOCK_END                                                      \
@@ -147,12 +158,12 @@ $typedef $uint ushort;
     $Texture2D<half> NAME, $SamplerState SAMPLER_NAME
 #define SAMPLED_R16F(NAME, SAMPLER_NAME) NAME, SAMPLER_NAME
 
-// SAMPLER_LINEAR and SAMPLER_MIPMAP are the same because in d3d11, sampler
+// SAMPLER_LINEAR is the same as SAMPLER because in d3d11, sampler
 // parameters are defined at the API level.
 #define SAMPLER(IDX, NAME) $SamplerState NAME;
 #define SAMPLER_LINEAR SAMPLER
-#define SAMPLER_MIPMAP SAMPLER
 #define SAMPLER_DYNAMIC(SET, IDX, NAME) SAMPLER(IDX, NAME)
+#define SAMPLER_DYNAMIC_IMAGE(NAME) SAMPLER(IMAGE_TEXTURE_IDX, NAME)
 
 #ifdef SOURCE_TEXTURE_MSAA
 #define TEXEL_FETCH_MS(NAME, LEVEL, COORD) NAME.Load(COORD, LEVEL)
@@ -193,24 +204,42 @@ $typedef $uint ushort;
 #define PLS_TEX2D $RWTexture2D
 #endif
 
-#if defined(@FRAGMENT) && defined(@RENDER_MODE_MSAA)
+#if defined(@FRAGMENT) && defined(@RENDER_MODE_DEPTH_STENCIL)
 
 #ifdef @SUPPORTS_SUBPASS_LOAD
+// Unreal reserves input attachment slot 0 for depth (see
+// FVulkanShaderHeader::EAttachmentType), so color attachment N is declared at
+// slot N + 1. COLOR_PLANE_IDX comes from constants.glsl, which is shared with
+// the native backends, so the offset is applied here instead of there.
+#define RHI_COLOR_INPUT_ATTACHMENT_SLOT (COLOR_PLANE_IDX + 1)
+
 #define DST_COLOR_TEXTURE(NAME)                                                \
-    [[vk::input_attachment_index(COLOR_PLANE_IDX)]] $SubpassInputMS<half4> NAME
+    [[$vk::$input_attachment_index(                                            \
+        RHI_COLOR_INPUT_ATTACHMENT_SLOT)]] $SubpassInputMS<half4> NAME
 
 #define DST_COLOR_FETCH(NAME)                                                  \
-    dst_color_fetch(half4x4(NAME.SubpassLoad(0),                               \
-                            NAME.SubpassLoad(1),                               \
-                            NAME.SubpassLoad(2),                               \
-                            NAME.SubpassLoad(3)),                              \
+    dst_color_fetch(half4x4(NAME.$SubpassLoad(0),                              \
+                            NAME.$SubpassLoad(1),                              \
+                            NAME.$SubpassLoad(2),                              \
+                            NAME.$SubpassLoad(3)),                             \
                     _sampleMask)
+// Per-sample fetch of the live 4x color attachment.
+#elif defined(@SUPPORTS_MSAA_DST_TEXEL_FETCH)
+#define DST_COLOR_TEXTURE(NAME) $Texture2DMS<half4> NAME
+
+#define DST_COLOR_FETCH(NAME)                                                  \
+    dst_color_fetch(half4x4(NAME.$Load(_plsCoord, 0),                          \
+                            NAME.$Load(_plsCoord, 1),                          \
+                            NAME.$Load(_plsCoord, 2),                          \
+                            NAME.$Load(_plsCoord, 3)),                         \
+                    _sampleMask)
+
 #else
 #define DST_COLOR_TEXTURE(NAME) $Texture2D NAME
 
 #define DST_COLOR_FETCH(NAME) NAME[_plsCoord]
 #endif
-#endif // @FRAGMENT && @RENDER_MODE_MSAA
+#endif // @FRAGMENT && @RENDER_MODE_DEPTH_STENCIL
 
 #define PLS_BLOCK_BEGIN
 #define PLS_BLOCK_END
@@ -223,17 +252,17 @@ $typedef $uint ushort;
 #define PLS_DECL4F_READONLY PLS_DECL4F
 #define PLS_DECLUI(IDX, NAME) uniform PLS_TEX2D<uint> NAME
 
-#define PLS_LOADUI_ATOMIC PLS_LOADUI
-#define PLS_STOREUI_ATOMIC PLS_STOREUI
+#define PLS_LOADUI_UAV PLS_LOADUI
+#define PLS_STOREUI_UAV PLS_STOREUI
 
 #if $COMPILER_METAL || $FORCE_ATOMIC_BUFFER
-#define PLS_DECLUI_ATOMIC(IDX, NAME) uniform $RWBuffer<uint> NAME
-#define PLS_LOADUI_ATOMIC(PLANE) PLANE[_plsIdx]
-#define PLS_STOREUI_ATOMIC(PLANE, VALUE) PLANE[_plsIdx] = VALUE
+#define PLS_DECLUI_UAV(IDX, NAME) uniform $RWBuffer<uint> NAME
+#define PLS_LOADUI_UAV(PLANE) PLANE[_plsIdx]
+#define PLS_STOREUI_UAV(PLANE, VALUE) PLANE[_plsIdx] = VALUE
 #else
-#define PLS_DECLUI_ATOMIC PLS_DECLUI
-#define PLS_LOADUI_ATOMIC PLS_LOADUI
-#define PLS_STOREUI_ATOMIC PLS_STOREUI
+#define PLS_DECLUI_UAV PLS_DECLUI
+#define PLS_LOADUI_UAV PLS_LOADUI
+#define PLS_STOREUI_UAV PLS_STOREUI
 #endif // COMPILER_METAL
 
 #ifdef @ENABLE_TYPED_UAV_LOAD_STORE
@@ -296,18 +325,30 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
 #define TEXTURE_CONTEXT_DECL
 #define TEXTURE_CONTEXT_FORWARD
 
+// D3D's SV_InstanceID ignores the draw's start instance location, so the base
+// instance arrives as a uniform and is added by hand. Vulkan's InstanceIndex
+// already includes it, and adding it again would double count.
+#ifdef @SV_INSTANCE_ID_INCLUDES_BASE
+#define BASE_INSTANCE_DECL
+#define RESOLVE_INSTANCE_ID(_instanceIDWithoutBase) (_instanceIDWithoutBase)
+#else
+#define BASE_INSTANCE_DECL uint $baseInstance;
+#define RESOLVE_INSTANCE_ID(_instanceIDWithoutBase)                            \
+    ((_instanceIDWithoutBase) + $baseInstance)
+#endif
+
 #ifdef @NO_VARYING
 
 #define VERTEX_MAIN(NAME, Attrs, attrs, _vertexID, _instanceID)                \
                                                                                \
-    uint $baseInstance;                                                        \
+    BASE_INSTANCE_DECL                                                         \
                                                                                \
     float4 NAME(Attrs attrs,                                                   \
                 uint _vertexID : $SV_VertexID,                                 \
                 uint _instanceIDWithoutBase : $SV_InstanceID) :                \
         $SV_Position                                                           \
     {                                                                          \
-        uint _instanceID = _instanceIDWithoutBase + $baseInstance;
+        uint _instanceID = RESOLVE_INSTANCE_ID(_instanceIDWithoutBase);
 
 #define EMIT_VERTEX(POSITION)                                                  \
     return POSITION;                                                           \
@@ -317,17 +358,25 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
 
 #define VERTEX_MAIN(NAME, Attrs, attrs, _vertexID, _instanceID)                \
                                                                                \
-    uint $baseInstance;                                                        \
+    BASE_INSTANCE_DECL                                                         \
                                                                                \
     Varyings NAME(Attrs attrs,                                                 \
                   uint _vertexID : $SV_VertexID,                               \
                   uint _instanceIDWithoutBase : $SV_InstanceID)                \
     {                                                                          \
-        uint _instanceID = _instanceIDWithoutBase + $baseInstance;             \
+        uint _instanceID = RESOLVE_INSTANCE_ID(_instanceIDWithoutBase);        \
         Varyings _varyings;
 
-#define IMAGE_RECT_VERTEX_MAIN(NAME, Attrs, attrs, _vertexID, _instanceID)     \
-    Varyings NAME(Attrs attrs, uint _vertexID : $SV_VertexID)                  \
+#define IMAGE_RECT_VERTEX_MAIN(NAME,                                           \
+                               Attrs,                                          \
+                               attrs,                                          \
+                               ImageDrawAttrs,                                 \
+                               imageDrawAttrs,                                 \
+                               _vertexID,                                      \
+                               _instanceID)                                    \
+    Varyings NAME(Attrs attrs,                                                 \
+                  ImageDrawAttrs imageDrawAttrs,                               \
+                  uint _vertexID : $SV_VertexID)                               \
     {                                                                          \
         Varyings _varyings;                                                    \
         float4 _pos;
@@ -337,9 +386,12 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
                                position,                                       \
                                UVAttr,                                         \
                                uv,                                             \
+                               ImageDrawAttrs,                                 \
+                               imageDrawAttrs,                                 \
                                _vertexID)                                      \
     Varyings NAME(PositionAttr position,                                       \
                   UVAttr uv,                                                   \
+                  ImageDrawAttrs imageDrawAttrs,                               \
                   uint _vertexID : $SV_VertexID)                               \
     {                                                                          \
         Varyings _varyings;                                                    \
@@ -351,6 +403,14 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
     return _varyings;
 #endif // End !@NO_VARYING
 
+// Unreal flips the front face for direct x but not vulkan. We should test this
+// in other platforms and make sure it comes out the correct direction.
+#if $COMPILER_DXC && ($COMPILER_VULKAN || $COMPILER_GLSL_ES3_1)
+#define CLOCKWISE_FROM_FRONT_FACE(_ff) (_ff)
+#else
+#define CLOCKWISE_FROM_FRONT_FACE(_ff) (!(_ff))
+#endif
+
 #ifdef @NO_VARYING
 #define FRAG_DATA_MAIN(DATA_TYPE, NAME)                                        \
     $EARLYDEPTHSTENCIL DATA_TYPE NAME(float4 _pos : $SV_Position) : $SV_Target \
@@ -360,10 +420,11 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
 #define FRAG_DATA_MAIN_WITH_CLOCKWISE(DATA_TYPE, NAME)                         \
     EARLYDEPTHSTENCIL DATA_TYPE NAME(float4 _pos : $SV_Position,               \
                                      uint _sampleMask : $SV_Coverage,          \
-                                     bool _clockwise : $SV_IsFrontFace) :      \
+                                     bool _isFrontFace : $SV_IsFrontFace) :    \
         $SV_Target                                                             \
     {                                                                          \
-        float2 _fragCoord = _pos.xy;
+        float2 _fragCoord = _pos.xy;                                           \
+        bool _clockwise = CLOCKWISE_FROM_FRONT_FACE(_isFrontFace);
 #else
 #define FRAG_DATA_MAIN(DATA_TYPE, NAME)                                        \
     $EARLYDEPTHSTENCIL DATA_TYPE NAME(Varyings _varyings,                      \
@@ -377,12 +438,13 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
 #define FRAG_DATA_MAIN_WITH_CLOCKWISE(DATA_TYPE, NAME)                         \
     DATA_TYPE NAME(Varyings _varyings,                                         \
                    uint _sampleMask : $SV_Coverage,                            \
-                   bool _clockwise : $SV_IsFrontFace) :                        \
+                   bool _isFrontFace : $SV_IsFrontFace) :                      \
         $SV_Target                                                             \
     {                                                                          \
         float2 _fragCoord = _varyings._pos.xy;                                 \
         int2 _plsCoord = int2(floor(_fragCoord));                              \
-        uint _plsIdx = _plsCoord.y * uniforms.renderTargetWidth + _plsCoord.x;
+        uint _plsIdx = _plsCoord.y * uniforms.renderTargetWidth + _plsCoord.x; \
+        bool _clockwise = CLOCKWISE_FROM_FRONT_FACE(_isFrontFace);
 
 #endif
 
@@ -485,9 +547,16 @@ INLINE half4 unpackUnorm4x8(uint u)
     return half4(vals) * (1. / 255.);
 }
 
+INLINE float2 unpackUnorm2x16(uint u)
+{
+    uint2 vals = uint2(u & 0xffffu, u >> 16);
+    return float2(vals) * (1. / 65535.);
+}
+
 INLINE uint packUnorm4x8(half4 color)
 {
-    uint4 vals = (uint4(color * 255.) & 0xff) << uint4(0, 8, 16, 24);
+    // Clamp before quantizing: additive blending produces channel values > 1,
+    uint4 vals = (uint4($saturate(color) * 255.) & 0xff) << uint4(0, 8, 16, 24);
     vals.rg |= vals.ba;
     vals.r |= vals.g;
     return vals.r;

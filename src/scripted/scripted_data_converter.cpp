@@ -1,6 +1,3 @@
-#ifdef WITH_RIVE_SCRIPTING
-#include "rive/lua/rive_lua_libs.hpp"
-#endif
 #include "rive/assets/script_asset.hpp"
 #include "rive/component_dirt.hpp"
 #include "rive/data_bind/data_bind.hpp"
@@ -41,98 +38,42 @@ void ScriptedDataConverter::disposeScriptInputs()
 }
 
 #ifdef WITH_RIVE_SCRIPTING
-bool ScriptedDataConverter::scriptInit(ScriptingVM* vm)
-{
-    ScriptedObject::scriptInit(vm);
-    addScriptedDirt(ComponentDirt::Bindings);
-    return true;
-}
 
-bool ScriptedDataConverter::pushDataValue(DataValue* value)
+void ScriptedDataConverter::didHydrateScriptInputs()
 {
-    lua_State* L = state();
-    // Stack: [self, field, self]
-    if (value->is<DataValueNumber>())
-    {
-        lua_newrive<ScriptedDataValueNumber>(
-            L,
-            L,
-            value->as<DataValueNumber>()->value());
-    }
-    else if (value->is<DataValueString>())
-    {
-        lua_newrive<ScriptedDataValueString>(
-            L,
-            L,
-            value->as<DataValueString>()->value());
-    }
-    else if (value->is<DataValueBoolean>())
-    {
-        lua_newrive<ScriptedDataValueBoolean>(
-            L,
-            L,
-            value->as<DataValueBoolean>()->value());
-    }
-    else if (value->is<DataValueColor>())
-    {
-        lua_newrive<ScriptedDataValueColor>(
-            L,
-            L,
-            value->as<DataValueColor>()->value());
-    }
-    else
-    {
-        return false;
-    }
-    return true;
+    addScriptedDirt(ComponentDirt::Bindings);
 }
 
 DataValue* ScriptedDataConverter::applyConversion(DataValue* value,
                                                   const std::string& method)
 {
-    lua_State* L = state();
-    if (L == nullptr)
+    if (m_vm == nullptr || !m_vm->valid() || m_self == 0)
     {
         return value;
     }
-    // Stack: []
-    rive_lua_pushRef(L, m_self);
-    // Stack: [self]
-    lua_getfield(L, -1, method.c_str());
-
-    // Stack: [self, field]
-    lua_pushvalue(L, -2);
-    // Stack: [self, field, self]
-    if (pushDataValue(value))
+    ScriptBackend::ScriptDataResult result;
+    if (!m_vm->callDataConvert(this, m_self, method.c_str(), value, &result))
     {
-        // Stack: [self, field, self, ScriptedData]
-        if (static_cast<lua_Status>(rive_lua_pcall(L, 2, 1)) == LUA_OK)
-        {
-            auto result = (ScriptedDataValue*)lua_touserdata(L, -1);
-            if (result->isNumber())
-            {
-                storeData<DataValueNumber>(result->dataValue());
-            }
-            else if (result->isString())
-            {
-                storeData<DataValueString>(result->dataValue());
-            }
-            else if (result->isBoolean())
-            {
-                storeData<DataValueBoolean>(result->dataValue());
-            }
-            else if (result->isColor())
-            {
-                storeData<DataValueColor>(result->dataValue());
-            }
-        }
-        // Stack: [self, status] or [self, result]
-        rive_lua_pop(L, 2);
+        // Assumed for legacy files but not implemented; pass the value through
+        // unchanged (same as !dataConverts()).
+        return value;
     }
-    else
+    switch (result.kind)
     {
-        // Stack: [self, field, self]
-        rive_lua_pop(L, 3);
+        case ScriptBackend::ScriptDataResult::Kind::number:
+            storeData<DataValueNumber>(result.number);
+            break;
+        case ScriptBackend::ScriptDataResult::Kind::string:
+            storeData<DataValueString>(result.string);
+            break;
+        case ScriptBackend::ScriptDataResult::Kind::boolean:
+            storeData<DataValueBoolean>(result.boolean);
+            break;
+        case ScriptBackend::ScriptDataResult::Kind::color:
+            storeData<DataValueColor>(result.color);
+            break;
+        case ScriptBackend::ScriptDataResult::Kind::none:
+            break;
     }
     if (!m_dataValue)
     {
@@ -164,7 +105,6 @@ DataValue* ScriptedDataConverter::reverseConvert(DataValue* value,
 void ScriptedDataConverter::bindFromContext(DataContext* dataContext,
                                             DataBind* dataBind)
 {
-    m_dataContext = rcp<DataContext>(safe_ref(dataContext));
     Super::bindFromContext(dataContext, dataBind);
     reinit();
     for (auto prop : m_customProperties)
@@ -184,15 +124,26 @@ void ScriptedDataConverter::bindFromContext(DataContext* dataContext,
 bool ScriptedDataConverter::advanceComponent(float elapsedSeconds,
                                              AdvanceFlags flags)
 {
+    if (!enums::is_flag_set(flags, AdvanceFlags::AdvanceNested))
+    {
+        elapsedSeconds = 0;
+    }
+    return advance(elapsedSeconds);
+}
+
+bool ScriptedDataConverter::advance(float elapsedSeconds)
+{
+
     if (elapsedSeconds == 0)
     {
         return false;
     }
-    if ((flags & AdvanceFlags::AdvanceNested) == 0)
+    auto needsAdvance = scriptAdvance(elapsedSeconds);
+    if (needsAdvance)
     {
-        elapsedSeconds = 0;
+        markConverterDirty();
     }
-    return scriptAdvance(elapsedSeconds);
+    return needsAdvance;
 }
 
 void ScriptedDataConverter::addProperty(CustomProperty* prop)
@@ -227,6 +178,37 @@ Core* ScriptedDataConverter::clone() const
     {
         auto clonedValue = prop->clone()->as<CustomProperty>();
         twin->addProperty(clonedValue);
+        auto scriptedInputClone = ScriptInput::from(clonedValue);
+        auto scriptedInputSource = ScriptInput::from(prop);
+        auto thisDataBinds = dataBinds();
+        auto twinDataBinds = twin->dataBinds();
+        if (scriptedInputClone && scriptedInputSource)
+        {
+            if (scriptedInputSource->dataBind())
+            {
+                int index = 0;
+                // Data binds are cloned in the data converters, and assigned to
+                // the right target here
+                for (auto& dataBind : thisDataBinds)
+                {
+                    if (dataBind->target() == prop)
+                    {
+                        if (index < twinDataBinds.size())
+                        {
+                            twinDataBinds[index]->target(clonedValue);
+                            scriptedInputClone->dataBind(twinDataBinds[index]);
+                        }
+                    }
+                    index++;
+                }
+            }
+        }
     }
     return twin;
+}
+
+bool ScriptedDataConverter::addDataBindFromScriptedObject(DataBind* dataBind)
+{
+    addDataBind(dataBind);
+    return true;
 }

@@ -29,7 +29,7 @@ public:
     // Calls clearColor(), updateFrameOptions(),
     // TestingWindow::beginFrame(), draw(), TestingWindow::flush(). (Most GMs
     // just need to override onDraw() instead of overriding this method.)
-    virtual void run(std::vector<uint8_t>* pixels);
+    virtual void run(const char* name, std::vector<uint8_t>* pixels);
 
     virtual rive::ColorInt clearColor() const { return 0xffffffff; }
 
@@ -106,5 +106,4 @@ extern "C" bool gms_registry_get_name(REGISTRY_HANDLE position_handle,
 extern "C" bool gms_registry_get_size(REGISTRY_HANDLE position_handle,
                                       size_t& width,
                                       size_t& height);
-extern "C" int gms_main(int argc, const char* argv[]);
 #endif

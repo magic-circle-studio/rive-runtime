@@ -14,6 +14,9 @@ PLS_BLOCK_END
 PLS_MAIN(@drawFragmentMain)
 {
     VARYING_UNPACK(v_paint, float4);
+#ifdef @ENABLE_MODULATED_IMAGE
+    VARYING_UNPACK(v_image, float3);
+#endif
 
 #ifdef @DRAW_INTERIOR_TRIANGLES
     VARYING_UNPACK(v_windingWeight, half);
@@ -30,6 +33,9 @@ PLS_MAIN(@drawFragmentMain)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_UNPACK(v_blendMode, half);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
 #endif
 
 #if !defined(@DRAW_INTERIOR_TRIANGLES)
@@ -150,13 +156,35 @@ PLS_MAIN(@drawFragmentMain)
 #ifdef @ENABLE_CLIP_RECT
         if (@ENABLE_CLIP_RECT)
         {
-            half clipRectCoverage = min_value(cast_float4_to_half4(v_clipRect));
+            half clipRectCoverage =
+                min_component(cast_float4_to_half4(v_clipRect));
             coverage = clamp(clipRectCoverage, make_half(.0), coverage);
         }
 #endif // ENABLE_CLIP_RECT
 
-        half4 color =
-            find_paint_color(v_paint, coverage FRAGMENT_CONTEXT_UNPACK);
+        half4 color = find_paint_color(
+#ifdef @ENABLE_MODULATED_IMAGE
+            v_image,
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+            cast_half_to_ushort(v_blendMode),
+#endif
+            v_paint FRAGMENT_CONTEXT_UNPACK);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+        if (@ENABLE_HSL_BLEND_MODES)
+        {
+            color = apply_surface_material_to_paint(
+                color,
+                v_surfaceMaterialData,
+                
+#ifdef @ENABLE_ADVANCED_BLEND
+            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+#else
+            true
+#endif
+);
+        }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 
         half4 dstColorPremul;
         if (coverageBufferID != v_pathID)
@@ -182,21 +210,16 @@ PLS_MAIN(@drawFragmentMain)
 
         // Blend with the framebuffer color.
 #ifdef @ENABLE_ADVANCED_BLEND
-        if (@ENABLE_ADVANCED_BLEND)
+        if (@ENABLE_ADVANCED_BLEND &&
+            v_blendMode != cast_uint_to_half(BLEND_SRC_OVER))
         {
-            // GENERATE_PREMULTIPLIED_PAINT_COLORS is false in this case because
-            // advanced blend needs unmultiplied colors.
-            if (v_blendMode != cast_uint_to_half(BLEND_SRC_OVER))
-            {
-                color.rgb =
-                    advanced_color_blend(color.rgb,
-                                         dstColorPremul,
-                                         cast_half_to_ushort(v_blendMode));
-            }
-            // Premultiply alpha now.
-            color.rgb *= color.a;
+            color.rgb = advanced_color_blend(color.rgb,
+                                             dstColorPremul,
+                                             cast_half_to_ushort(v_blendMode)) *
+                        color.a;
         }
 #endif
+        color *= coverage;
 
         // Certain platforms give us less control of the format of what we are
         // rendering too. Specifically, we are auto converted from linear ->
@@ -209,12 +232,14 @@ PLS_MAIN(@drawFragmentMain)
         }
 #endif
 
-        color += dstColorPremul * (1. - color.a);
-
-        color.rgb = add_dither(color.rgb,
-                               _fragCoord.xy,
-                               uniforms.ditherScale,
-                               uniforms.ditherBias);
+        // Save paint alpha before destructively updating it with the dstColor.
+        half paintAlpha = color.a;
+        color += dstColorPremul * (1. - paintAlpha);
+        color.rgb = add_dither_if_alpha_nonzero(color.rgb,
+                                                paintAlpha,
+                                                _fragCoord.xy,
+                                                uniforms.ditherScale,
+                                                uniforms.ditherBias);
 
         PLS_STORE4F(colorBuffer, color);
         PLS_PRESERVE_UI(clipBuffer);

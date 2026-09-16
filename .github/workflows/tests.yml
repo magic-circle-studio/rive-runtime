@@ -20,11 +20,8 @@ jobs:
           sudo chmod a+x premake5
           sudo mv premake5 /usr/local/bin
 
-      - name: Build
-        run: |
-          ./build.sh clean
-          ./build.sh
-          ./build.sh release
+      - name: Install C++ dependencies
+        run: sudo apt update && sudo apt-get -y install build-essential clang libclang-rt-dev g++ llvm-dev uuid-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev freeglut3-dev zlib1g-dev
 
       - name: Tests
         run: |
@@ -57,11 +54,6 @@ jobs:
           sudo chmod a+x premake5
           sudo mv premake5 /usr/local/bin
 
-      - name: Build
-        run: |
-          ./build.sh
-          ./build.sh release
-
       - name: Build glfw
         working-directory: skia/dependencies/
         run: ./make_glfw.sh
@@ -72,10 +64,3 @@ jobs:
           echo Testing for ${{matrix.platform}}
           cd tests/unit_tests
           ./test.sh
-
-      - name: Tess Tests
-        if: matrix.platform == 'macOS'
-        run: |
-          echo Testing for ${{matrix.platform}}
-          cd tess/build/macosx
-          ./build_tess.sh test

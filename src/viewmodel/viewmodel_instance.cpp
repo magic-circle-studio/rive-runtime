@@ -5,16 +5,28 @@
 #include "rive/viewmodel/viewmodel_instance.hpp"
 #include "rive/viewmodel/viewmodel.hpp"
 #include "rive/viewmodel/viewmodel_instance_value.hpp"
+#include "rive/viewmodel/viewmodel_instance_number.hpp"
 #include "rive/viewmodel/viewmodel_instance_viewmodel.hpp"
-#include "rive/importers/viewmodel_importer.hpp"
+#include "rive/viewmodel/viewmodel_instance_symbol_list_index.hpp"
+#include "rive/file.hpp"
+#include "rive/backboard.hpp"
+#include "rive/importers/backboard_importer.hpp"
+#include "rive/importers/artboard_importer.hpp"
 #include "rive/viewmodel/viewmodel_property_viewmodel.hpp"
 #include "rive/core_context.hpp"
 #include "rive/refcnt.hpp"
+#include "rive/artboard.hpp"
+#include "rive/data_bind/data_bind.hpp"
+#include "rive/data_bind_flags.hpp"
 
 using namespace rive;
 
 ViewModelInstance::~ViewModelInstance()
 {
+    for (auto dataBind : m_valueDataBinds)
+    {
+        delete dataBind;
+    }
     for (auto& value : m_PropertyValues)
     {
         if (value->is<ViewModelInstanceViewModel>())
@@ -36,7 +48,79 @@ ViewModelInstance::~ViewModelInstance()
 
 void ViewModelInstance::addValue(ViewModelInstanceValue* value)
 {
+    // Check if already added (can happen when both import() and onAddedDirty()
+    // add the same value).
+    for (const auto& existing : m_PropertyValues)
+    {
+        if (existing.get() == value)
+        {
+            return;
+        }
+    }
+    if (value)
+    {
+        value->viewModelInstance(this);
+    }
+    if (value->viewModelProperty() != nullptr &&
+        (SymbolType)value->viewModelProperty()->symbolTypeValue() !=
+            SymbolType::none)
+    {
+        propertyValue((SymbolType)value->viewModelProperty()->symbolTypeValue(),
+                      value);
+    }
     m_PropertyValues.push_back(rcp<ViewModelInstanceValue>(value));
+}
+
+bool ViewModelInstance::removeValue(uint32_t propertyId)
+{
+    for (auto it = m_PropertyValues.begin(); it != m_PropertyValues.end(); ++it)
+    {
+        auto value = *it;
+        if (value->viewModelPropertyId() != propertyId)
+        {
+            continue;
+        }
+        // Binds aimed at this value, ours and the clones containers hold,
+        // would dangle once it is freed.
+        for (auto dataBind : LazyVector<DataBind*>(m_valueDataBinds))
+        {
+            if (dataBind->target() == value.get())
+            {
+                m_valueDataBinds.eraseAll(dataBind);
+                delete dataBind;
+            }
+        }
+        for (auto* dependent : std::vector<DataBindContainer*>(m_dependents))
+        {
+            dependent->dropInstanceValueBindsTargeting(value.get());
+        }
+        // Mirror the destructor cleanup for nested view model references.
+        if (value->is<ViewModelInstanceViewModel>())
+        {
+            auto vmInstanceViewModel = value->as<ViewModelInstanceViewModel>();
+            if (vmInstanceViewModel->referenceViewModelInstance())
+            {
+                vmInstanceViewModel->referenceViewModelInstance()->removeParent(
+                    this);
+            }
+        }
+        // Drop any symbol-table entry pointing at this value.
+        for (auto sit = m_propertySymbols.begin();
+             sit != m_propertySymbols.end();)
+        {
+            if (sit->second == value.get())
+            {
+                sit = m_propertySymbols.erase(sit);
+            }
+            else
+            {
+                ++sit;
+            }
+        }
+        m_PropertyValues.erase(it); // rcp releases the value
+        return true;
+    }
+    return false;
 }
 
 ViewModelInstanceValue* ViewModelInstance::propertyValue(const uint32_t id)
@@ -65,10 +149,13 @@ bool ViewModelInstance::replaceViewModelByName(const std::string& name,
                     viewModelProperty->as<ViewModelPropertyViewModel>()
                         ->viewModelReferenceId())
                 {
-                    propertyValue->as<ViewModelInstanceViewModel>()
-                        ->referenceViewModelInstance(value);
-                    rebindDependents();
-                    return true;
+                    // Share the by-property implementation so both entry points
+                    // behave identically — same invalidation sequence, same
+                    // same-value guard. Callers must not see different churn
+                    // depending on which API they reached for.
+                    return replaceViewModelByProperty(
+                        propertyValue->as<ViewModelInstanceViewModel>(),
+                        value);
                 }
                 break;
             }
@@ -77,19 +164,70 @@ bool ViewModelInstance::replaceViewModelByName(const std::string& name,
     return false;
 }
 
+bool ViewModelInstance::replaceViewModelByProperty(
+    ViewModelInstanceViewModel* property,
+    rcp<ViewModelInstance> value)
+{
+    for (auto& propertyValue : m_PropertyValues)
+    {
+        if (propertyValue.get() == property)
+        {
+            auto previousViewModelInstance =
+                propertyValue->as<ViewModelInstanceViewModel>()
+                    ->referenceViewModelInstance();
+            // Assigning the instance the property already holds is a no-op,
+            // but the work below is not: it re-parents, marks Bindings dirt,
+            // fires the WITH_RIVE_TOOLS changed callback, and relinks every
+            // dependent. The data-bind apply path reaches here on every
+            // advance (DataBindContextValueViewModel::apply ->
+            // updateViewModel) without comparing first, so an unchanged
+            // reference would churn all of that every frame. The invalidation
+            // below exists to drop caches pointing at a *previous* instance;
+            // with no swap there are none. Still reports success: the property
+            // was found and holds the requested value.
+            if (previousViewModelInstance == value)
+            {
+                return true;
+            }
+            propertyValue->as<ViewModelInstanceViewModel>()
+                ->referenceViewModelInstance(value);
+            // Invalidate value-level dependents (e.g. scripted property
+            // wrappers) so cached references to the previous instance are
+            // dropped. Multiple dependents can share this property. Snapshot
+            // because relinkDataBind can mutate the dependents list.
+            auto dependentsSnapshot = propertyValue->dependents();
+            for (auto& dependent : dependentsSnapshot)
+            {
+                dependent->relinkDataBind();
+            }
+            rebindDependents();
+            if (previousViewModelInstance)
+            {
+                previousViewModelInstance->rebindProperties();
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void ViewModelInstance::propertyValue(const SymbolType symbolType,
+                                      ViewModelInstanceValue* value)
+{
+    if (symbolType != SymbolType::none)
+    {
+        m_propertySymbols[symbolType] = value;
+    }
+}
+
 ViewModelInstanceValue* ViewModelInstance::propertyValue(
     const SymbolType symbolType)
 {
-    auto viewModelProperty = viewModel()->property(symbolType);
-    if (viewModelProperty != nullptr)
+
+    auto propertyIt = m_propertySymbols.find(symbolType);
+    if (propertyIt != m_propertySymbols.end())
     {
-        for (auto value : m_PropertyValues)
-        {
-            if (value->viewModelProperty() == viewModelProperty)
-            {
-                return value.get();
-            }
-        }
+        return propertyIt->second;
     }
     return nullptr;
 }
@@ -97,15 +235,12 @@ ViewModelInstanceValue* ViewModelInstance::propertyValue(
 ViewModelInstanceValue* ViewModelInstance::propertyValue(
     const std::string& name)
 {
-    auto viewModelProperty = viewModel()->property(name);
-    if (viewModelProperty != nullptr)
+    for (auto value : m_PropertyValues)
     {
-        for (auto value : m_PropertyValues)
+        if (value->viewModelProperty() &&
+            value->viewModelProperty()->name() == name)
         {
-            if (value->viewModelProperty() == viewModelProperty)
-            {
-                return value.get();
-            }
+            return value.get();
         }
     }
     return nullptr;
@@ -138,7 +273,8 @@ void ViewModelInstance::setRoot(rcp<ViewModelInstance> value)
     }
 }
 
-std::vector<rcp<ViewModelInstanceValue>> ViewModelInstance::propertyValues()
+const std::vector<rcp<ViewModelInstanceValue>>& ViewModelInstance::
+    propertyValues()
 {
     return m_PropertyValues;
 }
@@ -147,25 +283,72 @@ Core* ViewModelInstance::clone() const
 {
     auto cloned = new ViewModelInstance();
     cloned->copy(*this);
-    for (auto propertyValue : m_PropertyValues)
+
+    // If we have an artboard, it means we will be in the artboard's object
+    // list which will clone our property values for us
+    if (artboard() == nullptr)
     {
-        auto clonedValue = propertyValue->clone()->as<ViewModelInstanceValue>();
-        cloned->addValue(clonedValue);
+        for (auto propertyValue : m_PropertyValues)
+        {
+            auto clonedValue =
+                propertyValue->clone()->as<ViewModelInstanceValue>();
+            cloned->addValue(clonedValue);
+        }
+        for (auto dataBind : m_valueDataBinds)
+        {
+            for (size_t i = 0; i < m_PropertyValues.size(); i++)
+            {
+                if (m_PropertyValues[i].get() == dataBind->target())
+                {
+                    cloned->addValueDataBind(dataBind->cloneWithTarget(
+                        cloned->m_PropertyValues[i].get()));
+                    break;
+                }
+            }
+        }
     }
     cloned->viewModel(viewModel());
     return cloned;
 }
 
+void ViewModelInstance::addValueDataBind(DataBind* dataBind)
+{
+    // The authored value is only a default, so the source wins the reconcile.
+    if (dataBind->toSource() && dataBind->toTarget())
+    {
+        dataBind->flags(
+            dataBind->flags() |
+            static_cast<uint32_t>(DataBindFlags::SourceToTargetRunsFirst));
+    }
+    m_valueDataBinds.push_back(dataBind);
+}
+
 StatusCode ViewModelInstance::import(ImportStack& importStack)
 {
-    auto viewModelImporter =
-        importStack.latest<ViewModelImporter>(ViewModel::typeKey);
-    if (viewModelImporter == nullptr)
+    auto backboardImporter =
+        importStack.latest<BackboardImporter>(Backboard::typeKey);
+    if (backboardImporter == nullptr)
     {
         return StatusCode::MissingObject;
     }
 
-    viewModelImporter->addInstance(this);
+    backboardImporter->addViewModelInstance(this);
+
+    auto artboardImporter =
+        importStack.latest<ArtboardImporter>(ArtboardBase::typeKey);
+    if (artboardImporter != nullptr)
+    {
+        return Super::import(importStack);
+    }
+
+    // Only add ViewModelInstances at the File level if they are not
+    // in the Component hierarchy.
+    auto file = backboardImporter->file();
+    if (file != nullptr)
+    {
+        file->addFileViewModelInstance(this);
+    }
+
     return StatusCode::Ok;
 }
 
@@ -202,18 +385,6 @@ void ViewModelInstance::advanced()
     {
         value->advanced();
     }
-}
-
-ViewModelInstanceValue* ViewModelInstance::symbol(int coreType)
-{
-    for (auto& value : m_PropertyValues)
-    {
-        if (value->coreType() == coreType)
-        {
-            return value.get();
-        }
-    }
-    return nullptr;
 }
 
 void ViewModelInstance::addParent(ViewModelInstance* parent)
@@ -255,11 +426,32 @@ void ViewModelInstance::removeDependent(DataBindContainer* dependent)
         m_dependents.end());
 }
 
+void ViewModelInstance::rebindProperties()
+{
+    for (auto& property : m_PropertyValues)
+    {
+        auto dependents = property->dependents();
+        for (auto& dependent : dependents)
+        {
+            dependent->relinkDataBind();
+        }
+        if (property->is<ViewModelInstanceViewModel>())
+        {
+            auto viewModelInstance = property->as<ViewModelInstanceViewModel>()
+                                         ->referenceViewModelInstance();
+            if (viewModelInstance)
+            {
+                viewModelInstance->rebindProperties();
+            }
+        }
+    }
+}
+
 void ViewModelInstance::rebindDependents()
 {
     for (auto& dependent : m_dependents)
     {
-        dependent->rebind();
+        dependent->relinkDataContext();
     }
     for (auto& parent : m_parents)
     {

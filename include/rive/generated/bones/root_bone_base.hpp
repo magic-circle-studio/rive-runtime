@@ -48,8 +48,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xPropertyKey, &m_X, &value);
         m_X = value;
-        xChanged();
+        RIVE_EDITOR_CHANGED(xChanged());
+        notifyPropertyChanged(xPropertyKey);
     }
 
     inline float y() const override { return m_Y; }
@@ -59,8 +61,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yPropertyKey, &m_Y, &value);
         m_Y = value;
-        yChanged();
+        RIVE_EDITOR_CHANGED(yChanged());
+        notifyPropertyChanged(yPropertyKey);
     }
 
     Core* clone() const override;
@@ -88,6 +92,9 @@ public:
 protected:
     virtual void xChanged() {}
     virtual void yChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/bones/root_bone_ext.inl"
+#endif
 };
 } // namespace rive
 

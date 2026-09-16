@@ -68,7 +68,7 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif // VERTEX
 #endif // DRAW_PATH
 
-#if defined(@DRAW_INTERIOR_TRIANGLES) || defined(@ATLAS_BLIT)
+#if defined(@DRAW_INTERIOR_TRIANGLES) || defined(@FEATHER_ATLAS_BLIT)
 #ifdef @VERTEX
 ATTR_BLOCK_BEGIN(Attrs)
 ATTR(0, packed_float3, @a_triangleVertex);
@@ -76,7 +76,7 @@ ATTR_BLOCK_END
 #endif
 
 VARYING_BLOCK_BEGIN
-#ifdef @ATLAS_BLIT
+#ifdef @FEATHER_ATLAS_BLIT
 NO_PERSPECTIVE VARYING(0, float2, v_atlasCoord);
 #else
 @OPTIONALLY_FLAT VARYING(0, half, v_windingWeight);
@@ -89,7 +89,7 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 {
     ATTR_UNPACK(_vertexID, attrs, @a_triangleVertex, float3);
 
-#ifdef @ATLAS_BLIT
+#ifdef @FEATHER_ATLAS_BLIT
     VARYING_INIT(v_atlasCoord, float2);
 #else
     VARYING_INIT(v_windingWeight, half);
@@ -98,7 +98,7 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 
     uint pathID;
     float2 vertexPosition;
-#ifdef @ATLAS_BLIT
+#ifdef @FEATHER_ATLAS_BLIT
     vertexPosition =
         unpack_atlas_coverage_vertex(@a_triangleVertex,
                                      pathID,
@@ -112,7 +112,7 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     v_pathID = cast_uint_to_ushort(pathID);
     float4 pos = RENDER_TARGET_COORD_TO_CLIP_COORD(vertexPosition);
 
-#ifdef @ATLAS_BLIT
+#ifdef @FEATHER_ATLAS_BLIT
     VARYING_PACK(v_atlasCoord);
 #else
     VARYING_PACK(v_windingWeight);
@@ -121,32 +121,96 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     EMIT_VERTEX(pos);
 }
 #endif // @VERTEX
-#endif // @DRAW_INTERIOR_TRIANGLES || @ATLAS_BLIT
+#endif // @DRAW_INTERIOR_TRIANGLES || @FEATHER_ATLAS_BLIT
 
 #ifdef @DRAW_IMAGE_RECT
 #ifdef @VERTEX
 ATTR_BLOCK_BEGIN(Attrs)
 ATTR(0, float4, @a_imageRectVertex);
 ATTR_BLOCK_END
+
+ATTR_BLOCK_BEGIN(ImageDrawAttrs)
+ATTR(IMAGE_VIEW_MATRIX_ATTRIB_IDX, float4, @a_imageDrawViewMatrix);
+ATTR(IMAGE_CLIP_RECT_INVERSE_MATRIX_ATTRIB_IDX,
+     float4,
+     @a_imageDrawClipRectInverseMatrix);
+ATTR(IMAGE_TRANSLATES_ATTRIB_IDX, float4, @a_imageDrawTranslates);
+ATTR(IMAGE_MODULATED_COLOR_ATTRIB_IDX, uint, @a_imageDrawModulatedColor);
+ATTR(IMAGE_CLIP_ID_ATTRIB_IDX, uint, @a_imageDrawClipID);
+ATTR(IMAGE_BLEND_MODE_ATTRIB_IDX, uint, @a_imageDrawBlendMode);
+ATTR(IMAGE_ZINDEX_ATTRIB_IDX, uint, @a_imageDrawZIndex);
+ATTR(IMAGE_RECT_IMAGE_MATRIX_ATTRIB_IDX, float4, @a_imageRectImageMatrix);
+ATTR(IMAGE_RECT_GRADIENT_MATRIX_ATTRIB_IDX, float4, @a_imageRectGradientMatrix);
+ATTR(IMAGE_RECT_IMAGE_AND_GRADIENT_TRANSLATES_ATTRIB_IDX,
+     float4,
+     @a_imageRectImageAndGradientTranslates);
+ATTR(IMAGE_RECT_PACKED_GRADIENT_DATA, float4, @a_imageRectPackedGradientData);
+
+ATTR_BLOCK_END
 #endif
 
 VARYING_BLOCK_BEGIN
 NO_PERSPECTIVE VARYING(0, float2, v_texCoord);
 NO_PERSPECTIVE VARYING(1, half, v_edgeCoverage);
+NO_PERSPECTIVE VARYING(2, float4, v_gradient);
 #ifdef @ENABLE_CLIP_RECT
-NO_PERSPECTIVE VARYING(2, float4, v_clipRect);
+NO_PERSPECTIVE VARYING(3, float4, v_clipRect);
+#endif
+@OPTIONALLY_FLAT VARYING(4, half4, v_imageModulatedColor);
+#ifdef @ENABLE_CLIPPING
+FLAT VARYING(5, ushort, v_imageClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+FLAT VARYING(6, ushort, v_imageBlendMode);
 #endif
 VARYING_BLOCK_END
 
 #ifdef @VERTEX
-IMAGE_RECT_VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
+IMAGE_RECT_VERTEX_MAIN(@drawVertexMain,
+                       Attrs,
+                       attrs,
+                       ImageDrawAttrs,
+                       imageDrawAttrs,
+                       _vertexID,
+                       _instanceID)
 {
     ATTR_UNPACK(_vertexID, attrs, @a_imageRectVertex, float4);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawViewMatrix, float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageDrawClipRectInverseMatrix,
+                float4);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawTranslates, float4);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawModulatedColor, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawClipID, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawBlendMode, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawZIndex, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageRectImageMatrix, float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageRectGradientMatrix,
+                float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageRectImageAndGradientTranslates,
+                float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageRectPackedGradientData,
+                float4);
 
     VARYING_INIT(v_texCoord, float2);
     VARYING_INIT(v_edgeCoverage, half);
+    VARYING_INIT(v_gradient, float4);
 #ifdef @ENABLE_CLIP_RECT
     VARYING_INIT(v_clipRect, float4);
+#endif
+    VARYING_INIT(v_imageModulatedColor, half4);
+#ifdef @ENABLE_CLIPPING
+    VARYING_INIT(v_imageClipID, ushort);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    VARYING_INIT(v_imageBlendMode, ushort);
 #endif
 
     bool isOuterVertex =
@@ -154,7 +218,7 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     v_edgeCoverage = isOuterVertex ? .0 : 1.;
 
     float2 vertexPosition = @a_imageRectVertex.xy;
-    float2x2 M = make_float2x2(imageDrawUniforms.viewMatrix);
+    float2x2 M = make_float2x2(@a_imageDrawViewMatrix);
     float2x2 MIT = transpose(inverse(M));
     if (!isOuterVertex)
     {
@@ -185,8 +249,11 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
         }
     }
 
-    v_texCoord = vertexPosition;
-    vertexPosition = MUL(M, vertexPosition) + imageDrawUniforms.translate;
+    float2x2 texMatrix = make_float2x2(@a_imageRectImageMatrix);
+    v_texCoord = MUL(texMatrix, vertexPosition) +
+                 @a_imageRectImageAndGradientTranslates.xy;
+
+    vertexPosition = MUL(M, vertexPosition) + @a_imageDrawTranslates.xy;
 
     if (isOuterVertex)
     {
@@ -200,18 +267,59 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
     if (@ENABLE_CLIP_RECT)
     {
         v_clipRect = find_clip_rect_coverage_distances(
-            make_float2x2(imageDrawUniforms.clipRectInverseMatrix),
-            imageDrawUniforms.clipRectInverseTranslate,
+            make_float2x2(@a_imageDrawClipRectInverseMatrix),
+            @a_imageDrawTranslates.zw,
             vertexPosition);
     }
 #endif
 
+    v_imageModulatedColor = unpackUnorm4x8(@a_imageDrawModulatedColor);
+#ifdef @ENABLE_CLIPPING
+    v_imageClipID = cast_uint_to_ushort(@a_imageDrawClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    v_imageBlendMode = cast_uint_to_ushort(@a_imageDrawBlendMode);
+#endif
+
     float4 pos = RENDER_TARGET_COORD_TO_CLIP_COORD(vertexPosition);
 
+    // Paint matrices operate on the fragment shader's "_fragCoord", which
+    // counts from memory row 0. A bottom up target needs it flipped into Rive
+    // pixel space.
+    float2 fragCoord = vertexPosition;
+#ifdef @ENABLE_RENDER_TARGET_BOTTOM_UP
+    if (uniforms.renderTargetBottomUp != 0u)
+    {
+        fragCoord.y = float(uniforms.renderTargetHeight) - fragCoord.y;
+    }
+#endif
+
+    // @a_imageRectPackedGradientData contains:
+    //  xy = horizontal span, z = y, w = type
+    if (@a_imageRectPackedGradientData.w != 0.0)
+    {
+        float2x2 gradientMatrix = make_float2x2(@a_imageRectGradientMatrix);
+        float2 gradientTranslate = @a_imageRectImageAndGradientTranslates.zw;
+
+        v_gradient = packGradientData(fragCoord,
+                                      gradientMatrix,
+                                      gradientTranslate,
+                                      @a_imageRectPackedGradientData.w,
+                                      @a_imageRectPackedGradientData.xy,
+                                      @a_imageRectPackedGradientData.z);
+    }
     VARYING_PACK(v_texCoord);
     VARYING_PACK(v_edgeCoverage);
+    VARYING_PACK(v_gradient);
 #ifdef @ENABLE_CLIP_RECT
     VARYING_PACK(v_clipRect);
+#endif
+    VARYING_PACK(v_imageModulatedColor);
+#ifdef @ENABLE_CLIPPING
+    VARYING_PACK(v_imageClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    VARYING_PACK(v_imageBlendMode);
 #endif
     EMIT_VERTEX(pos);
 }
@@ -226,12 +334,31 @@ ATTR_BLOCK_END
 ATTR_BLOCK_BEGIN(UVAttr)
 ATTR(1, float2, @a_texCoord);
 ATTR_BLOCK_END
+
+ATTR_BLOCK_BEGIN(ImageDrawAttrs)
+ATTR(IMAGE_VIEW_MATRIX_ATTRIB_IDX, float4, @a_imageDrawViewMatrix);
+ATTR(IMAGE_CLIP_RECT_INVERSE_MATRIX_ATTRIB_IDX,
+     float4,
+     @a_imageDrawClipRectInverseMatrix);
+ATTR(IMAGE_TRANSLATES_ATTRIB_IDX, float4, @a_imageDrawTranslates);
+ATTR(IMAGE_MODULATED_COLOR_ATTRIB_IDX, uint, @a_imageDrawModulatedColor);
+ATTR(IMAGE_CLIP_ID_ATTRIB_IDX, uint, @a_imageDrawClipID);
+ATTR(IMAGE_BLEND_MODE_ATTRIB_IDX, uint, @a_imageDrawBlendMode);
+ATTR(IMAGE_ZINDEX_ATTRIB_IDX, uint, @a_imageDrawZIndex);
+ATTR_BLOCK_END
 #endif
 
 VARYING_BLOCK_BEGIN
 NO_PERSPECTIVE VARYING(0, float2, v_texCoord);
 #ifdef @ENABLE_CLIP_RECT
 NO_PERSPECTIVE VARYING(1, float4, v_clipRect);
+#endif
+@OPTIONALLY_FLAT VARYING(3, half4, v_imageModulatedColor);
+#ifdef @ENABLE_CLIPPING
+FLAT VARYING(4, ushort, v_imageClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+FLAT VARYING(5, ushort, v_imageBlendMode);
 #endif
 VARYING_BLOCK_END
 
@@ -241,28 +368,55 @@ IMAGE_MESH_VERTEX_MAIN(@drawVertexMain,
                        position,
                        UVAttr,
                        uv,
+                       ImageDrawAttrs,
+                       imageDrawAttrs,
                        _vertexID)
 {
     ATTR_UNPACK(_vertexID, position, @a_position, float2);
     ATTR_UNPACK(_vertexID, uv, @a_texCoord, float2);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawViewMatrix, float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageDrawClipRectInverseMatrix,
+                float4);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawTranslates, float4);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawModulatedColor, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawClipID, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawBlendMode, uint);
+    ATTR_UNPACK(_instanceID, imageDrawAttrs, @a_imageDrawZIndex, uint);
 
     VARYING_INIT(v_texCoord, float2);
 #ifdef @ENABLE_CLIP_RECT
     VARYING_INIT(v_clipRect, float4);
 #endif
+    VARYING_INIT(v_imageModulatedColor, half4);
+#ifdef @ENABLE_CLIPPING
+    VARYING_INIT(v_imageClipID, ushort);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    VARYING_INIT(v_imageBlendMode, ushort);
+#endif
 
-    float2x2 M = make_float2x2(imageDrawUniforms.viewMatrix);
-    float2 vertexPosition = MUL(M, @a_position) + imageDrawUniforms.translate;
+    float2x2 M = make_float2x2(@a_imageDrawViewMatrix);
+    float2 vertexPosition = MUL(M, @a_position) + @a_imageDrawTranslates.xy;
     v_texCoord = @a_texCoord;
 
 #ifdef @ENABLE_CLIP_RECT
     if (@ENABLE_CLIP_RECT)
     {
         v_clipRect = find_clip_rect_coverage_distances(
-            make_float2x2(imageDrawUniforms.clipRectInverseMatrix),
-            imageDrawUniforms.clipRectInverseTranslate,
+            make_float2x2(@a_imageDrawClipRectInverseMatrix),
+            @a_imageDrawTranslates.zw,
             vertexPosition);
     }
+#endif
+
+    v_imageModulatedColor = unpackUnorm4x8(@a_imageDrawModulatedColor);
+#ifdef @ENABLE_CLIPPING
+    v_imageClipID = cast_uint_to_ushort(@a_imageDrawClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    v_imageBlendMode = cast_uint_to_ushort(@a_imageDrawBlendMode);
 #endif
 
     float4 pos = RENDER_TARGET_COORD_TO_CLIP_COORD(vertexPosition);
@@ -270,6 +424,13 @@ IMAGE_MESH_VERTEX_MAIN(@drawVertexMain,
     VARYING_PACK(v_texCoord);
 #ifdef @ENABLE_CLIP_RECT
     VARYING_PACK(v_clipRect);
+#endif
+    VARYING_PACK(v_imageModulatedColor);
+#ifdef @ENABLE_CLIPPING
+    VARYING_PACK(v_imageClipID);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    VARYING_PACK(v_imageBlendMode);
 #endif
     EMIT_VERTEX(pos);
 }
@@ -300,6 +461,16 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #endif // DRAW_RENDER_TARGET_UPDATE_BOUNDS
 
 #ifdef @DRAW_IMAGE
+#define NEEDS_IMAGE_TEXTURE
+#endif
+
+// INITIALIZE_PLS may sample @imageTexture (the previous framebuffer contents
+// copied to dstColorTexture) when LoadAction::preserveRenderTarget is
+// requested. The spec-const LOAD_COLOR_FROM_DST_TEXTURE is set at runtime. We
+// have to declare the binding unconditionally though for non-FFCO
+// INITIALIZE_PLS so the spec-const branch can reach it; the caller binds a null
+// texture when the branch is off.
+#if defined(@INITIALIZE_PLS) && !defined(@FIXED_FUNCTION_COLOR_OUTPUT)
 #define NEEDS_IMAGE_TEXTURE
 #endif
 
@@ -348,7 +519,7 @@ PLS_DECL4F_READONLY(CLIP_PLANE_IDX, clipBuffer);
 PLS_DECLUI(CLIP_PLANE_IDX, clipBuffer);
 #endif // ENABLE_CLIPPING
 #endif // !PLS_BLEND_SRC_OVER
-PLS_DECLUI_ATOMIC(COVERAGE_PLANE_IDX, coverageAtomicBuffer);
+PLS_DECLUI_UAV(COVERAGE_PLANE_IDX, coverageAtomicBuffer);
 PLS_BLOCK_END
 
 FRAG_STORAGE_BUFFER_BLOCK_BEGIN
@@ -443,9 +614,11 @@ INLINE void resolve_paint(uint pathID,
     if (@ENABLE_CLIP_RECT && (paintData.x & PAINT_FLAG_HAS_CLIP_RECT) != 0u)
     {
         float2x2 M = make_float2x2(
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 2u));
+            STORAGE_BUFFER_LOAD4(@paintAuxBuffer,
+                                 pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT + 2u));
         float4 translate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 3u);
+            STORAGE_BUFFER_LOAD4(@paintAuxBuffer,
+                                 pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT + 3u);
         float2 clipCoord = MUL(M, _fragCoord) + translate.xy;
         // translate.zw contains -1 / fwidth(clipCoord), which we use to
         // calculate antialiasing.
@@ -456,6 +629,13 @@ INLINE void resolve_paint(uint pathID,
     }
 #endif // ENABLE_CLIP_RECT
     uint paintType = paintData.x & 0xfu;
+    ushort blendMode = cast_uint_to_ushort((paintData.x >> 4) & 0xfu);
+#ifdef @ENABLE_ADVANCED_BLEND
+    bool paintHasAdvancedBlend =
+        @ENABLE_ADVANCED_BLEND && blendMode != BLEND_SRC_OVER;
+#else
+    const bool paintHasAdvancedBlend = false;
+#endif
     if (paintType <= SOLID_COLOR_PAINT_TYPE) // CLIP_UPDATE_PAINT_TYPE or
                                              // SOLID_COLOR_PAINT_TYPE
     {
@@ -482,35 +662,89 @@ INLINE void resolve_paint(uint pathID,
     }
     else // LINEAR_GRADIENT_PAINT_TYPE or RADIAL_GRADIENT_PAINT_TYPE
     {
-        float2x2 M =
-            make_float2x2(STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u));
+        float2x2 M = make_float2x2(
+            STORAGE_BUFFER_LOAD4(@paintAuxBuffer,
+                                 pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT));
         float4 translate =
-            STORAGE_BUFFER_LOAD4(@paintAuxBuffer, pathID * 4u + 1u);
+            STORAGE_BUFFER_LOAD4(@paintAuxBuffer,
+                                 pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT + 1u);
         float2 paintCoord = MUL(M, _fragCoord) + translate.xy;
         float t = paintType == LINEAR_GRADIENT_PAINT_TYPE
                       ? /*linear*/ paintCoord.x
                       : /*radial*/ length(paintCoord);
         t = clamp(t, .0, 1.);
         float x = t * translate.z + translate.w;
-        float y = uintBitsToFloat(paintData.y);
+        // paintData.y has (gradient Y row + 1) in the integer part,
+        // additiveness in range 0/256 to 255/256 in the fraction
+        float gradRowAndAdditiveness = uintBitsToFloat(paintData.y);
+        float gradY =
+            floor(gradRowAndAdditiveness) * uniforms.gradTextureYScale +
+            uniforms.gradTextureYBias;
         fragColorOut =
-            TEXTURE_SAMPLE_LOD(@gradTexture, gradSampler, float2(x, y), .0);
+            TEXTURE_SAMPLE_LOD(@gradTexture, gradSampler, float2(x, gradY), .0);
+        if (!paintHasAdvancedBlend) // If not advanced blend then premultiply.
+        {
+            fragColorOut.rgb *= fragColorOut.a;
+            half additiveness = cast_float_to_half(
+                fract(gradRowAndAdditiveness) * (256. / 255.));
+            fragColorOut.a *= additiveness;
+        }
     }
-    fragColorOut.a *= coverage;
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        float4 surfaceMaterialTranslate =
+            STORAGE_BUFFER_LOAD4(
+                @paintAuxBuffer,
+                pathID * PAINT_AUX_STRIDE +
+                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+        if (surfaceMaterialTranslate.z > 0.5)
+        {
+            float2x2 surfaceMaterialMatrix = make_float2x2(
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+            float2 materialCoord =
+                MUL(surfaceMaterialMatrix, _fragCoord) + surfaceMaterialTranslate.xy;
+            fragColorOut = apply_surface_material_to_paint(
+                fragColorOut,
+                float4(materialCoord, surfaceMaterialTranslate.zw),
+                !paintHasAdvancedBlend);
+        }
+    }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 
 #if !defined(@FIXED_FUNCTION_COLOR_OUTPUT) && defined(@ENABLE_ADVANCED_BLEND)
-    // Apply the advanced blend mode, if applicable.
-    ushort blendMode;
-    if (@ENABLE_ADVANCED_BLEND && fragColorOut.a != .0 &&
-        (blendMode = cast_uint_to_ushort((paintData.x >> 4) & 0xfu)) != 0u)
+    // NOTE: fixedFunctionColorOutput is never selected for a flush that
+    // contains advanced-blend draws, so paintHasAdvancedBlend is always false
+    // in FIXED_FUNCTION_COLOR_OUTPUT variants and this branch can compile out.
+    if (paintHasAdvancedBlend)
     {
-        half4 dstColorPremul = PLS_LOAD4F(colorBuffer);
-        fragColorOut.rgb =
-            advanced_color_blend(fragColorOut.rgb, dstColorPremul, blendMode);
+        // Apply the advanced blend mode, if applicable.
+        if (fragColorOut.a * coverage != .0)
+        {
+            half4 dstColorPremul = PLS_LOAD4F(colorBuffer);
+            fragColorOut.rgb = advanced_color_blend(fragColorOut.rgb,
+                                                    dstColorPremul,
+                                                    blendMode);
+        }
+        // Premultiply before gamma correction so both paths gamma-correct a
+        // premultiplied color.
+        fragColorOut.rgb *= fragColorOut.a;
     }
 #endif // !FIXED_FUNCTION_COLOR_OUTPUT && ENABLE_ADVANCED_BLEND
+    fragColorOut *= coverage;
 
-    fragColorOut.rgb *= fragColorOut.a;
+// Certain platforms give us less control of the format of what we are
+// rendering too. Specifically, we are auto converted from linear -> sRGB on
+// render target writes in unreal. In those cases we made need to end up in
+// linear color space
+#if defined(@NEEDS_GAMMA_CORRECTION) &&                                        \
+    (defined(@FIXED_FUNCTION_COLOR_OUTPUT) || defined(@RESOLVE_PLS))
+    fragColorOut = gamma_to_linear(fragColorOut);
+#endif
 }
 
 #if !defined(@FIXED_FUNCTION_COLOR_OUTPUT) &&                                  \
@@ -518,7 +752,7 @@ INLINE void resolve_paint(uint pathID,
 INLINE void blend_pls_color_src_over(half4 fragColorOut PLS_CONTEXT_DECL)
 {
 #ifndef @PLS_BLEND_SRC_OVER
-    if (fragColorOut.a == .0)
+    if (fragColorOut.r + fragColorOut.g + fragColorOut.b + fragColorOut.a == .0)
         return;
     float oneMinusSrcAlpha = 1. - fragColorOut.a;
     if (oneMinusSrcAlpha != .0)
@@ -543,12 +777,9 @@ INLINE void emit_pls_clip(CLIP_VALUE_TYPE fragClipOut PLS_CONTEXT_DECL)
 
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
 #define ATOMIC_PLS_MAIN PLS_FRAG_COLOR_MAIN
-#define ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS                                    \
-    PLS_FRAG_COLOR_MAIN_WITH_IMAGE_UNIFORMS
 #define EMIT_ATOMIC_PLS EMIT_PLS_AND_FRAG_COLOR
 #else // !FIXED_FUNCTION_COLOR_OUTPUT
 #define ATOMIC_PLS_MAIN PLS_MAIN
-#define ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS PLS_MAIN_WITH_IMAGE_UNIFORMS
 #define EMIT_ATOMIC_PLS EMIT_PLS
 #endif
 
@@ -642,10 +873,11 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
                           FRAGMENT_CONTEXT_UNPACK PLS_CONTEXT_UNPACK);
     }
 
-    fragColorOut.rgb = add_dither(fragColorOut.rgb,
-                                  _fragCoord.xy,
-                                  uniforms.ditherScale,
-                                  uniforms.ditherBias);
+    fragColorOut.rgb = add_dither_if_alpha_nonzero(fragColorOut.rgb,
+                                                   fragColorOut.a,
+                                                   _fragCoord.xy,
+                                                   uniforms.ditherScale,
+                                                   uniforms.ditherBias);
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
     _fragColor = fragColorOut;
 #else
@@ -659,17 +891,17 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
 }
 #endif // DRAW_PATH
 
-#if defined(@DRAW_INTERIOR_TRIANGLES) || defined(@ATLAS_BLIT)
+#if defined(@DRAW_INTERIOR_TRIANGLES) || defined(@FEATHER_ATLAS_BLIT)
 ATOMIC_PLS_MAIN(@drawFragmentMain)
 {
-#ifdef @ATLAS_BLIT
+#ifdef @FEATHER_ATLAS_BLIT
     VARYING_UNPACK(v_atlasCoord, float2);
 #else
     VARYING_UNPACK(v_windingWeight, half);
 #endif
     VARYING_UNPACK(v_pathID, ushort);
 
-    uint lastCoverageData = PLS_LOADUI_ATOMIC(coverageAtomicBuffer);
+    uint lastCoverageData = PLS_LOADUI_UAV(coverageAtomicBuffer);
     ushort lastPathID =
         cast_uint_to_ushort(lastCoverageData >> FIXED_COVERAGE_BIT_COUNT);
     lastPathID = apply_driver_workaround_for_path_id(lastPathID);
@@ -677,7 +909,7 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
     // triangle. This does not need to be atomic since interior triangles don't
     // overlap.
     uint currPathCoverageData;
-#ifndef @ATLAS_BLIT
+#ifndef @FEATHER_ATLAS_BLIT
     if (lastPathID == v_pathID)
     {
         currPathCoverageData = lastCoverageData;
@@ -691,24 +923,28 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
     }
 
     half coverage;
-#ifdef @ATLAS_BLIT
-    coverage = filter_feather_atlas(
-        v_atlasCoord,
-        uniforms.atlasTextureInverseSize TEXTURE_CONTEXT_FORWARD);
+#ifdef @FEATHER_ATLAS_BLIT
+    coverage = clamp(TEXTURE_SAMPLE_LOD(@featherAtlasTexture,
+                                        featherAtlasSampler,
+                                        v_atlasCoord,
+                                        .0)
+                         .r,
+                     make_half(.0),
+                     make_half(1.));
 #else
     coverage = v_windingWeight;
 #endif
 
     int coverageDeltaFixed = int(round(coverage * FIXED_COVERAGE_PRECISION));
-    PLS_STOREUI_ATOMIC(coverageAtomicBuffer,
-                       currPathCoverageData + uint(coverageDeltaFixed));
+    PLS_STOREUI_UAV(coverageAtomicBuffer,
+                    currPathCoverageData + uint(coverageDeltaFixed));
 
     half4 fragColorOut = make_half4(.0);
 #ifdef @ENABLE_CLIPPING
     CLIP_VALUE_TYPE fragClipOut = MAKE_NON_UPDATING_CLIP_VALUE;
 #endif
 
-#ifndef @ATLAS_BLIT
+#ifndef @FEATHER_ATLAS_BLIT
     // If this is not the first fragment of the current path to touch this
     // pixel, then we've already resolved the previous path and can move on.
     if (lastPathID != v_pathID)
@@ -728,10 +964,11 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
                           FRAGMENT_CONTEXT_UNPACK PLS_CONTEXT_UNPACK);
     }
 
-    fragColorOut.rgb = add_dither(fragColorOut.rgb,
-                                  _fragCoord.xy,
-                                  uniforms.ditherScale,
-                                  uniforms.ditherBias);
+    fragColorOut.rgb = add_dither_if_alpha_nonzero(fragColorOut.rgb,
+                                                   fragColorOut.a,
+                                                   _fragCoord.xy,
+                                                   uniforms.ditherScale,
+                                                   uniforms.ditherBias);
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
     _fragColor = fragColorOut;
 #else
@@ -743,17 +980,25 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
 
     EMIT_ATOMIC_PLS
 }
-#endif // @DRAW_INTERIOR_TRIANGLES || @ATLAS_BLIT
+#endif // @DRAW_INTERIOR_TRIANGLES || @FEATHER_ATLAS_BLIT
 
 #ifdef @DRAW_IMAGE
-ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
+ATOMIC_PLS_MAIN(@drawFragmentMain)
 {
     VARYING_UNPACK(v_texCoord, float2);
 #ifdef @DRAW_IMAGE_RECT
     VARYING_UNPACK(v_edgeCoverage, half);
+    VARYING_UNPACK(v_gradient, float4);
 #endif
 #ifdef @ENABLE_CLIP_RECT
     VARYING_UNPACK(v_clipRect, float4);
+#endif
+    VARYING_UNPACK(v_imageModulatedColor, half4);
+#ifdef @ENABLE_CLIPPING
+    VARYING_UNPACK(v_imageClipID, ushort);
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+    VARYING_UNPACK(v_imageBlendMode, ushort);
 #endif
 
     // Start by finding the image color. We have to do this immediately instead
@@ -770,13 +1015,13 @@ ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
 #ifdef @ENABLE_CLIP_RECT
     if (@ENABLE_CLIP_RECT)
     {
-        half clipRectCoverage = min_value(cast_float4_to_half4(v_clipRect));
+        half clipRectCoverage = min_component(cast_float4_to_half4(v_clipRect));
         imageCoverage = clamp(clipRectCoverage, make_half(.0), imageCoverage);
     }
 #endif
 
     // Resolve the previous path.
-    uint lastCoverageData = PLS_LOADUI_ATOMIC(coverageAtomicBuffer);
+    uint lastCoverageData = PLS_LOADUI_UAV(coverageAtomicBuffer);
     ushort lastPathID =
         cast_uint_to_ushort(lastCoverageData >> FIXED_COVERAGE_BIT_COUNT);
     lastPathID = apply_driver_workaround_for_path_id(lastPathID);
@@ -787,7 +1032,7 @@ ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
 #endif
     // TODO: consider not resolving the prior paint if we're solid and the prior
     // paint is not a clip update: (imageColor.a == 1. &&
-    //                              imageDrawUniforms.blendMode ==
+    //                              v_imageBlendMode ==
     //                              BLEND_SRC_OVER && priorPaintType !=
     //                              CLIP_UPDATE_PAINT_TYPE)
     resolve_paint(lastPathID,
@@ -803,42 +1048,70 @@ ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
 // the clip buffer.
 #ifdef @ENABLE_CLIPPING // TODO! ENABLE_IMAGE_CLIPPING in addition to
                         // ENABLE_CLIPPING?
-    if (@ENABLE_CLIPPING && imageDrawUniforms.clipID != 0u)
+    if (@ENABLE_CLIPPING && v_imageClipID != 0u)
     {
         CLIP_VALUE_TYPE clipData = HAS_UPDATED_CLIP_VALUE(fragClipOut)
                                        ? fragClipOut
                                        : PLS_LOAD_CLIP_TYPE(clipBuffer);
-        apply_clip(imageDrawUniforms.clipID, clipData, imageCoverage);
+        apply_clip(v_imageClipID, clipData, imageCoverage);
     }
 #endif // ENABLE_CLIPPING
 
-// Prepare imageColor for premultiplied src-over blending.
+#ifdef @DRAW_IMAGE_RECT
+    if (v_gradient.w != 0.0)
+    {
+        float2 gradientTexCoord = getGradientCoord(v_gradient);
+
+        // Our gradient texture is not mipmapped. Issue a texture sample that
+        // explicitly does not find derivatives for LOD computation.
+        half4 gradColor = TEXTURE_SAMPLE_LOD(@gradTexture,
+                                             gradSampler,
+                                             gradientTexCoord,
+                                             0.0);
+        // Gradients are always unmultiplied so we don't lose color data while
+        // doing the hardware filter, so premultiply that and then modulate it
+        // with the (already premultiplied) image.
+        // (If there is advanced blend, this will be re-unmultiplied in the
+        // resulting modulated color. But the image color is premultiplied
+        // anyway, so we would've had to do an unmultiply no matter what.)
+        gradColor.rgb *= gradColor.a;
+        imageColor *= gradColor;
+    }
+#endif // DRAW_IMAGE_RECT
+
+    imageColor *= v_imageModulatedColor;
+
+    // Prepare imageColor for premultiplied src-over blending.
 #if !defined(@FIXED_FUNCTION_COLOR_OUTPUT) && defined(@ENABLE_ADVANCED_BLEND)
-    if (@ENABLE_ADVANCED_BLEND && imageDrawUniforms.blendMode != BLEND_SRC_OVER)
+    if (@ENABLE_ADVANCED_BLEND && v_imageBlendMode != BLEND_SRC_OVER)
     {
         // Calculate what dstColorPremul will be after applying fragColorOut.
         half4 dstColorPremul =
             PLS_LOAD4F(colorBuffer) * (1. - fragColorOut.a) + fragColorOut;
         // Calculate the imageColor to emit *BEFORE* src-over blending, such
         // that the post-src-over-blend result is equivalent to the blendMode.
-        imageColor.rgb = advanced_color_blend(
-                             unmultiply_rgb(imageColor),
-                             dstColorPremul,
-                             cast_uint_to_ushort(imageDrawUniforms.blendMode)) *
+        imageColor.rgb = advanced_color_blend(unmultiply_rgb(imageColor),
+                                              dstColorPremul,
+                                              v_imageBlendMode) *
                          imageColor.a;
     }
 #endif // !FIXED_FUNCTION_COLOR_OUTPUT && ENABLE_ADVANCED_BLEND
-    imageColor *= imageCoverage * cast_float_to_half(imageDrawUniforms.opacity);
+    imageColor *= imageCoverage;
+
+#if defined(@NEEDS_GAMMA_CORRECTION)
+    imageColor = gamma_to_linear(imageColor);
+#endif
 
     // Leverage the property that premultiplied src-over blending is associative
     // and blend the imageColor and fragColorOut before passing them on to the
     // blending pipeline.
     fragColorOut = fragColorOut * (1. - imageColor.a) + imageColor;
 
-    fragColorOut.rgb = add_dither(fragColorOut.rgb,
-                                  _fragCoord.xy,
-                                  uniforms.ditherScale,
-                                  uniforms.ditherBias);
+    fragColorOut.rgb = add_dither_if_alpha_nonzero(fragColorOut.rgb,
+                                                   fragColorOut.a,
+                                                   _fragCoord.xy,
+                                                   uniforms.ditherScale,
+                                                   uniforms.ditherBias);
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
     _fragColor = fragColorOut;
 #else
@@ -850,7 +1123,7 @@ ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
 
     // Write out a coverage value of "zero at pathID=0" so a future resolve
     // attempt doesn't affect this pixel.
-    PLS_STOREUI_ATOMIC(coverageAtomicBuffer, FIXED_COVERAGE_ZERO_UINT);
+    PLS_STOREUI_UAV(coverageAtomicBuffer, FIXED_COVERAGE_ZERO_UINT);
 
     EMIT_ATOMIC_PLS
 }
@@ -860,14 +1133,25 @@ ATOMIC_PLS_MAIN_WITH_IMAGE_UNIFORMS(@drawFragmentMain)
 
 ATOMIC_PLS_MAIN(@drawFragmentMain)
 {
+#ifndef @FIXED_FUNCTION_COLOR_OUTPUT
 #ifdef @STORE_COLOR_CLEAR
-    PLS_STORE4F(colorBuffer, unpackUnorm4x8(uniforms.colorClearValue));
+    if (@STORE_COLOR_CLEAR)
+    {
+        PLS_STORE4F(colorBuffer, unpackUnorm4x8(uniforms.colorClearValue));
+    }
+#endif
+#ifdef @LOAD_COLOR_FROM_DST_TEXTURE
+    if (@LOAD_COLOR_FROM_DST_TEXTURE)
+    {
+        PLS_STORE4F(colorBuffer, TEXEL_FETCH(@imageTexture, _plsCoord));
+    }
 #endif
 #ifdef @SWIZZLE_COLOR_BGRA_TO_RGBA
     half4 color = PLS_LOAD4F(colorBuffer);
     PLS_STORE4F(colorBuffer, color.bgra);
 #endif
-    PLS_STOREUI_ATOMIC(coverageAtomicBuffer, uniforms.coverageClearValue);
+#endif
+    PLS_STOREUI_UAV(coverageAtomicBuffer, uniforms.coverageClearValue);
 #ifdef @ENABLE_CLIPPING
     if (@ENABLE_CLIPPING)
     {
@@ -890,7 +1174,7 @@ PLS_FRAG_COLOR_MAIN(@drawFragmentMain)
 ATOMIC_PLS_MAIN(@drawFragmentMain)
 #endif
 {
-    uint lastCoverageData = PLS_LOADUI_ATOMIC(coverageAtomicBuffer);
+    uint lastCoverageData = PLS_LOADUI_UAV(coverageAtomicBuffer);
     half coverageCount = from_fixed(lastCoverageData & FIXED_COVERAGE_MASK);
     ushort lastPathID =
         cast_uint_to_ushort(lastCoverageData >> FIXED_COVERAGE_BIT_COUNT);
@@ -899,13 +1183,6 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
     resolve_paint(lastPathID,
                   coverageCount,
                   fragColorOut FRAGMENT_CONTEXT_UNPACK PLS_CONTEXT_UNPACK);
-// Certain platforms give us less control of the format of what we are
-// rendering too. Specifically, we are auto converted from linear -> sRGB on
-// render target writes in unreal. In those cases we made need to end up in
-// linear color space
-#ifdef @NEEDS_GAMMA_CORRECTION
-    fragColorOut = gamma_to_linear(fragColorOut);
-#endif
 #ifdef @COALESCED_PLS_RESOLVE_AND_TRANSFER
     float oneMinusSrcAlpha = 1. - fragColorOut.a;
     if (oneMinusSrcAlpha != .0)
@@ -914,10 +1191,11 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
     EMIT_PLS_AND_FRAG_COLOR
 #else
 
-    fragColorOut.rgb = add_dither(fragColorOut.rgb,
-                                  _fragCoord.xy,
-                                  uniforms.ditherScale,
-                                  uniforms.ditherBias);
+    fragColorOut.rgb = add_dither_if_alpha_nonzero(fragColorOut.rgb,
+                                                   fragColorOut.a,
+                                                   _fragCoord.xy,
+                                                   uniforms.ditherScale,
+                                                   uniforms.ditherBias);
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
     _fragColor = fragColorOut;
 #else

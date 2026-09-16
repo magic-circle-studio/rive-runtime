@@ -2,8 +2,9 @@
 #include "rive/artboard.hpp"
 #include "rive/artboard_component_list.hpp"
 #include "rive/artboard_host.hpp"
+#include "rive/component.hpp"
 #include "rive/constraints/scrolling/scroll_constraint.hpp"
-#include "rive/input/focus_input_traversal.hpp"
+#include "rive/drawable.hpp"
 #include "rive/input/focusable.hpp"
 #include "rive/input/focus_listener.hpp"
 #include "rive/input/focus_manager.hpp"
@@ -12,12 +13,28 @@
 #include "rive/nested_artboard.hpp"
 #include "rive/node.hpp"
 #include "rive/parent_traversal.hpp"
+#include "rive/semantic/semantic_data.hpp"
+#include "rive/semantic/semantic_provider.hpp"
+#include "rive/semantic/semantic_state.hpp"
 #include "rive/text/text_input.hpp"
 #include "rive/transform_component.hpp"
 #include "rive/world_transform_component.hpp"
 #include <algorithm>
 
 using namespace rive;
+
+namespace
+{
+SemanticData* findSiblingSemanticData(Component* self)
+{
+    auto* parentNode = self->parent();
+    if (parentNode == nullptr || !parentNode->is<Node>())
+    {
+        return nullptr;
+    }
+    return parentNode->as<Node>()->firstChild<SemanticData>();
+}
+} // namespace
 
 FocusData::~FocusData()
 {
@@ -26,11 +43,36 @@ FocusData::~FocusData()
         // Clear the focusable pointer first to prevent callbacks during removal
         m_focusNode->clearFocusable();
 
-        // Remove from manager if registered
-        auto* manager = m_focusNode->manager();
+        // Take the node out of the focus tree. Its own manager pointer is the
+        // normal route, but a node can end up without one (a detach that was
+        // never paired with a re-add, or a manager torn down around it). Left
+        // parented, such a node survives with a null focusable, which is a
+        // state nothing else can clean up.
+        //
+        // Fall back to the nearest ancestor that still knows its manager, so
+        // removal keeps clearing focus and invalidating the manager's cached
+        // focusable-content answer; only when nothing in the chain is
+        // registered do we settle for a plain detach.
+        FocusManager* manager = m_focusNode->manager();
+        if (manager == nullptr)
+        {
+            for (FocusNode* p = m_focusNode->parent(); p != nullptr;
+                 p = p->parent())
+            {
+                if (p->manager() != nullptr)
+                {
+                    manager = p->manager();
+                    break;
+                }
+            }
+        }
         if (manager != nullptr)
         {
             manager->removeChild(m_focusNode);
+        }
+        else
+        {
+            m_focusNode->removeFromParent();
         }
         // m_focusNode (rcp) is released automatically when this destructor ends
     }
@@ -41,9 +83,9 @@ rcp<FocusNode> FocusData::focusNode()
     if (m_focusNode == nullptr)
     {
         m_focusNode = rcp<FocusNode>(new FocusNode(this));
-        m_focusNode->canFocus(m_CanFocus);
-        m_focusNode->canTouch(m_CanTouch);
-        m_focusNode->canTraverse(m_CanTraverse);
+        m_focusNode->canFocus((focusFlags() & canFocusBitmask) != 0);
+        m_focusNode->canTouch((focusFlags() & canTouchBitmask) != 0);
+        m_focusNode->canTraverse((focusFlags() & canTraverseBitmask) != 0);
         m_focusNode->edgeBehavior(
             static_cast<EdgeBehavior>(m_EdgeBehaviorValue));
         m_focusNode->name(name());
@@ -68,6 +110,54 @@ void FocusData::removeFocusListener(FocusListener* listener)
     }
 }
 
+void FocusData::addKeyboardListener(KeyboardListener* listener)
+{
+    m_keyboardListeners.push_back(listener);
+}
+
+void FocusData::removeKeyboardListener(KeyboardListener* listener)
+{
+    auto it = std::find(m_keyboardListeners.begin(),
+                        m_keyboardListeners.end(),
+                        listener);
+    if (it != m_keyboardListeners.end())
+    {
+        m_keyboardListeners.erase(it);
+    }
+}
+
+void FocusData::addTextInputListener(KeyboardListener* listener)
+{
+    m_textInputListeners.push_back(listener);
+}
+
+void FocusData::removeTextInputListener(KeyboardListener* listener)
+{
+    auto it = std::find(m_textInputListeners.begin(),
+                        m_textInputListeners.end(),
+                        listener);
+    if (it != m_textInputListeners.end())
+    {
+        m_textInputListeners.erase(it);
+    }
+}
+
+void FocusData::addGamepadListener(GamepadListener* listener)
+{
+    m_gamepadListeners.push_back(listener);
+}
+
+void FocusData::removeGamepadListener(GamepadListener* listener)
+{
+    auto it = std::find(m_gamepadListeners.begin(),
+                        m_gamepadListeners.end(),
+                        listener);
+    if (it != m_gamepadListeners.end())
+    {
+        m_gamepadListeners.erase(it);
+    }
+}
+
 void FocusData::focus()
 {
     // Note: In C++ runtime, focus() needs a FocusManager to set focus.
@@ -81,28 +171,28 @@ bool FocusData::keyInput(Key value,
                          bool isPressed,
                          bool isRepeat)
 {
-    // Search only the children of this FocusData's owner (parent Node),
-    // not the entire artboard.
-    auto* parentNode = parent();
-    if (parentNode == nullptr || !parentNode->is<Node>())
+    // Every listener on this node is offered the key, even once one has
+    // claimed it: two listeners on the same element watching the same key
+    // both run, the way they always have. A claim reports upward, where
+    // FocusManager::keyInput stops the bubble -- the same split the DOM draws
+    // between stopPropagation and stopImmediatePropagation.
+    bool claimed = false;
+    for (auto* listener : m_keyboardListeners)
     {
-        return false;
+        if (listener->keyInput(value, modifiers, isPressed, isRepeat))
+        {
+            claimed = true;
+        }
     }
-    // If the parent is Focusable and immediately handles the input, we're done!
-    auto* focusable = Focusable::from(parentNode);
-    if (focusable != nullptr &&
-        focusable->keyInput(value, modifiers, isPressed, isRepeat))
+    return claimed;
+}
+
+bool FocusData::textInput(const std::string& text)
+{
+
+    for (auto* listener : m_textInputListeners)
     {
-        return true;
-    }
-    for (auto* child : parentNode->as<Node>()->children())
-    {
-        if (sendInputToFocusableChildren(child,
-                                         &Focusable::keyInput,
-                                         value,
-                                         modifiers,
-                                         isPressed,
-                                         isRepeat))
+        if (listener->textInput(text))
         {
             return true;
         }
@@ -110,27 +200,33 @@ bool FocusData::keyInput(Key value,
     return false;
 }
 
-bool FocusData::textInput(const std::string& text)
+bool FocusData::selectedText(std::string& outText) const
 {
-    // Search only the children of this FocusData's owner (parent Node),
-    // not the entire artboard.
-    auto* parentNode = parent();
-    if (parentNode == nullptr || !parentNode->is<Node>())
+    // Mirror the TextInput special case in KeyboardListenerGroup's
+    // key/text routing: the focus target for a text input is a FocusData
+    // child whose parent is the TextInput itself.
+    Component* target = parent();
+    if (target != nullptr && target->is<TextInput>())
     {
-        return false;
+        return target->as<TextInput>()->selectedText(outText);
     }
+    return false;
+}
 
-    // If the parent is Focusable and immediately handles the input, we're done!
-    auto* focusable = Focusable::from(parentNode);
-    if (focusable != nullptr && focusable->textInput(text))
-    {
-        return true;
-    }
+bool FocusData::acceptsTextInput() const
+{
+    Component* target = parent();
+    return target != nullptr && target->is<TextInput>();
+}
 
-    // Look through children for a Focusable to handle the text input.
-    for (auto* child : parentNode->as<Node>()->children())
+bool FocusData::gamepadDispatch(
+    const ListenerInvocation& invocation,
+    ScriptedDrawable** outDispatchedScriptedDrawable)
+{
+    for (auto* listener : m_gamepadListeners)
     {
-        if (sendInputToFocusableChildren(child, &Focusable::textInput, text))
+        if (listener->gamepadDispatch(invocation,
+                                      outDispatchedScriptedDrawable))
         {
             return true;
         }
@@ -236,7 +332,13 @@ void FocusData::scrollConstraintToShowBounds(ScrollConstraint* constraint,
     // Calculate horizontal scroll adjustment.
     if (constraint->constrainsHorizontal())
     {
-        if (viewportLeft < 0)
+        float elementWidth = viewportRight - viewportLeft;
+        if (elementWidth > viewportWidth)
+        {
+            // Oversized element: keep the left edge visible.
+            deltaX = -viewportLeft;
+        }
+        else if (viewportLeft < 0)
         {
             // Element is to the left of viewport, scroll right (increase
             // offset)
@@ -253,7 +355,13 @@ void FocusData::scrollConstraintToShowBounds(ScrollConstraint* constraint,
     // Calculate vertical scroll adjustment
     if (constraint->constrainsVertical())
     {
-        if (viewportTop < 0)
+        float elementHeight = viewportBottom - viewportTop;
+        if (elementHeight > viewportHeight)
+        {
+            // Oversized element: keep the top edge visible.
+            deltaY = -viewportTop;
+        }
+        else if (viewportTop < 0)
         {
             // Element is above viewport, scroll up (increase offset)
             deltaY = -viewportTop;
@@ -269,9 +377,11 @@ void FocusData::scrollConstraintToShowBounds(ScrollConstraint* constraint,
     if (deltaX != 0 || deltaY != 0)
     {
         // Add delta to effective scroll offset to get target position.
-        float targetX = effectiveScrollX + deltaX;
-        float targetY = effectiveScrollY + deltaY;
-        constraint->scrollToPosition(targetX, targetY);
+        Vec2D current(effectiveScrollX, effectiveScrollY);
+        Vec2D target(effectiveScrollX + deltaX, effectiveScrollY + deltaY);
+        Vec2D snapped =
+            constraint->nearestSnapOffsetInDirection(current, target);
+        constraint->scrollToPosition(snapped.x, snapped.y);
     }
 }
 
@@ -285,6 +395,19 @@ void FocusData::focused()
     {
         listener->onFocused();
     }
+
+    // Sync focus state to sibling SemanticData (if any)
+    auto* sibling = findSiblingSemanticData(this);
+    if (sibling != nullptr)
+    {
+        sibling->setFocusedState(true);
+    }
+
+    auto* parentComponent = parent();
+    if (parentComponent != nullptr && parentComponent->is<TextInput>())
+    {
+        parentComponent->as<TextInput>()->focused();
+    }
 }
 
 void FocusData::blurred()
@@ -293,29 +416,28 @@ void FocusData::blurred()
     {
         listener->onBlurred();
     }
-}
 
-void FocusData::canFocusChanged()
-{
-    if (m_focusNode != nullptr)
+    // Sync focus state to sibling SemanticData (if any)
+    auto* sibling = findSiblingSemanticData(this);
+    if (sibling != nullptr)
     {
-        m_focusNode->canFocus(m_CanFocus);
+        sibling->setFocusedState(false);
+    }
+
+    auto* parentComponent = parent();
+    if (parentComponent != nullptr && parentComponent->is<TextInput>())
+    {
+        parentComponent->as<TextInput>()->blurred();
     }
 }
 
-void FocusData::canTouchChanged()
+void FocusData::focusFlagsChanged()
 {
     if (m_focusNode != nullptr)
     {
-        m_focusNode->canTouch(m_CanTouch);
-    }
-}
-
-void FocusData::canTraverseChanged()
-{
-    if (m_focusNode != nullptr)
-    {
-        m_focusNode->canTraverse(m_CanTraverse);
+        m_focusNode->canFocus((focusFlags() & canFocusBitmask) != 0);
+        m_focusNode->canTouch((focusFlags() & canTouchBitmask) != 0);
+        m_focusNode->canTraverse((focusFlags() & canTraverseBitmask) != 0);
     }
 }
 
@@ -408,6 +530,85 @@ rcp<FocusNode> FocusData::findClosestFocusNode(Component* component)
     return nullptr;
 }
 
+namespace
+{
+
+bool componentAllowsFocusTraversal(const Component* c)
+{
+    if (c == nullptr || c->isCollapsed())
+    {
+        return false;
+    }
+    if (c->is<Drawable>())
+    {
+        if (c->as<Drawable>()->isHidden())
+        {
+            return false;
+        }
+    }
+    if (c->is<TransformComponent>())
+    {
+        if (c->as<TransformComponent>()->renderOpacity() <= 0.0f)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+bool FocusData::isEligibleForFocusTraversal() const
+{
+    if (isCollapsed())
+    {
+        return false;
+    }
+    Component* start = parent();
+    if (start == nullptr)
+    {
+        return true;
+    }
+    if (!componentAllowsFocusTraversal(start))
+    {
+        return false;
+    }
+    ParentTraversal traversal(start);
+    while (true)
+    {
+        ContainerComponent* p = traversal.next();
+        if (p == nullptr)
+        {
+            break;
+        }
+        if (!componentAllowsFocusTraversal(p))
+        {
+            return false;
+        }
+        if (traversal.didCrossBoundary())
+        {
+            ArtboardHost* host = traversal.crossingHost();
+            if (host != nullptr)
+            {
+                Component* hc = host->hostComponent();
+                if (hc != nullptr)
+                {
+                    if (!componentAllowsFocusTraversal(hc))
+                    {
+                        return false;
+                    }
+                    if (hc->is<NestedArtboard>() &&
+                        hc->as<NestedArtboard>()->isPaused())
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool FocusData::worldPosition(Vec2D& outPosition)
 {
     // Get local position from parent transform component
@@ -460,6 +661,25 @@ void FocusData::update(ComponentDirt value)
     }
 }
 
+bool FocusData::worldBounds(AABB& outBounds)
+{
+    auto* parentComponent = parent();
+    if (parentComponent == nullptr || !parentComponent->is<LayoutComponent>())
+    {
+        return false;
+    }
+    AABB bounds = parentComponent->as<LayoutComponent>()->worldBounds();
+    // Transform to root artboard space (handles nested artboards); all four
+    // corners so rotated/skewed hosts still yield a valid AABB.
+    auto* ab = artboard();
+    if (ab != nullptr)
+    {
+        bounds = SemanticProvider::rootTransformAABB(ab, bounds);
+    }
+    outBounds = bounds;
+    return true;
+}
+
 void FocusData::updateWorldBounds()
 {
     if (m_focusNode == nullptr)
@@ -467,24 +687,13 @@ void FocusData::updateWorldBounds()
         return;
     }
 
-    auto* parentComponent = parent();
-    if (parentComponent != nullptr && parentComponent->is<LayoutComponent>())
+    AABB bounds;
+    if (worldBounds(bounds))
     {
-        // LayoutComponent has worldBounds based on its layout dimensions
-        AABB bounds = parentComponent->as<LayoutComponent>()->worldBounds();
-        // Transform to root artboard space (handles nested artboards)
-        auto* ab = artboard();
-        if (ab != nullptr)
-        {
-            Vec2D min = ab->rootTransform(Vec2D(bounds.minX, bounds.minY));
-            Vec2D max = ab->rootTransform(Vec2D(bounds.maxX, bounds.maxY));
-            bounds = AABB(min.x, min.y, max.x, max.y);
-        }
         m_focusNode->worldBounds(bounds);
     }
     else
     {
-        // For non-layout parents, clear bounds (will fall back to position)
         m_focusNode->clearWorldBounds();
     }
 }

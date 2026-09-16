@@ -11,7 +11,6 @@ namespace rive
 class DataBindContextValue
 {
 protected:
-    DataBind* m_dataBind = nullptr;
     DataValue* m_dataValue = nullptr;
     DataBindContextTargetValue m_targetValue;
     bool m_isValid = false;
@@ -27,16 +26,30 @@ public:
     };
     virtual void applyToSource(Core* component,
                                uint32_t propertyKey,
-                               bool isMainDirection);
+                               bool isMainDirection,
+                               DataBind* dataBind);
     virtual void apply(Core* component,
                        uint32_t propertyKey,
-                       bool isMainDirection) {};
+                       bool isMainDirection,
+                       DataBind* dataBind) {};
     void invalidate() { m_isValid = false; };
+    // Re-read the target after we wrote it ourselves (source->target). The
+    // cached target value is what detects target-side changes; if we leave it
+    // holding the value from before our own write, a later genuine target
+    // change that lands back on that stale value reads as "unchanged" and
+    // never propagates to the source. Only toSource binds allocate the cache.
+    void refreshTargetValue(DataBind* dataBind)
+    {
+        if (dataBind->toSource())
+        {
+            m_targetValue.syncTargetValue(dataBind);
+        }
+    }
     virtual bool syncTargetValue(Core* target, uint32_t propertyKey)
     {
         return false;
     };
-    void syncSourceValue();
+    void syncSourceValue(DataBind* dataBind);
     DataValue* calculateUntypedDataValue(DataValue* input,
                                          bool isMainDirection,
                                          DataBind* dataBind)
@@ -77,23 +90,22 @@ public:
     template <typename T = DataValue,
               typename U,
               typename V = ViewModelInstanceValue>
-    void calculateValueAndApply(bool isMainDirection)
+    void calculateValueAndApply(bool isMainDirection, DataBind* dataBind)
     {
         // Check if target value changed or binding has been invalidated
-        if (m_targetValue.syncTargetValue() || !m_isValid)
+        if (m_targetValue.syncTargetValue(dataBind) || !m_isValid)
         {
             // Calculate new value after converters are applied
             auto value = calculateDataValue<T>(m_targetValue.dataValue(),
                                                isMainDirection,
-                                               m_dataBind);
+                                               dataBind);
             if (value)
             {
-
                 // Apply value to source
-                m_dataBind->suppressDirt(true);
-                auto source = m_dataBind->source();
+                dataBind->suppressDirt(true);
+                auto source = dataBind->source();
                 source->as<V>()->applyValue(value->template as<T>());
-                m_dataBind->suppressDirt(false);
+                dataBind->suppressDirt(false);
                 m_isValid = true;
             }
         }

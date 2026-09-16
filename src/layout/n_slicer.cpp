@@ -6,7 +6,7 @@
 
 using namespace rive;
 
-NSlicer::NSlicer() { m_sliceMesh = rivestd::make_unique<SliceMesh>(this); }
+NSlicer::NSlicer() { m_sliceMesh = std::make_unique<SliceMesh>(this); }
 
 Image* NSlicer::image()
 {
@@ -30,7 +30,10 @@ StatusCode NSlicer::onAddedDirty(CoreContext* context)
         return StatusCode::MissingObject;
     }
 
+#ifndef WITH_RIVE_EDITOR
+    // Runtime-only; editor build registers via editorParentChanged.
     parent()->as<Image>()->setMesh(m_sliceMesh.get());
+#endif
     return StatusCode::Ok;
 }
 

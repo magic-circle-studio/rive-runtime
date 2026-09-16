@@ -1,5 +1,6 @@
 #ifdef WITH_RIVE_SCRIPTING
 #include "rive/lua/rive_lua_libs.hpp"
+#include "rive/viewmodel/viewmodel_property_asset_image.hpp"
 #include "rive/viewmodel/viewmodel_property_boolean.hpp"
 #include "rive/viewmodel/viewmodel_property_color.hpp"
 #include "rive/viewmodel/viewmodel_property_enum.hpp"
@@ -7,18 +8,36 @@
 #include "rive/viewmodel/viewmodel_property_string.hpp"
 #include "rive/viewmodel/viewmodel_property_trigger.hpp"
 #include "rive/viewmodel/viewmodel_property_list.hpp"
+#include "rive/viewmodel/viewmodel_property_symbol_list_index.hpp"
 #include "rive/viewmodel/viewmodel_property_viewmodel.hpp"
+#include "rive/viewmodel/viewmodel_instance_asset_image.hpp"
+#include "rive/viewmodel/viewmodel_property_asset_font.hpp"
+#include "rive/viewmodel/viewmodel_instance_asset_font.hpp"
+#include "rive/viewmodel/viewmodel_property_asset_blob.hpp"
+#include "rive/viewmodel/viewmodel_instance_asset_blob.hpp"
 #include "rive/viewmodel/viewmodel_instance_list.hpp"
 #include "rive/viewmodel/viewmodel_instance_enum.hpp"
 #include "rive/viewmodel/viewmodel_instance_list_item.hpp"
+#include "rive/viewmodel/viewmodel_instance_symbol_list_index.hpp"
+#include "rive/scripted/scripted_object.hpp"
+#include "rive/assets/image_asset.hpp"
+#include "rive/assets/script_asset.hpp"
+#include "rive/file.hpp"
+#ifdef WITH_RIVE_TOOLS
+#include "rive/viewmodel/viewmodel.hpp"
+#include "rive/viewmodel/viewmodel_instance.hpp"
+#endif
 
 #include <math.h>
-#include <stdio.h>
 
 using namespace rive;
 
+static ScriptingContext* scriptingContext(lua_State* L)
+{
+    return static_cast<ScriptingContext*>(lua_getthreaddata(L));
+}
+
 static void pushViewModelInstanceValue(lua_State* L,
-                                       rcp<ViewModel> viewModel,
                                        ViewModelInstanceValue* propValue)
 {
     switch (propValue->coreType())
@@ -66,12 +85,51 @@ static void pushViewModelInstanceValue(lua_State* L,
                 ref_rcp(propValue->as<ViewModelInstanceEnum>()));
             break;
         case ViewModelInstanceViewModelBase::typeKey:
+        {
+            // The wrapper needs the referenced view model, not the owner's, so
+            // instance() mints the nested type.
+            auto vmValue = propValue->as<ViewModelInstanceViewModel>();
+            auto reference = vmValue->referenceViewModelInstance();
             lua_newrive<ScriptedPropertyViewModel>(
                 L,
                 L,
-                viewModel,
-                ref_rcp(propValue->as<ViewModelInstanceViewModel>()));
+                reference != nullptr ? ref_rcp(reference->viewModel())
+                                     : nullptr,
+                ref_rcp(vmValue));
             break;
+        }
+        case ViewModelInstanceSymbolListIndexBase::typeKey:
+        {
+
+            auto listIndexProp =
+                propValue->as<ViewModelInstanceSymbolListIndex>();
+            lua_pushinteger(L, listIndexProp->propertyValue());
+            break;
+        }
+        case ViewModelInstanceAssetImageBase::typeKey:
+        {
+            lua_newrive<ScriptedPropertyImage>(
+                L,
+                L,
+                ref_rcp(propValue->as<ViewModelInstanceAssetImage>()));
+            break;
+        }
+        case ViewModelInstanceAssetFontBase::typeKey:
+        {
+            lua_newrive<ScriptedPropertyFont>(
+                L,
+                L,
+                ref_rcp(propValue->as<ViewModelInstanceAssetFont>()));
+            break;
+        }
+        case ViewModelInstanceAssetBlobBase::typeKey:
+        {
+            lua_newrive<ScriptedPropertyBlob>(
+                L,
+                L,
+                ref_rcp(propValue->as<ViewModelInstanceAssetBlob>()));
+            break;
+        }
         default:
             lua_pushnil(L);
             break;
@@ -101,15 +159,17 @@ static void pushViewModelInstanceValue(lua_State* L,
 //     return 1;
 // }
 
-ScriptedProperty::~ScriptedProperty()
-{
-    m_instanceValue->removeDelegate(this);
-    clearListeners();
-}
+ScriptedProperty::~ScriptedProperty() { dispose(); }
 
-ScriptedPropertyViewModel::~ScriptedPropertyViewModel()
+ScriptedPropertyViewModel::~ScriptedPropertyViewModel() { dispose(); }
+
+void ScriptedProperty::clearCachedValueRef()
 {
-    lua_unref(m_state, m_valueRef);
+    if (m_cachedValueRef != 0)
+    {
+        lua_unref(m_state, m_cachedValueRef);
+        m_cachedValueRef = 0;
+    }
 }
 
 void ScriptedProperty::clearListeners()
@@ -122,6 +182,7 @@ void ScriptedProperty::clearListeners()
         {
             lua_unref(m_state, listener.userdata);
         }
+        lua_unref(m_state, listener.propertySelfRef);
     }
     m_listeners.clear();
 }
@@ -130,11 +191,72 @@ ScriptedProperty::ScriptedProperty(lua_State* L,
                                    rcp<ViewModelInstanceValue> value) :
     m_state(L), m_instanceValue(std::move(value))
 {
-    m_instanceValue->addDelegate(this);
+    if (m_instanceValue != nullptr)
+    {
+        m_instanceValue->addDelegate(this);
+    }
+
+    auto context = scriptingContext(L);
+    if (context != nullptr)
+    {
+        m_owner = context->currentScriptedObject();
+        if (m_owner != nullptr)
+        {
+            m_owner->addTrackedScriptedProperty(this);
+        }
+#ifdef WITH_RIVE_TOOLS
+        else
+        {
+            context->trackOrphanScriptedProperty(this);
+            m_orphanContext = context;
+            m_orphanOwnerTag = context->orphanOwnerTag();
+        }
+#endif
+    }
+}
+
+void ScriptedProperty::dispose()
+{
+    if (m_disposed)
+    {
+        return;
+    }
+    m_disposed = true;
+
+    if (m_owner != nullptr)
+    {
+        m_owner->removeTrackedScriptedProperty(this);
+        m_owner = nullptr;
+    }
+#ifdef WITH_RIVE_TOOLS
+    if (m_orphanContext != nullptr)
+    {
+        m_orphanContext->untrackOrphanScriptedProperty(this);
+        m_orphanContext = nullptr;
+    }
+#endif
+
+    if (m_instanceValue != nullptr)
+    {
+        m_instanceValue->removeDelegate(this);
+        m_instanceValue = nullptr;
+    }
+
+    clearCachedValueRef();
+    clearListeners();
 }
 
 void ScriptedProperty::valueChanged()
 {
+    clearCachedValueRef();
+    if (m_listeners.empty())
+    {
+        return;
+    }
+    if (!lua_checkstack(m_state, (int)(m_listeners.size() * 2 + LUA_MINSTACK)))
+    {
+        return;
+    }
     // This works because we don't actually call as we go (or we could
     // invalidate listeners if a callback registers a new or removes a
     // listener). Instead, we build up the call stack and then call for each
@@ -164,15 +286,21 @@ int ScriptedProperty::addListener()
 {
     if (lua_isfunction(m_state, 2))
     {
+        lua_pushvalue(m_state, 1);
+        int propertySelfRef = lua_ref(m_state, -1);
+        lua_pop(m_state, 1);
         int callbackRef = lua_ref(m_state, 2);
-        m_listeners.push_back({callbackRef});
+        m_listeners.push_back({callbackRef, 0, propertySelfRef});
         return 0;
     }
     else if (lua_isfunction(m_state, 3))
     {
+        lua_pushvalue(m_state, 1);
+        int propertySelfRef = lua_ref(m_state, -1);
+        lua_pop(m_state, 1);
         int userdataRef = lua_ref(m_state, 2);
         int callbackRef = lua_ref(m_state, 3);
-        m_listeners.push_back({callbackRef, userdataRef});
+        m_listeners.push_back({callbackRef, userdataRef, propertySelfRef});
         return 0;
     }
 
@@ -207,6 +335,7 @@ int ScriptedProperty::removeListener()
             {
                 lua_unref(m_state, listener.userdata);
             }
+            lua_unref(m_state, listener.propertySelfRef);
             itr = m_listeners.erase(itr);
         }
         else
@@ -225,14 +354,66 @@ ScriptedPropertyViewModel::ScriptedPropertyViewModel(
     ScriptedProperty(L, std::move(value)), m_viewModel(std::move(viewModel))
 {}
 
+void ScriptedPropertyViewModel::setValue(ScriptedViewModel* scriptedViewModel)
+{
+    if (m_instanceValue != nullptr &&
+        m_instanceValue->is<ViewModelInstanceViewModel>())
+    {
+        auto instanceValue = m_instanceValue->as<ViewModelInstanceViewModel>();
+        auto parentViewModelInstance = instanceValue->parentViewModelInstance();
+        auto viewModelInstance = scriptedViewModel->mutableViewModelInstance();
+        // replaceViewModelByProperty notifies this property's value-dependents
+        // (including this wrapper and any siblings sharing the property) so
+        // cached Lua-side values are invalidated.
+        parentViewModelInstance->replaceViewModelByProperty(
+            instanceValue,
+            rcp<ViewModelInstance>(viewModelInstance));
+    }
+}
+
+void ScriptedPropertyViewModel::dispose()
+{
+    if (m_instanceValue)
+    {
+        m_instanceValue->removeDependent(this);
+    }
+    clearRef();
+    ScriptedProperty::dispose();
+}
+
+void ScriptedPropertyViewModel::clearRef()
+{
+
+    if (m_valueRef != 0)
+    {
+        lua_unref(m_state, m_valueRef);
+        m_valueRef = 0;
+    }
+}
+
 ScriptedViewModel::ScriptedViewModel(lua_State* L,
                                      rcp<ViewModel> viewModel,
                                      rcp<ViewModelInstance> viewModelInstance) :
     m_state(L), m_viewModel(viewModel), m_viewModelInstance(viewModelInstance)
-{}
+{
+    // Register the instance so detached ones (no parents) get advanced at the
+    // end of each frame. Tracking is keyed to owner lifetime, so the instance
+    // stays tracked while any owner (this wrapper, a scripted artboard) is
+    // alive. Store the context so unregistration in the destructor does not
+    // depend on lua_getthreaddata during Lua finalization.
+    m_scriptingContext = scriptingContext(L);
+    if (m_scriptingContext != nullptr)
+    {
+        m_scriptingContext->trackViewModelInstance(m_viewModelInstance);
+    }
+}
 
 ScriptedViewModel::~ScriptedViewModel()
 {
+    if (m_scriptingContext != nullptr)
+    {
+        m_scriptingContext->untrackViewModelInstance(m_viewModelInstance.get());
+    }
     for (auto itr : m_propertyRefs)
     {
         lua_unref(m_state, itr.second);
@@ -276,13 +457,59 @@ int ScriptedViewModel::instance(lua_State* L)
     return 1;
 }
 
+#ifdef WITH_RIVE_TOOLS
+static ScriptedProperty* scriptedPropertyOrNull(lua_State* L, int idx)
+{
+    if (!lua_isuserdata(L, idx))
+    {
+        return nullptr;
+    }
+    switch (lua_userdatatag(L, idx))
+    {
+        case ScriptedPropertyNumber::luaTag:
+        case ScriptedPropertyTrigger::luaTag:
+        case ScriptedPropertyList::luaTag:
+        case ScriptedPropertyColor::luaTag:
+        case ScriptedPropertyString::luaTag:
+        case ScriptedPropertyBoolean::luaTag:
+        case ScriptedPropertyEnum::luaTag:
+        case ScriptedPropertyImage::luaTag:
+        case ScriptedPropertyFont::luaTag:
+        case ScriptedPropertyBlob::luaTag:
+            return (ScriptedProperty*)lua_touserdata(L, idx);
+        default:
+            return nullptr;
+    }
+}
+#endif
+
 int ScriptedViewModel::pushValue(const char* name, int coreType)
 {
     auto itr = m_propertyRefs.find(name);
     if (itr != m_propertyRefs.end())
     {
         lua_rawgeti(m_state, LUA_REGISTRYINDEX, itr->second);
+#ifdef WITH_RIVE_TOOLS
+        // Orphan properties (which are only tracked/swept under
+        // WITH_RIVE_TOOLS) can be disposed out from under us when a
+        // scripting-context regeneration (e.g. the editor's recompileAll)
+        // sweeps them but keeps this lua_State alive — leaving the
+        // ScriptedViewModel (cached on a long-lived artboard/self) pointing at
+        // dead wrappers.
+        ScriptedProperty* cached = scriptedPropertyOrNull(m_state, -1);
+        if (cached != nullptr && cached->disposed())
+        {
+            lua_pop(m_state, 1);
+            lua_unref(m_state, itr->second);
+            m_propertyRefs.erase(itr);
+        }
+        else
+        {
+            return 1;
+        }
+#else
         return 1;
+#endif
     }
     // To be fully typesafe at runtime we should check the property in the
     // viewmodel and make sure the one in the value matches the same type or
@@ -346,6 +573,24 @@ int ScriptedViewModel::pushValue(const char* name, int coreType)
                                                            nullptr,
                                                            nullptr);
                     break;
+                case ViewModelPropertyAssetImageBase::typeKey:
+                    lua_newrive<ScriptedPropertyImage>(m_state,
+                                                       m_state,
+                                                       nullptr);
+                    break;
+                case ViewModelPropertyAssetFontBase::typeKey:
+                    lua_newrive<ScriptedPropertyFont>(m_state,
+                                                      m_state,
+                                                      nullptr);
+                    break;
+                case ViewModelPropertyAssetBlobBase::typeKey:
+                    lua_newrive<ScriptedPropertyBlob>(m_state,
+                                                      m_state,
+                                                      nullptr);
+                    break;
+                case ViewModelPropertySymbolListIndexBase::typeKey:
+                    lua_pushinteger(m_state, 1);
+                    break;
             }
         }
     }
@@ -359,17 +604,31 @@ int ScriptedViewModel::pushValue(const char* name, int coreType)
         }
         else
         {
-            pushViewModelInstanceValue(m_state, m_viewModel, propValue);
+            pushViewModelInstanceValue(m_state, propValue);
         }
     }
     m_propertyRefs[name] = lua_ref(m_state, -1);
     return 1;
 }
 
+int ScriptedViewModel::pushIndex()
+{
+    auto prop = m_viewModelInstance->propertyValue(SymbolType::itemIndex);
+    if (prop && prop->is<ViewModelInstanceSymbolListIndex>())
+    {
+        lua_pushinteger(
+            m_state,
+            prop->as<ViewModelInstanceSymbolListIndex>()->propertyValue());
+    }
+    else
+    {
+        lua_pushinteger(m_state, -1);
+    }
+    return 1;
+}
+
 int ScriptedPropertyViewModel::pushValue()
 {
-    // N.B. we'll need to invalidate m_valueRef if the viewmodel's value on the
-    // property changes.
     if (m_valueRef != 0)
     {
         lua_rawgeti(m_state, LUA_REGISTRYINDEX, m_valueRef);
@@ -377,12 +636,17 @@ int ScriptedPropertyViewModel::pushValue()
     }
     if (m_instanceValue)
     {
-        lua_newrive<ScriptedViewModel>(
-            m_state,
-            m_state,
-            m_viewModel,
-            m_instanceValue->as<ViewModelInstanceViewModel>()
-                ->referenceViewModelInstance());
+        m_instanceValue->addDependent(this);
+        // Derive the view model from the current reference; the creation-time
+        // one goes stale when the reference binds or swaps after a relink.
+        auto reference = m_instanceValue->as<ViewModelInstanceViewModel>()
+                             ->referenceViewModelInstance();
+        lua_newrive<ScriptedViewModel>(m_state,
+                                       m_state,
+                                       reference != nullptr
+                                           ? ref_rcp(reference->viewModel())
+                                           : m_viewModel,
+                                       reference);
     }
     else
     {
@@ -392,6 +656,8 @@ int ScriptedPropertyViewModel::pushValue()
     m_valueRef = lua_ref(m_state, -1);
     return 1;
 }
+
+void ScriptedPropertyViewModel::relinkDataBind() { clearRef(); }
 
 static int property_vm_index(lua_State* L)
 {
@@ -412,6 +678,33 @@ static int property_vm_index(lua_State* L)
         default:
             return 0;
     }
+}
+
+static int property_vm_newindex(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto scriptedPropertyViewModel =
+        lua_torive<ScriptedPropertyViewModel>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+        {
+            auto vm = lua_torive<ScriptedViewModel>(L, 3);
+            scriptedPropertyViewModel->setValue(vm);
+            break;
+        }
+        default:
+            return 0;
+    }
+
+    return 0;
 }
 
 static int vm_index(lua_State* L)
@@ -446,8 +739,8 @@ static int property_namecall_atom(lua_State* L,
             if (value != nullptr && value->is<ViewModelInstanceTrigger>())
             {
                 value->as<ViewModelInstanceTrigger>()->trigger();
-                return 0;
             }
+            return 0;
         }
         case (int)LuaAtoms::push:
         {
@@ -505,6 +798,12 @@ static int property_namecall_atom(lua_State* L,
             }
             return 0;
         }
+        case (int)LuaAtoms::clear:
+        {
+            auto list = property->instanceValue()->as<ViewModelInstanceList>();
+            list->removeAllItems();
+            return 0;
+        }
 
         case (int)LuaAtoms::insert:
         {
@@ -516,7 +815,60 @@ static int property_namecall_atom(lua_State* L,
             auto listItem = make_rcp<ViewModelInstanceListItem>();
 
             listItem->viewModelInstance(copy);
-            list->addItemAt(listItem, index);
+            list->addItemAt(listItem, index - 1);
+            return 0;
+        }
+
+        case (int)LuaAtoms::remove:
+        {
+            auto list = property->instanceValue()->as<ViewModelInstanceList>();
+            auto* vmUser = static_cast<ScriptedViewModel*>(
+                lua_touserdatatagged(L, 2, ScriptedViewModel::luaTag));
+            if (vmUser != nullptr)
+            {
+                auto vmi = vmUser->viewModelInstance();
+                if (vmi)
+                {
+                    for (const auto& item : list->listItems())
+                    {
+                        if (item->viewModelInstance() == vmi)
+                        {
+                            list->removeItem(item);
+                            break;
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+
+        case (int)LuaAtoms::removeAt:
+        {
+            auto list = property->instanceValue()->as<ViewModelInstanceList>();
+            const lua_Integer luaIndex = luaL_checkinteger(L, 2);
+            const size_t count = list->listItems().size();
+            if (luaIndex < 1 ||
+                static_cast<uint64_t>(luaIndex) > static_cast<uint64_t>(count))
+            {
+                luaL_error(L, "removeAt index out of range");
+            }
+            list->removeItem(static_cast<int>(luaIndex - 1));
+            return 0;
+        }
+
+        case (int)LuaAtoms::removeAllOf:
+        {
+            auto list = property->instanceValue()->as<ViewModelInstanceList>();
+            auto* vmUser = static_cast<ScriptedViewModel*>(
+                lua_touserdatatagged(L, 2, ScriptedViewModel::luaTag));
+            if (vmUser != nullptr)
+            {
+                auto vmi = vmUser->viewModelInstance();
+                if (vmi)
+                {
+                    list->removeAllItemsWithViewModelInstance(vmi.get());
+                }
+            }
             return 0;
         }
 
@@ -611,6 +963,35 @@ static int vm_namecall(lua_State* L)
                 assert(vm->state() == L);
                 return vm->pushValue(name, ViewModelInstanceEnumBase::typeKey);
             }
+            case (int)LuaAtoms::getIndex:
+            {
+                assert(vm->state() == L);
+                return vm->pushIndex();
+            }
+            case (int)LuaAtoms::getImage:
+            {
+                size_t namelen = 0;
+                const char* name = luaL_checklstring(L, 2, &namelen);
+                assert(vm->state() == L);
+                return vm->pushValue(name,
+                                     ViewModelInstanceAssetImageBase::typeKey);
+            }
+            case (int)LuaAtoms::getFont:
+            {
+                size_t namelen = 0;
+                const char* name = luaL_checklstring(L, 2, &namelen);
+                assert(vm->state() == L);
+                return vm->pushValue(name,
+                                     ViewModelInstanceAssetFontBase::typeKey);
+            }
+            case (int)LuaAtoms::getBlob:
+            {
+                size_t namelen = 0;
+                const char* name = luaL_checklstring(L, 2, &namelen);
+                assert(vm->state() == L);
+                return vm->pushValue(name,
+                                     ViewModelInstanceAssetBlobBase::typeKey);
+            }
             case (int)LuaAtoms::instance:
             case (int)LuaAtoms::newAtom:
             {
@@ -682,6 +1063,15 @@ static int property_namecall(lua_State* L)
                 break;
             case ScriptedPropertyList::luaTag:
                 name = ScriptedPropertyList::luaName;
+                break;
+            case ScriptedPropertyImage::luaTag:
+                name = ScriptedPropertyImage::luaName;
+                break;
+            case ScriptedPropertyFont::luaTag:
+                name = ScriptedPropertyFont::luaName;
+                break;
+            case ScriptedPropertyBlob::luaTag:
+                name = ScriptedPropertyBlob::luaName;
                 break;
             default:
                 luaL_typeerror(L, 1, name);
@@ -954,6 +1344,257 @@ int ScriptedPropertyList::pushValue(int index)
     return 1;
 }
 
+ScriptedPropertyImage::ScriptedPropertyImage(
+    lua_State* L,
+    rcp<ViewModelInstanceAssetImage> value) :
+    ScriptedProperty(L, std::move(value))
+{}
+
+void ScriptedPropertyImage::setValue(ScriptedImage* scriptedImage)
+{
+    if (!m_instanceValue)
+    {
+        return;
+    }
+    m_instanceValue->as<ViewModelInstanceAssetImage>()->value(
+        scriptedImage != nullptr ? scriptedImage->image.get() : nullptr);
+}
+
+int ScriptedPropertyImage::pushValue()
+{
+    if (m_cachedValueRef != 0)
+    {
+        lua_rawgeti(m_state, LUA_REGISTRYINDEX, m_cachedValueRef);
+        return 1;
+    }
+    if (m_instanceValue)
+    {
+        auto vmi = m_instanceValue->as<ViewModelInstanceAssetImage>();
+        RenderImage* renderImage = nullptr;
+        if (auto asset = vmi->asset())
+        {
+            renderImage = asset->renderImage();
+        }
+        // Fall back to the file's asset registry when no image is embedded
+        // on the instance — mirrors DataBindContextValueAssetImage.
+        if (renderImage == nullptr && owner() != nullptr)
+        {
+            if (auto scriptAsset = owner()->scriptAsset())
+            {
+                if (auto file = scriptAsset->file())
+                {
+                    auto fileAsset = file->asset(vmi->propertyValue());
+                    if (fileAsset != nullptr && fileAsset->is<ImageAsset>())
+                    {
+                        renderImage =
+                            fileAsset->as<ImageAsset>()->renderImage();
+                    }
+                }
+            }
+        }
+#ifdef WITH_RIVE_TOOLS
+        // Editor/Dart path: when the property is constructed without a
+        // ScriptedObject owner (owner() is null), reach the File through
+        // the ViewModel instead.
+        if (renderImage == nullptr && owner() == nullptr)
+        {
+            if (auto vmInstance = vmi->viewModelInstance())
+            {
+                if (auto viewModel = vmInstance->viewModel())
+                {
+                    if (auto file = viewModel->file())
+                    {
+                        auto fileAsset = file->asset(vmi->propertyValue());
+                        if (fileAsset != nullptr && fileAsset->is<ImageAsset>())
+                        {
+                            renderImage =
+                                fileAsset->as<ImageAsset>()->renderImage();
+                        }
+                    }
+                }
+            }
+        }
+#endif
+        if (renderImage != nullptr)
+        {
+            // Use the out-of-line `ScriptedImage::luaNew` factory rather
+            // than `lua_newrive<ScriptedImage>` directly: when ore is
+            // enabled, ScriptedImage holds an `rcp<ore::TextureView>` and
+            // its destructor needs the full TextureView definition (this
+            // TU only sees the forward decl in `rive_lua_libs.hpp`). The
+            // factory lives in `lua_gpu.cpp` / `lua_image.cpp` where the
+            // ore headers are visible.
+            auto scriptedImage = ScriptedImage::luaNew(m_state);
+            scriptedImage->image = ref_rcp(renderImage);
+            m_cachedValueRef = lua_ref(m_state, -1);
+            return 1;
+        }
+    }
+    lua_pushnil(m_state);
+    return 1;
+}
+
+ScriptedPropertyFont::ScriptedPropertyFont(
+    lua_State* L,
+    rcp<ViewModelInstanceAssetFont> value) :
+    ScriptedProperty(L, std::move(value))
+{}
+
+void ScriptedPropertyFont::setValue(ScriptedFont* scriptedFont)
+{
+    if (!m_instanceValue)
+    {
+        return;
+    }
+    m_instanceValue->as<ViewModelInstanceAssetFont>()->value(
+        scriptedFont != nullptr ? scriptedFont->font.get() : nullptr);
+}
+
+int ScriptedPropertyFont::pushValue()
+{
+    if (m_cachedValueRef != 0)
+    {
+        lua_rawgeti(m_state, LUA_REGISTRYINDEX, m_cachedValueRef);
+        return 1;
+    }
+    if (m_instanceValue)
+    {
+        auto vmi = m_instanceValue->as<ViewModelInstanceAssetFont>();
+        Font* font = nullptr;
+        if (auto asset = vmi->asset())
+        {
+            font = asset->font().get();
+        }
+        // Fall back to the file's asset registry when no font is embedded
+        // on the instance — mirrors the image property.
+        if (font == nullptr && owner() != nullptr)
+        {
+            if (auto scriptAsset = owner()->scriptAsset())
+            {
+                if (auto file = scriptAsset->file())
+                {
+                    auto fileAsset = file->asset(vmi->propertyValue());
+                    if (fileAsset != nullptr && fileAsset->is<FontAsset>())
+                    {
+                        font = fileAsset->as<FontAsset>()->font().get();
+                    }
+                }
+            }
+        }
+#ifdef WITH_RIVE_TOOLS
+        // Editor/Dart path: when the property is constructed without a
+        // ScriptedObject owner, reach the File through the ViewModel.
+        if (font == nullptr && owner() == nullptr)
+        {
+            if (auto vmInstance = vmi->viewModelInstance())
+            {
+                if (auto viewModel = vmInstance->viewModel())
+                {
+                    if (auto file = viewModel->file())
+                    {
+                        auto fileAsset = file->asset(vmi->propertyValue());
+                        if (fileAsset != nullptr && fileAsset->is<FontAsset>())
+                        {
+                            font = fileAsset->as<FontAsset>()->font().get();
+                        }
+                    }
+                }
+            }
+        }
+#endif
+        if (font != nullptr)
+        {
+            auto scriptedFont = lua_newrive<ScriptedFont>(m_state);
+            scriptedFont->font = ref_rcp(font);
+            m_cachedValueRef = lua_ref(m_state, -1);
+            return 1;
+        }
+    }
+    lua_pushnil(m_state);
+    return 1;
+}
+
+ScriptedPropertyBlob::ScriptedPropertyBlob(
+    lua_State* L,
+    rcp<ViewModelInstanceAssetBlob> value) :
+    ScriptedProperty(L, std::move(value))
+{}
+
+void ScriptedPropertyBlob::setValue(BlobAsset* blob)
+{
+    if (!m_instanceValue)
+    {
+        return;
+    }
+    m_instanceValue->as<ViewModelInstanceAssetBlob>()->value(blob);
+}
+
+int ScriptedPropertyBlob::pushValue()
+{
+    if (m_cachedValueRef != 0)
+    {
+        lua_rawgeti(m_state, LUA_REGISTRYINDEX, m_cachedValueRef);
+        return 1;
+    }
+    if (m_instanceValue)
+    {
+        auto vmi = m_instanceValue->as<ViewModelInstanceAssetBlob>();
+        rcp<FileAsset> fileAsset = nullptr;
+        // A non-null asset means the blob was set directly on the instance
+        // (e.g. `prop.value = ...` from a script), including a legitimately
+        // empty blob. A null asset means the value is id-bound (or unset) —
+        // resolve it through the file registry.
+        if (auto asset = vmi->asset())
+        {
+            fileAsset = asset;
+        }
+        if (fileAsset == nullptr && owner() != nullptr)
+        {
+            if (auto scriptAsset = owner()->scriptAsset())
+            {
+                if (auto file = scriptAsset->file())
+                {
+                    auto candidate = file->asset(vmi->propertyValue());
+                    if (candidate != nullptr && candidate->is<BlobAsset>())
+                    {
+                        fileAsset = candidate;
+                    }
+                }
+            }
+        }
+#ifdef WITH_RIVE_TOOLS
+        // Editor/Dart path: when the property is constructed without a
+        // ScriptedObject owner, reach the File through the ViewModel.
+        if (fileAsset == nullptr && owner() == nullptr)
+        {
+            if (auto vmInstance = vmi->viewModelInstance())
+            {
+                if (auto viewModel = vmInstance->viewModel())
+                {
+                    if (auto file = viewModel->file())
+                    {
+                        auto candidate = file->asset(vmi->propertyValue());
+                        if (candidate != nullptr && candidate->is<BlobAsset>())
+                        {
+                            fileAsset = candidate;
+                        }
+                    }
+                }
+            }
+        }
+#endif
+        if (fileAsset != nullptr)
+        {
+            auto scriptedBlob = lua_newrive<ScriptedBlob>(m_state);
+            scriptedBlob->asset = fileAsset;
+            m_cachedValueRef = lua_ref(m_state, -1);
+            return 1;
+        }
+    }
+    lua_pushnil(m_state);
+    return 1;
+}
+
 int ScriptedEnumValues::pushValue(int index)
 {
     if (m_dataEnum && m_state)
@@ -982,6 +1623,46 @@ int ScriptedEnumValues::pushLength()
         lua_pushinteger(m_state, 0);
     }
     return 1;
+}
+
+// Direct field getters: dispatched by LOP_GETTABLEKS on `prop.value` /
+// `list.length`. Slow paths (property_*_index) remain reachable for
+// computed-key access and lua_getfield from C.
+
+static void property_number_direct_value(void* udata, void* result)
+{
+    auto* p = (ScriptedPropertyNumber*)udata;
+    auto* iv = p->instanceValue();
+    lua_userdatadirectfield_setnumber(
+        result,
+        iv ? iv->as<ViewModelInstanceNumber>()->propertyValue() : 0);
+}
+
+static void property_color_direct_value(void* udata, void* result)
+{
+    auto* p = (ScriptedPropertyColor*)udata;
+    auto* iv = p->instanceValue();
+    lua_userdatadirectfield_setnumber(
+        result,
+        iv ? (unsigned)iv->as<ViewModelInstanceColor>()->propertyValue() : 0);
+}
+
+static void property_boolean_direct_value(void* udata, void* result)
+{
+    auto* p = (ScriptedPropertyBoolean*)udata;
+    auto* iv = p->instanceValue();
+    lua_userdatadirectfield_setboolean(
+        result,
+        iv ? (iv->as<ViewModelInstanceBoolean>()->propertyValue() ? 1 : 0) : 0);
+}
+
+static void property_list_direct_length(void* udata, void* result)
+{
+    auto* p = (ScriptedPropertyList*)udata;
+    auto* iv = p->instanceValue();
+    lua_userdatadirectfield_setnumber(
+        result,
+        iv ? (double)iv->as<ViewModelInstanceList>()->listItems().size() : 0);
 }
 
 static int property_list_index(lua_State* L)
@@ -1244,6 +1925,175 @@ static int property_enum_newindex(lua_State* L)
     return 0;
 }
 
+static int property_image_index(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyImage = lua_torive<ScriptedPropertyImage>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+            assert(propertyImage->state() == L);
+            return propertyImage->pushValue();
+        default:
+            return 0;
+    }
+}
+
+static int property_image_newindex(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyImage = lua_torive<ScriptedPropertyImage>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+        {
+            auto image = lua_torive<ScriptedImage>(L, 3);
+            propertyImage->setValue(image);
+            break;
+        }
+        default:
+            return 0;
+    }
+
+    return 0;
+}
+
+static int property_font_index(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyFont = lua_torive<ScriptedPropertyFont>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+            assert(propertyFont->state() == L);
+            return propertyFont->pushValue();
+        default:
+            return 0;
+    }
+}
+
+static int property_font_newindex(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyFont = lua_torive<ScriptedPropertyFont>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+        {
+            auto font = lua_torive<ScriptedFont>(L, 3);
+            propertyFont->setValue(font);
+            break;
+        }
+        default:
+            return 0;
+    }
+
+    return 0;
+}
+
+static int property_blob_index(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyBlob = lua_torive<ScriptedPropertyBlob>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+            assert(propertyBlob->state() == L);
+            return propertyBlob->pushValue();
+        default:
+            return 0;
+    }
+}
+
+static int property_blob_newindex(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto propertyBlob = lua_torive<ScriptedPropertyBlob>(L, 1);
+    switch (atom)
+    {
+        case (int)LuaAtoms::value:
+        {
+            if (lua_isnil(L, 3))
+            {
+                propertyBlob->setValue(nullptr);
+                break;
+            }
+            // Accept raw bytes (a Luau buffer or a string) and build a blob, or
+            // an existing Blob userdata.
+            if (lua_isbuffer(L, 3))
+            {
+                size_t len = 0;
+                void* data = lua_tobuffer(L, 3, &len);
+                auto blobAsset = make_rcp<BlobAsset>();
+                SimpleArray<uint8_t> bytes((const uint8_t*)data, len);
+                blobAsset->decode(bytes, nullptr);
+                propertyBlob->setValue(blobAsset.get());
+                break;
+            }
+            if (lua_type(L, 3) == LUA_TSTRING)
+            {
+                size_t len = 0;
+                const char* data = lua_tolstring(L, 3, &len);
+                auto blobAsset = make_rcp<BlobAsset>();
+                SimpleArray<uint8_t> bytes((const uint8_t*)data, len);
+                blobAsset->decode(bytes, nullptr);
+                propertyBlob->setValue(blobAsset.get());
+                break;
+            }
+            auto blob = lua_torive<ScriptedBlob>(L, 3);
+            propertyBlob->setValue(blob->asset ? blob->asset->as<BlobAsset>()
+                                               : nullptr);
+            break;
+        }
+        default:
+            return 0;
+    }
+
+    return 0;
+}
+
 static int vm_eq(lua_State* L)
 {
     auto lhs = lua_torive<ScriptedViewModel>(L, 1);
@@ -1276,6 +2126,9 @@ int luaopen_rive_properties(lua_State* L)
         lua_pushcfunction(L, property_vm_index, nullptr);
         lua_setfield(L, -2, "__index");
 
+        lua_pushcfunction(L, property_vm_newindex, nullptr);
+        lua_setfield(L, -2, "__newindex");
+
         lua_pushcfunction(L, property_vm_namecall, nullptr);
         lua_setfield(L, -2, "__namecall");
 
@@ -1297,6 +2150,11 @@ int luaopen_rive_properties(lua_State* L)
 
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedPropertyNumber::luaTag,
+                                           "value",
+                                           property_number_direct_value);
     }
 
     {
@@ -1313,6 +2171,11 @@ int luaopen_rive_properties(lua_State* L)
 
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedPropertyColor::luaTag,
+                                           "value",
+                                           property_color_direct_value);
     }
 
     {
@@ -1345,6 +2208,11 @@ int luaopen_rive_properties(lua_State* L)
 
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedPropertyBoolean::luaTag,
+                                           "value",
+                                           property_boolean_direct_value);
     }
 
     {
@@ -1381,6 +2249,65 @@ int luaopen_rive_properties(lua_State* L)
 
         lua_pushcfunction(L, property_list_index, nullptr);
         lua_setfield(L, -2, "__index");
+
+        lua_setreadonly(L, -1, true);
+        lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedPropertyList::luaTag,
+                                           "length",
+                                           property_list_direct_length);
+    }
+
+    {
+        lua_register_rive<ScriptedPropertyImage>(L);
+
+        lua_pushcfunction(L, property_namecall, nullptr);
+        lua_setfield(L, -2, "__namecall");
+
+        lua_pushcfunction(L, property_image_index, nullptr);
+        lua_setfield(L, -2, "__index");
+
+        lua_pushcfunction(L, property_image_newindex, nullptr);
+        lua_setfield(L, -2, "__newindex");
+
+        lua_setreadonly(L, -1, true);
+        lua_pop(L, 1); // pop the metatable
+    }
+
+    {
+        // No metatable, but the rcp<Font> member needs its destructor run
+        // when the userdata is collected.
+        lua_register_rive<ScriptedFont>(L);
+    }
+
+    {
+        lua_register_rive<ScriptedPropertyFont>(L);
+
+        lua_pushcfunction(L, property_namecall, nullptr);
+        lua_setfield(L, -2, "__namecall");
+
+        lua_pushcfunction(L, property_font_index, nullptr);
+        lua_setfield(L, -2, "__index");
+
+        lua_pushcfunction(L, property_font_newindex, nullptr);
+        lua_setfield(L, -2, "__newindex");
+
+        lua_setreadonly(L, -1, true);
+        lua_pop(L, 1); // pop the metatable
+    }
+
+    {
+        lua_register_rive<ScriptedPropertyBlob>(L);
+
+        lua_pushcfunction(L, property_namecall, nullptr);
+        lua_setfield(L, -2, "__namecall");
+
+        lua_pushcfunction(L, property_blob_index, nullptr);
+        lua_setfield(L, -2, "__index");
+
+        lua_pushcfunction(L, property_blob_newindex, nullptr);
+        lua_setfield(L, -2, "__newindex");
 
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable

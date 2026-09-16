@@ -2,6 +2,9 @@
 #define _RIVE_NODE_BASE_HPP_
 #include "rive/core/field_types/core_double_type.hpp"
 #include "rive/transform_component.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class NodeBase : public TransformComponent
@@ -56,8 +59,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xPropertyKey, &m_X, &value);
         m_X = value;
-        xChanged();
+        RIVE_EDITOR_CHANGED(xChanged());
+        notifyPropertyChanged(xPropertyKey);
     }
 
     inline float y() const override { return m_Y; }
@@ -67,8 +72,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yPropertyKey, &m_Y, &value);
         m_Y = value;
-        yChanged();
+        RIVE_EDITOR_CHANGED(yChanged());
+        notifyPropertyChanged(yPropertyKey);
     }
 
     virtual void setComputedLocalX(float value) = 0;
@@ -81,6 +88,7 @@ public:
         }
         setComputedLocalX(value);
         computedLocalXChanged();
+        notifyPropertyChanged(computedLocalXPropertyKey);
     }
 
     virtual void setComputedLocalY(float value) = 0;
@@ -93,6 +101,7 @@ public:
         }
         setComputedLocalY(value);
         computedLocalYChanged();
+        notifyPropertyChanged(computedLocalYPropertyKey);
     }
 
     virtual void setComputedWorldX(float value) = 0;
@@ -105,6 +114,7 @@ public:
         }
         setComputedWorldX(value);
         computedWorldXChanged();
+        notifyPropertyChanged(computedWorldXPropertyKey);
     }
 
     virtual void setComputedWorldY(float value) = 0;
@@ -117,6 +127,7 @@ public:
         }
         setComputedWorldY(value);
         computedWorldYChanged();
+        notifyPropertyChanged(computedWorldYPropertyKey);
     }
 
     virtual void setComputedRootX(float value) = 0;
@@ -129,6 +140,7 @@ public:
         }
         setComputedRootX(value);
         computedRootXChanged();
+        notifyPropertyChanged(computedRootXPropertyKey);
     }
 
     virtual void setComputedRootY(float value) = 0;
@@ -141,6 +153,7 @@ public:
         }
         setComputedRootY(value);
         computedRootYChanged();
+        notifyPropertyChanged(computedRootYPropertyKey);
     }
 
     virtual void setComputedWidth(float value) = 0;
@@ -153,6 +166,7 @@ public:
         }
         setComputedWidth(value);
         computedWidthChanged();
+        notifyPropertyChanged(computedWidthPropertyKey);
     }
 
     virtual void setComputedHeight(float value) = 0;
@@ -165,6 +179,7 @@ public:
         }
         setComputedHeight(value);
         computedHeightChanged();
+        notifyPropertyChanged(computedHeightPropertyKey);
     }
 
     Core* clone() const override;
@@ -172,6 +187,7 @@ public:
     {
         m_X = object.m_X;
         m_Y = object.m_Y;
+        RIVE_EDITOR_COPY(object);
         TransformComponent::copy(object);
     }
 
@@ -186,6 +202,7 @@ public:
                 m_Y = CoreDoubleType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return TransformComponent::deserialize(propertyKey, reader);
     }
 
@@ -200,6 +217,9 @@ protected:
     virtual void computedRootYChanged() {}
     virtual void computedWidthChanged() {}
     virtual void computedHeightChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/node_ext.inl"
+#endif
 };
 } // namespace rive
 
