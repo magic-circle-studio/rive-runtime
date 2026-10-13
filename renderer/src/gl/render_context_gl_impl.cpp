@@ -2699,6 +2699,13 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
     // window, so its winding inverts, the same as the atlas pass above.
     glFrontFace(renderTarget->bottomUp() ? GL_CW : GL_CCW);
 
+    // Consecutive batches often need the same program. Reuse the previous
+    // lookup rather than rebuilding and hashing its pipeline key.
+    const DrawProgram* previousDrawProgram = nullptr;
+    gpu::DrawType previousDrawType{};
+    gpu::ShaderFeatures previousShaderFeatures{};
+    gpu::ShaderMiscFlags previousShaderMiscFlags{};
+
     // Execute the DrawList.
     for (const DrawBatch& batch : *desc.drawList)
     {
@@ -2713,17 +2720,31 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
             assert(m_plsImpl != nullptr);
             shaderMiscFlags |= m_plsImpl->shaderMiscFlags(desc, drawType);
         }
-        const DrawProgram* drawProgram = m_pipelineManager.tryGetPipeline(
-            {
-                .drawType = drawType,
-                .shaderFeatures = shaderFeatures,
-                .interlockMode = desc.interlockMode,
-                .shaderMiscFlags = shaderMiscFlags,
+        const DrawProgram* drawProgram;
+        if (previousDrawProgram != nullptr && drawType == previousDrawType &&
+            shaderFeatures == previousShaderFeatures &&
+            shaderMiscFlags == previousShaderMiscFlags)
+        {
+            drawProgram = previousDrawProgram;
+        }
+        else
+        {
+            drawProgram = m_pipelineManager.tryGetPipeline(
+                {
+                    .drawType = drawType,
+                    .shaderFeatures = shaderFeatures,
+                    .interlockMode = desc.interlockMode,
+                    .shaderMiscFlags = shaderMiscFlags,
 #ifdef WITH_RIVE_TOOLS
-                .synthesizedFailureType = desc.synthesizedFailureType,
+                    .synthesizedFailureType = desc.synthesizedFailureType,
 #endif
-            },
-            m_platformFeatures);
+                },
+                m_platformFeatures);
+            previousDrawProgram = drawProgram;
+            previousDrawType = drawType;
+            previousShaderFeatures = shaderFeatures;
+            previousShaderMiscFlags = shaderMiscFlags;
+        }
         if (drawProgram == nullptr)
         {
             // There was an issue getting either the requested draw program or
@@ -2741,11 +2762,19 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
             glutils::SetTexture2DSamplingParams(batch.imageSampler);
         }
 
+        // Combined dynamic-state draws set the complete pipeline state for
+        // each of their passes below, so only their scissor is decided here.
+        const bool setsPipelineStatePerPass =
+            drawType == DrawType::stencilDynamicMidpointFans ||
+            drawType == DrawType::stencilDynamicOuterCubics;
         gpu::PipelineState pipelineState;
-        gpu::get_pipeline_state(batch,
-                                desc,
-                                m_platformFeatures,
-                                &pipelineState);
+        if (!setsPipelineStatePerPass)
+        {
+            gpu::get_pipeline_state(batch,
+                                    desc,
+                                    m_platformFeatures,
+                                    &pipelineState);
+        }
         if (desc.interlockMode != gpu::InterlockMode::depthStencil)
         {
             assert(m_plsImpl != nullptr);
@@ -2829,10 +2858,17 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
         {
             auto scissorRect = fullUpdateScissorRect.intersectOrEmpty(
                 batch.scissorRect.value());
-            m_state->setPipelineState(pipelineState, ScissorAction::ignore);
+            if (!setsPipelineStatePerPass)
+            {
+                m_state->setPipelineState(pipelineState, ScissorAction::ignore);
+            }
             m_state->setScissor(scissorRect,
                                 renderTarget->height(),
                                 renderTarget->bottomUp());
+        }
+        else if (setsPipelineStatePerPass)
+        {
+            m_state->disableScissor();
         }
         else
         {
@@ -3168,7 +3204,8 @@ void RenderContextGLImpl::drawIndexedInstancedNoInstancedAttribs(
         else
 #endif
         {
-            glUniform1i(baseInstanceUniformLocation, chunkBaseInstance);
+            m_state->setBaseInstanceUniform(baseInstanceUniformLocation,
+                                            chunkBaseInstance);
             glDrawElementsInstanced(primitiveTopology,
                                     indexCount,
                                     GL_UNSIGNED_SHORT,

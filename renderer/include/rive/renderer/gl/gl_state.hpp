@@ -53,6 +53,9 @@ public:
                           ScissorAction = ScissorAction::disable);
 
     void bindProgram(GLuint);
+    // Sets the bound program's emulated base-instance uniform, skipping the
+    // call when the program still holds this value from an earlier draw.
+    void setBaseInstanceUniform(GLint location, GLint baseInstance);
     void bindVAO(GLuint);
     void bindBuffer(GLenum target, GLuint);
 
@@ -61,6 +64,20 @@ public:
     void deleteBuffer(GLuint);
 
 private:
+    // One face's glStencilFunc and glStencilOp arguments.
+    struct StencilFaceState
+    {
+        GLenum compareFunc;
+        GLint reference;
+        GLuint compareMask;
+        GLenum stencilFailOp;
+        GLenum depthFailOp;
+        GLenum depthStencilPassOp;
+    };
+
+    void setStencilFaces(const StencilFaceState& front,
+                         const StencilFaceState& back);
+
     const GLCapabilities m_capabilities;
     std::array<uint32_t, 4> m_scissorBox;
     bool m_scissorEnabled;
@@ -75,6 +92,10 @@ private:
     GLuint m_boundVAO;
     GLuint m_boundArrayBufferID;
     GLuint m_boundUniformBufferID;
+    StencilFaceState m_stencilFront;
+    StencilFaceState m_stencilBack;
+    GLint m_baseInstanceLocation;
+    GLint m_baseInstance;
 
     struct
     {
@@ -89,6 +110,9 @@ private:
         bool boundArrayBufferID : 1;
         bool boundUniformBufferID : 1;
         bool boundPixelUnpackBufferID : 1;
+        bool stencilFaces : 1;
+        // Only valid while the program it was set on remains bound.
+        bool baseInstanceUniform : 1;
     } m_validState;
 };
 } // namespace rive::gpu
