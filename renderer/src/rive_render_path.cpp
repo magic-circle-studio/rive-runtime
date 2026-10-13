@@ -476,7 +476,13 @@ IAABB RiveRenderPath::calculatePixelBounds(
     float feather,
     bool inkbleed) const
 {
-    AABB mappedBounds = matrix.mapBoundingBox(getRawPath().points());
+    // Without rotation or skew, the mapped points' bounds are exactly the
+    // mapped corners of the cached local bounds, so skip visiting every point.
+    // An empty path keeps the point mapping, which reports it as all zero.
+    const bool scaleTranslate = matrix.xy() == 0 && matrix.yx() == 0;
+    AABB mappedBounds = scaleTranslate && !getRawPath().empty()
+                            ? matrix.mapBoundingBox(getBounds())
+                            : matrix.mapBoundingBox(getRawPath().points());
 
     assert(mappedBounds.width() >= 0);
     assert(mappedBounds.height() >= 0);
