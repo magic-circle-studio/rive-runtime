@@ -483,6 +483,12 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
     {
         return;
     }
+    // Additive RGB uses the original opacity, not the reduced blend alpha.
+    // Preserve authored colors until materials can retain that original alpha.
+    if (draw.additiveness() > 0 && draw.blendMode() == BlendMode::srcOver)
+    {
+        return;
+    }
     if (state.surfaceMaterialBounds.isEmptyOrNaN())
     {
         return;
