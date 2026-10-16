@@ -142,6 +142,7 @@ private:
         yes,
     };
 
+    void captureSurfaceMaterialBinding(RiveRenderPath*);
     void applySurfaceMaterial(gpu::PathDraw&, RiveRenderPath*);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);

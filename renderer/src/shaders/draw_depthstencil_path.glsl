@@ -31,6 +31,9 @@ NO_PERSPECTIVE VARYING(0, float4, v_paint);
 #ifdef @ENABLE_MODULATED_IMAGE
 NO_PERSPECTIVE VARYING(2, float3, v_image);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(3, float4, v_surfaceMaterialData);
+#endif
 VARYING_BLOCK_END
 
 #ifdef @VERTEX
@@ -38,6 +41,9 @@ VARYING_BLOCK_END
 VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
 {
     VARYING_INIT(v_paint, float4);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_INIT(v_surfaceMaterialData, float4);
+#endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_INIT(v_blendMode, half);
 #endif
@@ -364,12 +370,21 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
         // hasn't explicitly disabled color writes, output a fully transparent
         // solid color.
         v_paint = float4(.0, .0, .0, .0);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+        v_surfaceMaterialData = float4(0.0, 0.0, 0.0, 0.0);
+#endif
 #ifdef @ENABLE_MODULATED_IMAGE
         v_image = float3(0.0, 0.0, 0.0);
 #endif
     }
     else
     {
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+        if (@ENABLE_HSL_BLEND_MODES)
+        {
+            v_surfaceMaterialData = load_surface_material_data(pathID, fragCoord);
+        }
+#endif
         uint2 paintData = STORAGE_BUFFER_LOAD2(@paintBuffer, pathID);
         uint paintType = paintData.x & 0xfu;
         bool paintHasAdvancedBlend = false;
@@ -463,6 +478,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
     pos.z = packNormalizedDepth(pathZIndex, depthCoverage8);
 
     VARYING_PACK(v_paint);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_PACK(v_surfaceMaterialData);
+#endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_PACK(v_blendMode);
 #endif
@@ -478,6 +496,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
 FRAG_DATA_MAIN(half4, @drawFragmentMain)
 {
     VARYING_UNPACK(v_paint, float4);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
+#endif
 #ifdef @ENABLE_MODULATED_IMAGE
     VARYING_UNPACK(v_image, float3);
 #endif
@@ -540,6 +561,14 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
             imageColor = make_half4(unmultiply_rgb(imageColor), imageColor.a);
 
         color *= imageColor;
+    }
+#endif
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        color = apply_surface_material_to_paint(
+            color, v_surfaceMaterialData, !paintHasAdvancedBlend);
     }
 #endif
 

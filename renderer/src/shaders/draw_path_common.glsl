@@ -42,6 +42,24 @@ STORAGE_BUFFER_U32x2(PAINT_BUFFER_IDX, PaintBuffer, @paintBuffer);
 STORAGE_BUFFER_F32x4(PAINT_AUX_BUFFER_IDX, PaintAuxBuffer, @paintAuxBuffer);
 STORAGE_BUFFER_U32x4(CONTOUR_BUFFER_IDX, ContourBuffer, @contourBuffer);
 VERTEX_STORAGE_BUFFER_BLOCK_END
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+INLINE float4 load_surface_material_data(uint pathID, float2 fragCoord)
+{
+    float4 translate = STORAGE_BUFFER_LOAD4(
+        @paintAuxBuffer,
+        pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT + PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
+    float4 materialData = float4(0.0, 0.0, translate.zw);
+    if (translate.z > 0.5)
+    {
+        float2x2 matrix = make_float2x2(STORAGE_BUFFER_LOAD4(
+            @paintAuxBuffer,
+            pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT + PAINT_AUX_MATERIAL_MATRIX_OFFSET));
+        materialData.xy = MUL(matrix, fragCoord) + translate.xy;
+    }
+    return materialData;
+}
+#endif
 #endif // @VERTEX
 
 #if defined(@ENABLE_FEATHER) || defined(@FEATHER_ATLAS_BLIT)

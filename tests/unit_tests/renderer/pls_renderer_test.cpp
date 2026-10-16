@@ -7,6 +7,9 @@
 #include "rive/renderer/rive_render_image.hpp"
 #include "../src/rive_render_path.hpp"
 #include "../src/rive_render_paint.hpp"
+#include "shaders/constants.glsl"
+#include <array>
+#include <cstring>
 #include <catch.hpp>
 
 namespace rive::gpu
@@ -1353,6 +1356,155 @@ TEST_CASE("image draws use scoped materials without caching shared paths",
     renderer.drawPath(rainbowImagePath.get(), &imagePaint);
     renderer.restore();
     CHECK_FALSE(rainbowImagePath->hasSurfaceMaterialBinding());
+
+    auto target = renderContext->static_impl_cast<RenderContextNULL>()
+                      ->makeRenderTarget(desc.renderTargetWidth,
+                                         desc.renderTargetHeight);
+    renderContext->flush({.renderTarget = target.get()});
+}
+
+// Inspect the material payload sent to shaders without a GPU backend.
+class MaterialCaptureContext : public RenderContextNULL
+{
+public:
+    std::vector<std::array<float, 8>> materials;
+
+    void* mapPaintAuxBuffer(size_t sizeInBytes) override
+    {
+        void* data = RenderContextNULL::mapPaintAuxBuffer(sizeInBytes);
+        m_paintAuxBytes = static_cast<const uint8_t*>(data);
+        return data;
+    }
+
+    void flush(const FlushDescriptor& desc) override
+    {
+        // Path ID zero is reserved; firstPaintAux is a record offset.
+        for (uint32_t pathID = 1; pathID < desc.pathCount; ++pathID)
+        {
+            std::array<float, 8> material;
+            memcpy(material.data(),
+                   m_paintAuxBytes + (desc.firstPaintAux + pathID) * sizeof(PaintAuxData) +
+                       PAINT_AUX_MATERIAL_MATRIX_OFFSET * 4 * sizeof(float),
+                   sizeof(material));
+            materials.push_back(material);
+        }
+    }
+
+private:
+    const uint8_t* m_paintAuxBytes = nullptr;
+};
+
+TEST_CASE("outside strokes retain material coordinates across poses",
+          "[RiveRenderer][SurfaceMaterial]")
+{
+    RenderContext context(std::make_unique<MaterialCaptureContext>());
+    auto* capture = context.static_impl_cast<MaterialCaptureContext>();
+    auto target = capture->makeRenderTarget(100, 100);
+    RiveRenderer renderer(&context);
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold, AABB(0, 0, 100, 100), 0);
+    auto path = make_rcp<RiveRenderPath>(FillRule::clockwise, make_rect({20, 20, 60, 60}));
+    RiveRenderPaint paint;
+    paint.color(0xffffffff);
+    paint.style(RenderPaintStyle::stroke);
+    paint.thickness(8);
+    paint.strokePosition(StrokePosition::outside);
+
+    for (float shift : {0.f, 10.f})
+    {
+        context.beginFrame(s_frameDescriptor);
+        capture->materials.clear();
+        renderer.save();
+        renderer.translate(shift, 0);
+        renderer.drawPath(path.get(), &paint);
+        renderer.restore();
+        context.flush({.renderTarget = target.get()});
+
+        size_t materialDrawCount = 0;
+        for (const auto& data : capture->materials)
+        {
+            if (data[6] == 0) // Clip paths have no material.
+            {
+                continue;
+            }
+            ++materialDrawCount;
+            CHECK(data[6] == static_cast<float>(SurfaceMaterial::gold));
+            Mat2D matrix(data[0], data[1], data[2], data[3], data[4], data[5]);
+            Vec2D uv = matrix * Vec2D{18 + shift, 40};
+            CHECK(uv.x == Approx(.18f));
+            CHECK(uv.y == Approx(.4f));
+        }
+        CHECK(materialDrawCount > 0);
+    }
+}
+
+TEST_CASE("luminance masks do not inherit surface materials", "[RiveRenderer][SurfaceMaterial]")
+{
+    RenderContext context(std::make_unique<MaterialCaptureContext>());
+    auto* capture = context.static_impl_cast<MaterialCaptureContext>();
+    auto target = capture->makeRenderTarget(100, 100);
+    RiveRenderer renderer(&context);
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold, AABB(0, 0, 100, 100), 0);
+    auto image = make_rcp<RiveRenderImage>(make_rcp<Texture>(100, 100));
+
+    for (LayerMaskMode mode : {LayerMaskMode::luminance, LayerMaskMode::invertedLuminance})
+    {
+        context.beginFrame(s_frameDescriptor);
+        REQUIRE(context.frameSupportsLayerMask());
+        capture->materials.clear();
+        renderer.applyLayerMask(image.get(), ImageSampler::LinearClamp(), mode);
+        context.flush({.renderTarget = target.get()});
+        REQUIRE_FALSE(capture->materials.empty());
+        for (const auto& data : capture->materials)
+        {
+            CHECK(data[6] == 0);
+        }
+    }
+
+    // Excluding masks must not clear the enclosing material scope.
+    context.beginFrame(s_frameDescriptor);
+    capture->materials.clear();
+    renderer.drawImage(image.get(), ImageSampler::LinearClamp(), BlendMode::srcOver, 1);
+    context.flush({.renderTarget = target.get()});
+    REQUIRE_FALSE(capture->materials.empty());
+    for (const auto& data : capture->materials)
+    {
+        CHECK(data[6] == static_cast<float>(SurfaceMaterial::gold));
+    }
+}
+
+TEST_CASE("cached pixel bounds match transformed path points", "[RiveRenderer][PixelBounds]")
+{
+    RiveRenderPath path;
+    const Mat2D transforms[] = {
+        Mat2D(),
+        Mat2D::fromScaleAndTranslation(2, 3, .25f, -.75f),
+        Mat2D::fromScaleAndTranslation(-2, -3, .25f, -.75f),
+        Mat2D::fromScaleAndTranslation(0, -3, .25f, -.75f),
+        Mat2D(0, 1, -1, 0, .25f, -.75f),
+        Mat2D(2, .5f, -.5f, 3, .25f, -.75f),
+    };
+    for (int mutation = 0; mutation < 4; ++mutation)
+    {
+        if (mutation == 1)
+        {
+            path.moveTo(-7, 2);
+            path.cubicTo(10, -20, -30, 40, 15, 8);
+            path.close();
+        }
+        else if (mutation == 2)
+        {
+            path.lineTo(50, -60);
+        }
+        else if (mutation == 3)
+        {
+            path.rewind();
+        }
+        for (const auto& matrix : transforms)
+        {
+            CHECK(path.calculatePixelBounds(matrix, {}, 0) ==
+                  matrix.mapBoundingBox(path.getRawPath().points()).roundOut());
+        }
+    }
 }
 
 // Ensure the renderer gracefully handles a null texture within a

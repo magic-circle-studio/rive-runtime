@@ -710,14 +710,14 @@ INLINE void resolve_paint(uint pathID,
         float4 surfaceMaterialTranslate =
             STORAGE_BUFFER_LOAD4(
                 @paintAuxBuffer,
-                pathID * PAINT_AUX_STRIDE +
+                pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT +
                     PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
         if (surfaceMaterialTranslate.z > 0.5)
         {
             float2x2 surfaceMaterialMatrix = make_float2x2(
                 STORAGE_BUFFER_LOAD4(
                     @paintAuxBuffer,
-                    pathID * PAINT_AUX_STRIDE +
+                    pathID * PAINT_AUX_ENTRY_ELEMENT_COUNT +
                         PAINT_AUX_MATERIAL_MATRIX_OFFSET));
             float2 materialCoord =
                 MUL(surfaceMaterialMatrix, _fragCoord) + surfaceMaterialTranslate.xy;

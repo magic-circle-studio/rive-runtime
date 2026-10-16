@@ -19,7 +19,6 @@
 
 #include <algorithm>
 #include <functional>
-#include <numeric>
 #include <optional>
 
 // Use the define to run the feather LUT code
@@ -1985,11 +1984,7 @@ static_assert(sizeof(PaintAuxData) ==
               StorageBufferElementSizeInBytes(PaintAuxData::kBufferStructure) *
                   8);
 static_assert(256 % sizeof(PaintAuxData) == 0);
-constexpr static size_t kPaintAuxBufferAlignmentInElements =
-    256 / std::gcd<size_t>(256, sizeof(PaintAuxData));
-static_assert((kPaintAuxBufferAlignmentInElements * sizeof(PaintAuxData)) %
-                  256 ==
-              0);
+constexpr static size_t kPaintAuxBufferAlignmentInElements = 256 / sizeof(PaintAuxData);
 
 // High level structure of the "contour" storage buffer. Each contour of every
 // path has a data record describing its info.

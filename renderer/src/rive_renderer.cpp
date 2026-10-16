@@ -266,6 +266,16 @@ void RiveRenderer::drawPath(RenderPath* renderPath, RenderPaint* renderPaint)
                                         path->getFillRule(),
                                         m_renderStateStack.back().matrix,
                                         pixelBounds);
+                if (paint->getImageTexture() == nullptr)
+                {
+                    captureSurfaceMaterialBinding(path);
+                    if (path->hasSurfaceMaterialBinding())
+                    {
+                        // The inverse is temporary but shares the source's
+                        // local coordinates and persistent material binding.
+                        fillPath->captureSurfaceMaterialBinding(path->surfaceMaterialLocalToUV());
+                    }
+                }
                 drawPath(fillPath.get(), fillPaint.get());
             }
         }
@@ -447,11 +457,29 @@ void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
     clipAndPushDraw(std::move(draw));
 }
 
+void RiveRenderer::captureSurfaceMaterialBinding(RiveRenderPath* path)
+{
+    const auto& state = m_renderStateStack.back();
+    if (path->hasSurfaceMaterialBinding() || state.surfaceMaterial == gpu::SurfaceMaterial::none ||
+        state.surfaceMaterialBounds.isEmptyOrNaN())
+    {
+        return;
+    }
+    const AABB& bounds = state.surfaceMaterialBounds;
+    const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(1.f / bounds.width(),
+                                                            1.f / bounds.height(),
+                                                            -bounds.left() / bounds.width(),
+                                                            -bounds.top() / bounds.height());
+    // Bind once in local coordinates so the material follows later poses.
+    path->captureSurfaceMaterialBinding(screenToUV * state.matrix);
+}
+
 void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
                                         RiveRenderPath* path)
 {
     const auto& state = m_renderStateStack.back();
-    if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
+    // Mask colors describe coverage; tinting changes luminance-mask opacity.
+    if (draw.isLayerMask() || state.surfaceMaterial == gpu::SurfaceMaterial::none)
     {
         return;
     }
@@ -464,28 +492,20 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
     const float width = bounds.width();
     const float height = bounds.height();
     const Mat2D& localToScreen = state.matrix;
-    const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
-        1.f / width,
-        1.f / height,
-        -bounds.left() / width,
-        -bounds.top() / height);
     Mat2D screenToMaterial;
     if (draw.imageTexture() != nullptr)
     {
         // drawImage() reuses one unit-rectangle path for every image. Keep
         // image material coordinates in artboard space rather than caching
         // the first image's transform on that shared path.
-        screenToMaterial = screenToUV;
+        screenToMaterial = Mat2D::fromScaleAndTranslation(1.f / width,
+                                                          1.f / height,
+                                                          -bounds.left() / width,
+                                                          -bounds.top() / height);
     }
     else
     {
-        if (!path->hasSurfaceMaterialBinding())
-        {
-            // Capture one stable local-to-material mapping. Later poses invert
-            // their current transform so the material follows the path instead
-            // of remaining attached to screen pixels.
-            path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
-        }
+        captureSurfaceMaterialBinding(path);
 
         Mat2D screenToLocal;
         if (!localToScreen.invert(&screenToLocal))
