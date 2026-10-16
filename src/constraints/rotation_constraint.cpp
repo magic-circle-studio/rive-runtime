@@ -7,26 +7,27 @@ using namespace rive;
 
 void RotationConstraint::constrain(TransformComponent* component)
 {
-    if (m_Target != nullptr && m_Target->isCollapsed())
+    auto* tgt = target();
+    if (tgt != nullptr && tgt->isCollapsed())
     {
         return;
     }
     const Mat2D& transformA = component->worldTransform();
     Mat2D transformB;
     m_ComponentsA = transformA.decompose();
-    if (m_Target == nullptr)
+    if (tgt == nullptr)
     {
         transformB = transformA;
         m_ComponentsB = m_ComponentsA;
     }
     else
     {
-        transformB = m_Target->worldTransform();
+        transformB = tgt->worldTransform();
         if (sourceSpace() == TransformSpace::local)
         {
             Mat2D inverse;
 
-            if (!getParentWorld(*m_Target).invert(&inverse))
+            if (!getParentWorld(*tgt).invert(&inverse))
             {
                 return;
             }
@@ -75,13 +76,26 @@ void RotationConstraint::constrain(TransformComponent* component)
         }
         m_ComponentsB = (inverse * transformB).decompose();
     }
-    if (max() && m_ComponentsB.rotation() > maxValue())
+    if (min() || max())
     {
-        m_ComponentsB.rotation(maxValue());
-    }
-    if (min() && m_ComponentsB.rotation() < minValue())
-    {
-        m_ComponentsB.rotation(minValue());
+        // Decomposed angles wrap at half a turn, so compare them within the
+        // turn centered on the limits instead.
+        float center = min() && max() ? (minValue() + maxValue()) * 0.5f
+                       : max()        ? maxValue()
+                                      : minValue();
+        float rotation = m_ComponentsB.rotation() - center;
+        rotation -=
+            math::PI * 2 * std::floor((rotation + math::PI) / (math::PI * 2));
+        rotation += center;
+        if (max() && rotation > maxValue())
+        {
+            rotation = maxValue();
+        }
+        if (min() && rotation < minValue())
+        {
+            rotation = minValue();
+        }
+        m_ComponentsB.rotation(rotation);
     }
     if (clampLocal)
     {
@@ -111,5 +125,5 @@ void RotationConstraint::constrain(TransformComponent* component)
     m_ComponentsB.scaleY(m_ComponentsA.scaleY());
     m_ComponentsB.skew(m_ComponentsA.skew());
 
-    component->mutableWorldTransform() = Mat2D::compose(m_ComponentsB);
+    composeKeepingAnchor(component, m_ComponentsB);
 }

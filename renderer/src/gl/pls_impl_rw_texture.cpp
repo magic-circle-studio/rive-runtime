@@ -144,9 +144,11 @@ class RenderContextGLImpl::PLSImplRWTexture
 
         // Bind and initialize the PLS backing textures.
         renderContextImpl->state()->setPipelineState(
-            gpu::COLOR_ONLY_PIPELINE_STATE);
+            gpu::COLOR_ONLY_PIPELINE_STATE,
+            ScissorAction::ignore);
         renderContextImpl->state()->setScissor(desc.renderTargetUpdateBounds,
-                                               renderTarget->height());
+                                               renderTarget->height(),
+                                               renderTarget->bottomUp());
 
         if (!desc.fixedFunctionColorOutput)
         {
@@ -164,7 +166,8 @@ class RenderContextGLImpl::PLSImplRWTexture
                     framebufferRenderTarget->bindTextureFramebuffer(
                         GL_DRAW_FRAMEBUFFER);
                     glutils::BlitFramebuffer(desc.renderTargetUpdateBounds,
-                                             renderTarget->height());
+                                             renderTarget->height(),
+                                             renderTarget->bottomUp());
                 }
             }
             // If the color buffer is *not* a storage texture, we will clear it
@@ -218,7 +221,8 @@ class RenderContextGLImpl::PLSImplRWTexture
             }
         }
 
-        if (desc.combinedShaderFeatures & gpu::ShaderFeatures::ENABLE_CLIPPING)
+        if (enums::is_flag_set(desc.combinedShaderFeatures,
+                               gpu::ShaderFeatures::ENABLE_CLIPPING))
         {
             constexpr static GLuint kZeroClear[4]{};
             glClearBufferuiv(GL_COLOR, nextTransientLayer, kZeroClear);
@@ -234,8 +238,8 @@ class RenderContextGLImpl::PLSImplRWTexture
 
         if (desc.interlockMode == gpu::InterlockMode::rasterOrdering ||
             (desc.interlockMode == gpu::InterlockMode::clockwise &&
-             (desc.combinedShaderFeatures &
-              gpu::ShaderFeatures::ENABLE_ADVANCED_BLEND)))
+             enums::is_flag_set(desc.combinedShaderFeatures,
+                                gpu::ShaderFeatures::ENABLE_ADVANCED_BLEND)))
         {
             glBindImageTexture(
                 SCRATCH_COLOR_PLANE_IDX,
@@ -299,7 +303,8 @@ class RenderContextGLImpl::PLSImplRWTexture
                 renderContextImpl->state()->setPipelineState(
                     gpu::COLOR_ONLY_PIPELINE_STATE);
                 glutils::BlitFramebuffer(desc.renderTargetUpdateBounds,
-                                         framebufferRenderTarget->height());
+                                         framebufferRenderTarget->height(),
+                                         framebufferRenderTarget->bottomUp());
             }
         }
     }

@@ -2,9 +2,167 @@
 #include "rive/core_context.hpp"
 #include "rive/layout_component.hpp"
 #include "rive/layout/layout_component_style.hpp"
+#include "rive/layout/layout_style_applier.hpp"
+#include "rive/layout/grid_track.hpp"
+#ifdef WITH_RIVE_LAYOUT
+// YGStyle is only forward declared in the headers; the setters below need it.
+#include "rive/layout/layout_data.hpp"
+#endif
 #include <vector>
 
 using namespace rive;
+
+#ifdef WITH_RIVE_LAYOUT
+// Stack alignment: the 9-way selector sets the default cell placement via grid
+// justifyItems (horizontal) + alignItems (vertical). Per-child
+// justifySelf/alignSelf still overrides. space-between collapses to start.
+static void applyStackAlignment(YGStyle& ygStyle, LayoutAlignmentType t)
+{
+    switch (t)
+    {
+        case LayoutAlignmentType::topLeft:
+        case LayoutAlignmentType::centerLeft:
+        case LayoutAlignmentType::bottomLeft:
+        case LayoutAlignmentType::spaceBetweenStart:
+            ygStyle.setJustifyItems(YGJustifyStart);
+            break;
+        case LayoutAlignmentType::topCenter:
+        case LayoutAlignmentType::center:
+        case LayoutAlignmentType::bottomCenter:
+        case LayoutAlignmentType::spaceBetweenCenter:
+            ygStyle.setJustifyItems(YGJustifyCenter);
+            break;
+        case LayoutAlignmentType::topRight:
+        case LayoutAlignmentType::centerRight:
+        case LayoutAlignmentType::bottomRight:
+        case LayoutAlignmentType::spaceBetweenEnd:
+            ygStyle.setJustifyItems(YGJustifyEnd);
+            break;
+    }
+    switch (t)
+    {
+        case LayoutAlignmentType::topLeft:
+        case LayoutAlignmentType::topCenter:
+        case LayoutAlignmentType::topRight:
+            ygStyle.alignItems() = YGAlignStart;
+            break;
+        case LayoutAlignmentType::centerLeft:
+        case LayoutAlignmentType::center:
+        case LayoutAlignmentType::centerRight:
+            ygStyle.alignItems() = YGAlignCenter;
+            break;
+        case LayoutAlignmentType::bottomLeft:
+        case LayoutAlignmentType::bottomCenter:
+        case LayoutAlignmentType::bottomRight:
+            ygStyle.alignItems() = YGAlignEnd;
+            break;
+        case LayoutAlignmentType::spaceBetweenStart:
+        case LayoutAlignmentType::spaceBetweenCenter:
+        case LayoutAlignmentType::spaceBetweenEnd:
+            ygStyle.alignItems() = YGAlignStart;
+            break;
+    }
+}
+#endif
+
+#ifdef WITH_RIVE_LAYOUT
+// How this layout sits inside its own parent.
+void LayoutComponentStyle::applyItemStyle(YGStyle& style,
+                                          const LayoutSyncContext& context)
+{
+    LayoutSizingStyle::applyItemStyle(style, context);
+
+    style.positionType() = positionType();
+    style.aspectRatio() =
+        YGFloatOptional(aspectRatio() > 0 ? aspectRatio() : NAN);
+
+    const auto startEdge = context.isLTR ? YGEdgeLeft : YGEdgeRight;
+    const auto endEdge = context.isLTR ? YGEdgeRight : YGEdgeLeft;
+    // No parent to take a percentage of, so margins resolve as points.
+    const auto marginUnits = [&](YGUnit units) {
+        return context.hasLayoutParent ? units : YGUnitPoint;
+    };
+
+    style.margin()[startEdge] =
+        YGValue{marginLeft(), marginUnits(marginLeftUnits())};
+    style.margin()[endEdge] =
+        YGValue{marginRight(), marginUnits(marginRightUnits())};
+    style.margin()[YGEdgeTop] =
+        YGValue{marginTop(), marginUnits(marginTopUnits())};
+    style.margin()[YGEdgeBottom] =
+        YGValue{marginBottom(), marginUnits(marginBottomUnits())};
+
+    style.position()[startEdge] = YGValue{positionLeft(), positionLeftUnits()};
+    style.position()[endEdge] = YGValue{positionRight(), positionRightUnits()};
+    style.position()[YGEdgeTop] = YGValue{positionTop(), positionTopUnits()};
+    style.position()[YGEdgeBottom] =
+        YGValue{positionBottom(), positionBottomUnits()};
+}
+#endif
+
+#ifdef WITH_RIVE_LAYOUT
+// What this layout imposes on its children: their box (padding/border/gap) and
+// the alignment selector, resolved onto our own axes by containerAlignment.
+void LayoutComponentStyle::applyContainerStyle(YGStyle& style,
+                                               const LayoutSyncContext& context)
+{
+    const auto startEdge = context.isLTR ? YGEdgeLeft : YGEdgeRight;
+    const auto endEdge = context.isLTR ? YGEdgeRight : YGEdgeLeft;
+
+    style.flexDirection() = flexDirection();
+    style.flexWrap() = flexWrap();
+    style.direction() = direction();
+
+    style.gap()[YGGutterColumn] =
+        YGValue{gapHorizontal(), gapHorizontalUnits()};
+    style.gap()[YGGutterRow] = YGValue{gapVertical(), gapVerticalUnits()};
+
+    style.border()[startEdge] = YGValue{borderLeft(), borderLeftUnits()};
+    style.border()[endEdge] = YGValue{borderRight(), borderRightUnits()};
+    style.border()[YGEdgeTop] = YGValue{borderTop(), borderTopUnits()};
+    style.border()[YGEdgeBottom] = YGValue{borderBottom(), borderBottomUnits()};
+
+    style.padding()[startEdge] = YGValue{paddingLeft(), paddingLeftUnits()};
+    style.padding()[endEdge] = YGValue{paddingRight(), paddingRightUnits()};
+    style.padding()[YGEdgeTop] = YGValue{paddingTop(), paddingTopUnits()};
+    style.padding()[YGEdgeBottom] =
+        YGValue{paddingBottom(), paddingBottomUnits()};
+
+    // A stack is one implicit cell, aligned through justifyItems/alignItems
+    // rather than the flex selector below.
+    if (isStack())
+    {
+        GridTrack::syncStackContainerStyle(style, justifyItemsValue());
+        applyStackAlignment(style, alignmentType());
+        return;
+    }
+    // Our own main axis, not the parent's: this aligns the children we lay out.
+    const bool isRow = flexDirection() == YGFlexDirectionRow ||
+                       flexDirection() == YGFlexDirectionRowReverse;
+    auto alignment = containerAlignment(alignmentType(), isRow);
+    switch (alignment.main)
+    {
+        case LayoutMainDistribute::start:
+            style.justifyContent() = YGJustifyFlexStart;
+            break;
+        case LayoutMainDistribute::center:
+            style.justifyContent() = YGJustifyCenter;
+            break;
+        case LayoutMainDistribute::end:
+            style.justifyContent() = YGJustifyFlexEnd;
+            break;
+        case LayoutMainDistribute::spaceBetween:
+            style.justifyContent() = YGJustifySpaceBetween;
+            break;
+    }
+    YGAlign cross =
+        alignment.cross == LayoutCrossAlign::start    ? YGAlignFlexStart
+        : alignment.cross == LayoutCrossAlign::center ? YGAlignCenter
+                                                      : YGAlignFlexEnd;
+    style.alignItems() = cross;
+    style.alignContent() = cross;
+}
+#endif
 
 #ifdef WITH_RIVE_LAYOUT
 
@@ -38,7 +196,16 @@ LayoutScaleType LayoutComponentStyle::heightScaleType()
     return LayoutScaleType(layoutHeightScaleType());
 }
 
-YGDisplay LayoutComponentStyle::display() { return YGDisplay(displayValue()); }
+YGDisplay LayoutComponentStyle::display()
+{
+    // displayValue is visibility only (flex/none); layoutTypeValue selects the
+    // algorithm. Hidden wins, else flex or grid (stack also drives the grid).
+    if (YGDisplay(displayValue()) == YGDisplayNone)
+    {
+        return YGDisplayNone;
+    }
+    return layoutTypeValue() == 0 ? YGDisplayFlex : YGDisplayGrid;
+}
 
 YGPositionType LayoutComponentStyle::positionType()
 {
@@ -56,23 +223,6 @@ YGDirection LayoutComponentStyle::direction()
 }
 
 YGWrap LayoutComponentStyle::flexWrap() { return YGWrap(flexWrapValue()); }
-
-YGAlign LayoutComponentStyle::alignItems()
-{
-    return YGAlign(alignItemsValue());
-}
-
-YGAlign LayoutComponentStyle::alignSelf() { return YGAlign(alignSelfValue()); }
-
-YGAlign LayoutComponentStyle::alignContent()
-{
-    return YGAlign(alignContentValue());
-}
-
-YGJustify LayoutComponentStyle::justifyContent()
-{
-    return YGJustify(justifyContentValue());
-}
 
 YGOverflow LayoutComponentStyle::overflow()
 {
@@ -181,25 +331,6 @@ YGUnit LayoutComponentStyle::gapVerticalUnits()
     return YGUnit(gapVerticalUnitsValue());
 }
 
-YGUnit LayoutComponentStyle::maxWidthUnits()
-{
-    return YGUnit(maxWidthUnitsValue());
-}
-
-YGUnit LayoutComponentStyle::maxHeightUnits()
-{
-    return YGUnit(maxHeightUnitsValue());
-}
-
-YGUnit LayoutComponentStyle::minWidthUnits()
-{
-    return YGUnit(minWidthUnitsValue());
-}
-
-YGUnit LayoutComponentStyle::minHeightUnits()
-{
-    return YGUnit(minHeightUnitsValue());
-}
 YGUnit LayoutComponentStyle::flexBasisUnits()
 {
     return YGUnit(flexBasisUnitsValue());
@@ -218,6 +349,14 @@ void LayoutComponentStyle::markLayoutStyleDirty()
     if (parent()->is<LayoutComponent>())
     {
         parent()->as<LayoutComponent>()->markLayoutStyleDirty();
+    }
+}
+
+void LayoutComponentStyle::markRenderPathDirty()
+{
+    if (parent()->is<LayoutComponent>())
+    {
+        parent()->as<LayoutComponent>()->addDirt(ComponentDirt::Path);
     }
 }
 
@@ -279,6 +418,7 @@ StatusCode LayoutComponentStyle::onAddedDirty(CoreContext* context)
 #else
 void LayoutComponentStyle::markLayoutNodeDirty() {}
 void LayoutComponentStyle::markLayoutStyleDirty() {}
+void LayoutComponentStyle::markRenderPathDirty() {}
 void LayoutComponentStyle::scaleTypeChanged() {}
 void LayoutComponentStyle::displayChanged() {}
 void LayoutComponentStyle::positionTypeValueChanged() {}
@@ -299,24 +439,26 @@ void LayoutComponentStyle::layoutHeightScaleTypeChanged()
 {
     scaleTypeChanged();
 }
+void LayoutComponentStyle::hugUnboundedChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::displayValueChanged() { displayChanged(); }
+void LayoutComponentStyle::layoutTypeValueChanged()
+{
+#ifdef WITH_RIVE_LAYOUT
+    if (parent()->is<LayoutComponent>())
+    {
+        parent()->as<LayoutComponent>()->layoutTypeChanged();
+    }
+#endif
+}
+void LayoutComponentStyle::justifyItemsValueChanged() { markLayoutNodeDirty(); }
+void LayoutComponentStyle::justifySelfValueChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::overflowValueChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::intrinsicallySizedValueChanged()
 {
     markLayoutNodeDirty();
 }
-void LayoutComponentStyle::alignContentValueChanged() { markLayoutNodeDirty(); }
-void LayoutComponentStyle::alignItemsValueChanged() { markLayoutNodeDirty(); }
-void LayoutComponentStyle::alignSelfValueChanged() { markLayoutNodeDirty(); }
-void LayoutComponentStyle::justifyContentValueChanged()
-{
-    markLayoutNodeDirty();
-}
 void LayoutComponentStyle::flexWrapValueChanged() { markLayoutNodeDirty(); }
 
-void LayoutComponentStyle::flexChanged() { markLayoutNodeDirty(); }
-void LayoutComponentStyle::flexGrowChanged() { markLayoutNodeDirty(); }
-void LayoutComponentStyle::flexShrinkChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::flexBasisChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::aspectRatioChanged() { markLayoutNodeDirty(); }
 void LayoutComponentStyle::gapHorizontalChanged() { markLayoutNodeDirty(); }
@@ -446,7 +588,15 @@ void LayoutComponentStyle::positionBottomUnitsValueChanged()
 {
     markLayoutNodeDirty();
 }
-void LayoutComponentStyle::cornerRadiusTLChanged() { markLayoutStyleDirty(); }
-void LayoutComponentStyle::cornerRadiusTRChanged() { markLayoutStyleDirty(); }
-void LayoutComponentStyle::cornerRadiusBLChanged() { markLayoutStyleDirty(); }
-void LayoutComponentStyle::cornerRadiusBRChanged() { markLayoutStyleDirty(); }
+// The corner radiuses are read only by LayoutComponent::updateRenderPath, to
+// round the layout's background, so a change just rebuilds that path.
+// markLayoutStyleDirty would also re-cascade styles through the artboard's
+// whole layout tree, and until that cascade ran, an inherit-style layout would
+// lose its interpolation and skip that frame's tween step. linkCornerRadius
+// decides which of the four radiuses the path uses, so it rebuilds the path
+// too; that matters most when the flag is data bound and flips mid-playback.
+void LayoutComponentStyle::linkCornerRadiusChanged() { markRenderPathDirty(); }
+void LayoutComponentStyle::cornerRadiusTLChanged() { markRenderPathDirty(); }
+void LayoutComponentStyle::cornerRadiusTRChanged() { markRenderPathDirty(); }
+void LayoutComponentStyle::cornerRadiusBLChanged() { markRenderPathDirty(); }
+void LayoutComponentStyle::cornerRadiusBRChanged() { markRenderPathDirty(); }

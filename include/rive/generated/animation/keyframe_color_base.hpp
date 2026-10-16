@@ -12,21 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 37;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case KeyFrameColorBase::typeKey:
-            case InterpolatingKeyFrameBase::typeKey:
-            case KeyFrameBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t valuePropertyKey = 88;
@@ -42,8 +27,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(valuePropertyKey, &m_Value, &value);
         m_Value = value;
-        valueChanged();
+        RIVE_EDITOR_CHANGED(valueChanged());
+        notifyPropertyChanged(valuePropertyKey);
     }
 
     Core* clone() const override;
@@ -66,6 +53,9 @@ public:
 
 protected:
     virtual void valueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/keyframe_color_ext.inl"
+#endif
 };
 } // namespace rive
 

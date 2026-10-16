@@ -2,6 +2,7 @@
 #include "rive/text/raw_text.hpp"
 #include "rive/text_engine.hpp"
 #include "rive/factory.hpp"
+#include "rive/shapes/paint/color.hpp"
 
 using namespace rive;
 
@@ -13,29 +14,42 @@ void RawText::append(const std::string& text,
                      rcp<Font> font,
                      float size,
                      float lineHeight,
-                     float letterSpacing)
+                     float letterSpacing,
+                     ColorInt foregroundColor)
 {
     int styleIndex = 0;
     for (RenderStyle& style : m_styles)
     {
-        if (style.paint == paint)
+        if (style.paint == paint && style.foregroundColor == foregroundColor)
         {
             break;
         }
         styleIndex++;
     }
-    if (styleIndex == m_styles.size())
+    if (styleIndex == (int)m_styles.size())
     {
-        m_styles.push_back({paint, true});
+        m_styles.emplace_back();
+        auto& style = m_styles.back();
+        style.paint = paint;
+        style.isEmpty = true;
+        style.foregroundColor = foregroundColor;
     }
     m_styled.append(font, size, lineHeight, letterSpacing, text, styleIndex);
-    m_dirty = true;
+    markDirty();
 }
 
 void RawText::clear()
 {
     m_styled.clear();
+    m_styles.clear();
+    markDirty();
+}
+
+void RawText::markDirty()
+{
     m_dirty = true;
+    m_lookupDirty = true;
+    m_revision++;
 }
 
 TextSizing RawText::sizing() const { return m_sizing; }
@@ -43,6 +57,16 @@ TextSizing RawText::sizing() const { return m_sizing; }
 TextOverflow RawText::overflow() const { return m_overflow; }
 
 TextAlign RawText::align() const { return m_align; }
+
+RawText::LogicalAlign RawText::logicalAlign() const { return m_logicalAlign; }
+
+TextWrap RawText::wrap() const { return m_wrap; }
+
+TextWordBreak RawText::wordBreak() const { return m_wordBreak; }
+
+TextOrigin RawText::origin() const { return m_origin; }
+
+int RawText::directionFlag() const { return m_directionFlag; }
 
 float RawText::maxWidth() const { return m_maxWidth; }
 
@@ -55,7 +79,7 @@ void RawText::sizing(TextSizing value)
     if (m_sizing != value)
     {
         m_sizing = value;
-        m_dirty = true;
+        markDirty();
     }
 }
 
@@ -64,7 +88,7 @@ void RawText::overflow(TextOverflow value)
     if (m_overflow != value)
     {
         m_overflow = value;
-        m_dirty = true;
+        markDirty();
     }
 }
 
@@ -73,7 +97,120 @@ void RawText::align(TextAlign value)
     if (m_align != value)
     {
         m_align = value;
-        m_dirty = true;
+        markDirty();
+    }
+}
+
+void RawText::logicalAlign(LogicalAlign value)
+{
+    if (m_logicalAlign != value)
+    {
+        m_logicalAlign = value;
+        markDirty();
+    }
+}
+
+void RawText::wrap(TextWrap value)
+{
+    if (m_wrap != value)
+    {
+        m_wrap = value;
+        markDirty();
+    }
+}
+
+void RawText::wordBreak(TextWordBreak value)
+{
+    if (m_wordBreak != value)
+    {
+        m_wordBreak = value;
+        markDirty();
+    }
+}
+
+void RawText::origin(TextOrigin value)
+{
+    if (m_origin != value)
+    {
+        m_origin = value;
+        markDirty();
+    }
+}
+
+void RawText::directionFlag(int value)
+{
+    if (m_directionFlag != value)
+    {
+        m_directionFlag = value;
+        markDirty();
+    }
+}
+
+int RawText::alignIndex() const
+{
+    return m_logicalAlign == LogicalAlign::none ? (int)m_align
+                                                : 2 + (int)m_logicalAlign;
+}
+
+void RawText::alignIndex(int value)
+{
+    if (value >= 0 && value <= 2)
+    {
+        align((TextAlign)value);
+        logicalAlign(LogicalAlign::none);
+    }
+    else if (value == 3 || value == 4)
+    {
+        logicalAlign((LogicalAlign)(value - 2));
+    }
+}
+
+void RawText::directionIndex(int value)
+{
+    if (value >= 0 && value <= 2)
+    {
+        directionFlag(value - 1);
+    }
+}
+
+void RawText::sizingIndex(int value)
+{
+    if (value >= 0 && value <= (int)TextSizing::fixed)
+    {
+        sizing((TextSizing)value);
+    }
+}
+
+void RawText::overflowIndex(int value)
+{
+    // fit and fitFontSize live in the Text component, not here.
+    if (value >= 0 && value <= (int)TextOverflow::ellipsis)
+    {
+        overflow((TextOverflow)value);
+    }
+}
+
+void RawText::wrapIndex(int value)
+{
+    if (value >= 0 && value <= (int)TextWrap::noWrap)
+    {
+        wrap((TextWrap)value);
+    }
+}
+
+void RawText::wordBreakIndex(int value)
+{
+    if (value >= 0 && value <= (int)TextWordBreak::breakAll)
+    {
+        wordBreak((TextWordBreak)value);
+    }
+}
+
+void RawText::originIndex(int value)
+{
+    if (value >= 0 && value <= (int)TextOrigin::baseline)
+    {
+        origin((TextOrigin)value);
     }
 }
 
@@ -82,7 +219,7 @@ void RawText::paragraphSpacing(float value)
     if (m_paragraphSpacing != value)
     {
         m_paragraphSpacing = value;
-        m_dirty = true;
+        markDirty();
     }
 }
 
@@ -91,7 +228,7 @@ void RawText::maxWidth(float value)
     if (m_maxWidth != value)
     {
         m_maxWidth = value;
-        m_dirty = true;
+        markDirty();
     }
 }
 
@@ -100,7 +237,7 @@ void RawText::maxHeight(float value)
     if (m_maxHeight != value)
     {
         m_maxHeight = value;
-        m_dirty = true;
+        markDirty();
     }
 }
 
@@ -112,20 +249,37 @@ void RawText::update()
         style.isEmpty = true;
     }
     m_renderStyles.clear();
+    m_drawCommands.clear();
+    m_orderedLines.clear();
+    m_lineDirections.clear();
+    m_lineGlyphCounts.clear();
     if (m_styled.empty())
     {
+        // Readers of the layout must not see the previous text's lines.
+        m_shape = SimpleArray<Paragraph>();
+        m_lines = SimpleArray<SimpleArray<GlyphLine>>();
+        m_bounds = AABB(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
     auto runs = m_styled.runs();
 
-    m_shape = runs[0].font->shapeText(m_styled.unichars(), runs);
+    m_shape =
+        runs[0].font->shapeText(m_styled.unichars(), runs, m_directionFlag);
+    TextAlign align = m_align;
+    if (m_logicalAlign != LogicalAlign::none && !m_shape.empty())
+    {
+        bool rtl = m_shape[0].baseDirection() == TextDirection::rtl;
+        align = (m_logicalAlign == LogicalAlign::start) != rtl
+                    ? TextAlign::left
+                    : TextAlign::right;
+    }
     m_lines =
         Text::BreakLines(m_shape,
                          m_sizing == TextSizing::autoWidth ? -1.0f : m_maxWidth,
-                         m_align,
-                         m_wrap);
+                         align,
+                         m_wrap,
+                         m_wordBreak);
 
-    m_orderedLines.clear();
     m_ellipsisRun = {};
 
     // build render styles.
@@ -278,10 +432,13 @@ void RawText::update()
             }
 
             const OrderedLine& orderedLine = m_orderedLines[lineIndex];
+            m_lineDirections.push_back((uint8_t)paragraph.baseDirection());
+            uint32_t lineGlyphs = 0;
             float x = line.startX;
 
             for (auto glyphItr : orderedLine)
             {
+                lineGlyphs++;
                 const GlyphRun* run = std::get<0>(glyphItr);
                 size_t glyphIndex = std::get<1>(glyphItr);
 
@@ -290,8 +447,6 @@ void RawText::update()
 
                 GlyphID glyphId = run->glyphs[glyphIndex];
                 float advance = run->advances[glyphIndex];
-
-                RawPath path = font->getPath(glyphId);
 
                 assert(run->styleId < m_styles.size());
                 RenderStyle* style = &m_styles[run->styleId];
@@ -305,17 +460,35 @@ void RawText::update()
                                 renderY + offset.y);
 
                 x += advance;
-                style->path.addPathClockwise(path, &transform);
 
-                if (style->isEmpty)
+                if (font->isColorGlyph(glyphId))
                 {
-                    // This was the first path added to the style, so let's mark
-                    // it in our draw list.
-                    style->isEmpty = false;
+                    RawTextDrawCommand cmd;
+                    cmd.type = RawTextDrawCommand::kColorGlyph;
+                    cmd.colorGlyph = {run->font,
+                                      glyphId,
+                                      transform,
+                                      style->foregroundColor};
+                    m_drawCommands.push_back(std::move(cmd));
+                }
+                else
+                {
+                    RawPath path = font->getPath(glyphId);
+                    style->path.addPathClockwise(path, &transform);
 
-                    m_renderStyles.push_back(style);
+                    if (style->isEmpty)
+                    {
+                        style->isEmpty = false;
+                        m_renderStyles.push_back(style);
+
+                        RawTextDrawCommand cmd;
+                        cmd.type = RawTextDrawCommand::kStylePath;
+                        cmd.style = style;
+                        m_drawCommands.push_back(std::move(cmd));
+                    }
                 }
             }
+            m_lineGlyphCounts.push_back(lineGlyphs);
             if (lineIndex == ellipsisLine)
             {
                 return;
@@ -353,17 +526,112 @@ void RawText::render(Renderer* renderer, rcp<RenderPaint> paint)
         renderer->save();
         renderer->clipPath(m_clipRenderPath.get());
     }
-    for (auto style : m_renderStyles)
+    for (auto& cmd : m_drawCommands)
     {
-        auto renderPaint = paint ? paint.get() : style->paint.get();
-        if (renderPaint != nullptr)
+        if (cmd.type == RawTextDrawCommand::kStylePath)
         {
-            renderer->drawPath(style->path.renderPath(m_factory), renderPaint);
+            auto renderPaint = paint ? paint.get() : cmd.style->paint.get();
+            if (renderPaint != nullptr)
+            {
+                renderer->drawPath(cmd.style->path.renderPath(m_factory),
+                                   renderPaint);
+            }
+        }
+        else
+        {
+            auto& info = cmd.colorGlyph;
+            drawColorGlyph(renderer,
+                           *info.font,
+                           info.glyphId,
+                           info.transform,
+                           info.foregroundColor);
         }
     }
     if (m_overflow == TextOverflow::clipped && m_clipRenderPath)
     {
         renderer->restore();
     }
+}
+
+void RawText::drawColorGlyph(Renderer* renderer,
+                             const Font& font,
+                             GlyphID glyphId,
+                             const Mat2D& transform,
+                             ColorInt foregroundColor)
+{
+    std::vector<Font::ColorGlyphLayer> layers;
+    if (font.getColorLayers(glyphId, layers, foregroundColor) == 0)
+    {
+        return;
+    }
+    renderer->save();
+    renderer->transform(transform);
+    for (auto& layer : layers)
+    {
+        drawColorGlyphLayer(renderer, m_factory, layer, 1.0f);
+    }
+    renderer->restore();
+}
+
+RawPath RawText::glyphPath(const Font& font, GlyphID glyphId)
+{
+    ShapePaintPath path;
+    path.addPathClockwise(font.getPath(glyphId), nullptr);
+    return *path.rawPath();
+}
+
+const std::vector<OrderedLine>& RawText::orderedLines()
+{
+    if (m_dirty)
+    {
+        update();
+        m_dirty = false;
+    }
+    return m_orderedLines;
+}
+
+float RawText::lineTop(uint32_t line)
+{
+    const OrderedLine& orderedLine = orderedLines()[line];
+    const GlyphLine& glyphLine = orderedLine.glyphLine();
+    return orderedLine.y() - glyphLine.baseline + glyphLine.top;
+}
+
+TextDirection RawText::lineDirection(uint32_t line)
+{
+    orderedLines();
+    return (TextDirection)m_lineDirections[line];
+}
+
+uint32_t RawText::lineGlyphCount(uint32_t line)
+{
+    orderedLines();
+    return m_lineGlyphCounts[line];
+}
+
+TextLayoutView RawText::layoutView()
+{
+    orderedLines();
+    if (m_lookupDirty)
+    {
+        m_glyphLookup.compute(m_styled.unichars(), m_shape);
+        m_lookupDirty = false;
+    }
+    return TextLayoutView(m_shape,
+                          m_lines,
+                          m_orderedLines,
+                          m_glyphLookup,
+                          (uint32_t)m_styled.unichars().size());
+}
+
+RenderPaint* RawText::stylePaint(uint16_t styleId) const
+{
+    return styleId < m_styles.size() ? m_styles[styleId].paint.get() : nullptr;
+}
+
+ColorInt RawText::styleForegroundColor(uint16_t styleId) const
+{
+    return styleId < m_styles.size() ? m_styles[styleId].foregroundColor
+                                     : 0xFF000000;
 }
 #endif

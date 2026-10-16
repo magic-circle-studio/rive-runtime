@@ -9,16 +9,31 @@
 #include "gradient.hpp"
 #include "rive_render_paint.hpp"
 #include "rive/renderer/draw.hpp"
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_canvas.hpp"
+#endif
 #include "rive/renderer/rive_render_image.hpp"
 #include "rive/renderer/render_context_impl.hpp"
+#include "rive/gpu_texture_format.hpp"
+#include "rive/renderer/stack_vector.hpp"
 #include "rive/profiler/profiler_macros.h"
 
 #include "shaders/constants.glsl"
 
+#include <algorithm>
+#include <limits>
 #include <string_view>
+
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 #ifdef RIVE_DECODERS
 #include "rive/decoders/bitmap_decoder.hpp"
+#endif
+
+#ifdef RIVE_KTX2
+#include "rive/decoders/decode_ktx2.hpp"
 #endif
 
 #include "sort_key_builder.hpp"
@@ -33,12 +48,13 @@ constexpr size_t kDefaultDrawCapacity = 2048;
 constexpr uint32_t kMaxTextureHeight = 2048;
 constexpr size_t kMaxTessellationVertexCount =
     kMaxTextureHeight * kTessTextureWidth;
+
 constexpr size_t kMaxTessellationPaddingVertexCount =
-    gpu::kMidpointFanPatchSegmentSpan + // Padding at the beginning of the tess
-                                        // texture
-    (gpu::kOuterCurvePatchSegmentSpan -
-     1) + // Max padding between patch types in the tess texture
-    1;    // Padding at the end of the tessellation texture
+    gpu::kMidpointFanPatchSegmentSpan + // Padding at the beginning of the
+                                        // tessellation texture
+    gpu::OuterCubicPatchSegmentSpan + // Max padding between patch types in the
+                                      // tessellation texture
+    1; // Padding at the end of the tessellation texture
 constexpr size_t kMaxTessellationVertexCountBeforePadding =
     kMaxTessellationVertexCount - kMaxTessellationPaddingVertexCount;
 
@@ -65,6 +81,20 @@ constexpr static size_t gradient_data_height(size_t simpleRampCount,
     return resource_texture_height<gpu::kGradTextureWidthInSimpleRamps>(
                simpleRampCount) +
            complexRampCount;
+}
+
+// Returns true if the current bounds poke outside of the containing bounds (and
+// thus would need to be clipped against them)
+inline bool needsScissor(IAABB currentBounds,
+                         IAABB containingBounds,
+                         uint32_t renderTargetWidth,
+                         uint32_t renderTargetHeight)
+{
+    // intersect the current bounds with the screen dimensions before testing so
+    // that if we end up outside the containing bounds on a side that is also a
+    // screen edge it doesn't matter.
+    return !containingBounds.contains(currentBounds.intersect(
+        IAABB::MakeWH(renderTargetWidth, renderTargetHeight)));
 }
 
 inline GradientContentKey::GradientContentKey(rcp<const Gradient> gradient) :
@@ -113,6 +143,11 @@ RenderContext::RenderContext(std::unique_ptr<RenderContextImpl> impl) :
     // directly by pathID.
     m_maxPathID(MaxPathID(m_impl->platformFeatures().pathIDGranularity) - 1)
 {
+    // Validate platformFeatures: if supportsBlendAdvancedCoherentKHR is set,
+    // supportsBlendAdvancedKHR must also be.
+    assert(!m_impl->platformFeatures().supportsBlendAdvancedCoherentKHR ||
+           m_impl->platformFeatures().supportsBlendAdvancedKHR);
+
 #ifdef RIVE_GENERATE_FEATHER_LUT
     float table[GAUSSIAN_TABLE_SIZE];
     generate_gausian_integral_table(table);
@@ -130,6 +165,9 @@ RenderContext::~RenderContext()
     // Delete the logical flushes before the block allocators let go of their
     // allocations.
     m_logicalFlushes.clear();
+#ifdef RIVE_CANVAS
+    m_oreContext.reset();
+#endif
 }
 
 const gpu::PlatformFeatures& RenderContext::platformFeatures() const
@@ -144,17 +182,71 @@ rcp<RenderBuffer> RenderContext::makeRenderBuffer(RenderBufferType type,
     return m_impl->makeRenderBuffer(type, flags, sizeInBytes);
 }
 
+#ifdef RIVE_CANVAS
+rcp<RenderCanvas> RenderContext::makeRenderCanvas(uint32_t width,
+                                                  uint32_t height)
+{
+    return m_impl->makeRenderCanvas(width, height);
+}
+
+rcp<RenderCanvas> RenderContext::makeDeferredRenderCanvas(uint32_t width,
+                                                          uint32_t height)
+{
+    return m_impl->makeDeferredRenderCanvas(width, height);
+}
+rive::ore::Context* RenderContext::ore()
+{
+    if (m_oreContext == nullptr)
+        m_oreContext = m_impl->makeOreContext();
+    return m_oreContext.get();
+}
+#endif
+
 rcp<RenderImage> RenderContext::decodeImage(Span<const uint8_t> encodedBytes)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     rcp<Texture> texture = m_impl->platformDecodeImageTexture(encodedBytes);
+
+#ifdef RIVE_KTX2
+    // KTX2 magic = «KTX 20»\r\n\x1A\n. Match the first 4 bytes for the cheap
+    // dispatch; full magic is re-checked inside DecodeKtx2.
+    if (texture == nullptr && encodedBytes.size() >= 12 &&
+        encodedBytes[0] == 0xAB && encodedBytes[1] == 0x4B &&
+        encodedBytes[2] == 0x54 && encodedBytes[3] == 0x58)
+    {
+        const Ktx2HwSupport hwSupport = {
+            platformFeatures().supportsTextureCompressionBC,
+            platformFeatures().supportsTextureCompressionASTC,
+            platformFeatures().supportsTextureCompressionETC2,
+        };
+        Ktx2DecodeResult ktx2;
+        if (DecodeKtx2(encodedBytes.data(),
+                       encodedBytes.size(),
+                       ktx2,
+                       hwSupport))
+        {
+            // KTX2 provides the full level chain (or just level 0). The
+            // backends never auto-generate; whatever the file ships with is
+            // exactly what gets uploaded.
+            texture = m_impl->makeImageTexture(ktx2.pixelWidth,
+                                               ktx2.pixelHeight,
+                                               ktx2.levelCount,
+                                               ktx2.format,
+                                               ktx2.blocks.data(),
+                                               ktx2.blockWidth,
+                                               ktx2.blockHeight,
+                                               ktx2.srgb);
+        }
+    }
+#endif
+
 #ifdef RIVE_DECODERS
     if (texture == nullptr)
     {
         auto bitmap = Bitmap::decode(encodedBytes.data(), encodedBytes.size());
         if (bitmap)
         {
-            // For now, RenderContextImpl::makeImageTexture() only accepts RGBA.
+            // Bitmap::decode always produces RGBA — convert if needed.
             if (bitmap->pixelFormat() != Bitmap::PixelFormat::RGBAPremul)
             {
                 bitmap->pixelFormat(Bitmap::PixelFormat::RGBAPremul);
@@ -165,7 +257,12 @@ rcp<RenderImage> RenderContext::decodeImage(Span<const uint8_t> encodedBytes)
             texture = m_impl->makeImageTexture(width,
                                                height,
                                                mipLevelCount,
-                                               bitmap->bytes());
+                                               GPUTextureFormat::rgba32,
+                                               bitmap->bytes(),
+                                               /*blockWidth=*/1,
+                                               /*blockHeight=*/1,
+                                               /*srgb=*/false,
+                                               /*generateRemainingMips=*/true);
         }
     }
 #endif
@@ -207,7 +304,7 @@ RenderContext::LogicalFlush::LogicalFlush(RenderContext* parent) : m_ctx(parent)
 
 void RenderContext::LogicalFlush::rewind()
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     m_resourceCounts = Draw::ResourceCounters();
     m_drawPassCount = 0;
     m_simpleGradients.clear();
@@ -217,10 +314,7 @@ void RenderContext::LogicalFlush::rewind()
     m_pendingGradSpanCount = 0;
     m_clips.clear();
     m_draws.clear();
-    m_combinedDrawBounds = {std::numeric_limits<int32_t>::max(),
-                            std::numeric_limits<int32_t>::max(),
-                            std::numeric_limits<int32_t>::min(),
-                            std::numeric_limits<int32_t>::min()};
+    m_combinedDrawBounds = IAABB::makeMaximallyNegative();
     m_combinedDrawContents = gpu::DrawContents::none;
 
     m_pathPaddingCount = 0;
@@ -244,19 +338,17 @@ void RenderContext::LogicalFlush::rewind()
     m_currentPathID = 0;
     m_currentContourID = 0;
 
-    if (m_atlasRectanizer != nullptr)
+    if (m_featherAtlasRectanizer != nullptr)
     {
-        m_atlasRectanizer->reset();
+        m_featherAtlasRectanizer->reset();
     }
-    m_atlasMaxX = 0;
-    m_atlasMaxY = 0;
-    m_pendingAtlasDraws.clear();
+    m_featherAtlasMaxX = 0;
+    m_featherAtlasMaxY = 0;
+    m_pendingFeatherAtlasDraws.clear();
 
     m_coverageBufferLength = 0;
 
     m_pendingBarriers = BarrierFlags::none;
-
-    m_currentZIndex = 0;
 
     RIVE_DEBUG_CODE(m_hasDoneLayout = false;)
 }
@@ -283,10 +375,10 @@ void RenderContext::LogicalFlush::resetContainers()
     m_pendingComplexGradDraws.shrink_to_fit();
     m_pendingComplexGradDraws.reserve(kDefaultComplexGradientCapacity);
 
-    m_pendingAtlasDraws.clear();
-    m_pendingAtlasDraws.shrink_to_fit();
-    // Don't reserve any space in m_pendingAtlasDraws since there are many
-    // usecases where it isn't used at all.
+    m_pendingFeatherAtlasDraws.clear();
+    m_pendingFeatherAtlasDraws.shrink_to_fit();
+    // Don't reserve any space in m_pendingFeatherAtlasDraws since there are
+    // many usecases where it isn't used at all.
 }
 
 static gpu::InterlockMode select_interlock_mode(
@@ -295,7 +387,7 @@ static gpu::InterlockMode select_interlock_mode(
 {
     if (frameDescriptor.msaaSampleCount != 0)
     {
-        return gpu::InterlockMode::msaa;
+        return gpu::InterlockMode::depthStencil;
     }
     if (frameDescriptor.clockwiseFillOverride)
     {
@@ -322,12 +414,12 @@ static gpu::InterlockMode select_interlock_mode(
     {
         return gpu::InterlockMode::atomics;
     }
-    return gpu::InterlockMode::msaa;
+    return gpu::InterlockMode::depthStencil;
 }
 
 void RenderContext::beginFrame(const FrameDescriptor& frameDescriptor)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(0)
 
     m_impl->preBeginFrame(this);
     assert(!m_didBeginFrame);
@@ -336,14 +428,36 @@ void RenderContext::beginFrame(const FrameDescriptor& frameDescriptor)
     m_frameDescriptor = frameDescriptor;
     m_frameInterlockMode =
         select_interlock_mode(m_frameDescriptor, platformFeatures());
-    if (m_frameInterlockMode == gpu::InterlockMode::msaa &&
+    if (m_frameInterlockMode == gpu::InterlockMode::depthStencil &&
         m_frameDescriptor.msaaSampleCount == 0)
     {
-        // Use 4x MSAA if msaaSampleCount wasn't already specified.
+        // No other mode was supported. Say so once, since MSAA costs
+        // differently and a host that wants it should ask for it.
+        [[maybe_unused]] static const bool warned = [] {
+            const char* msg = "rive: no interlock mode supports this frame, "
+                              "drawing it in depthStencil with 4x MSAA\n";
+#if defined(__ANDROID__)
+            // stderr goes nowhere on Android.
+            __android_log_print(ANDROID_LOG_WARN, "Rive", "%s", msg);
+#else
+            fprintf(stderr, "%s", msg);
+#endif
+            return true;
+        }();
         m_frameDescriptor.msaaSampleCount = 4;
     }
+    // Inkbleed is analytic antialiasing for 1x depthStencil. Don't let it
+    // through for MSAA.
+    m_frameDescriptor.inkbleedOverride = frameDescriptor.inkbleedOverride &&
+                                         m_frameDescriptor.msaaSampleCount == 1;
+    // Republished for the producer thread; see the member's comment.
+    m_frameCanApplyLayerMask.store(m_frameInterlockMode ==
+                                       gpu::InterlockMode::rasterOrdering,
+                                   std::memory_order_relaxed);
     m_frameShaderFeaturesMask =
         gpu::ShaderFeaturesMaskFor(m_frameInterlockMode);
+    m_triangulationController.beginFrame(
+        m_frameDescriptor.triangulationThresholds);
     if (m_logicalFlushes.empty())
     {
         m_logicalFlushes.emplace_back(new LogicalFlush(this));
@@ -365,7 +479,7 @@ bool RenderContext::isOutsideCurrentFrame(const IAABB& pixelBounds)
 bool RenderContext::frameSupportsClipRects() const
 {
     assert(m_didBeginFrame);
-    return m_frameInterlockMode != gpu::InterlockMode::msaa ||
+    return m_frameInterlockMode != gpu::InterlockMode::depthStencil ||
            platformFeatures().supportsClipPlanes;
 }
 
@@ -375,18 +489,80 @@ bool RenderContext::frameSupportsImagePaintForPaths() const
     return m_frameInterlockMode != gpu::InterlockMode::atomics;
 }
 
-uint32_t RenderContext::generateClipID(const IAABB& contentBounds)
+bool RenderContext::frameSupportsLayerMask() const
+{
+    assert(m_didBeginFrame);
+    // The precise answer, and no longer the same question as
+    // supportsLayerMask(): this one decides whether to EMIT the op, so it has
+    // to be this frame's mode. Emitting on a mode whose blend step has not been
+    // taught it is worse than skipping -- find_paint_color would hand back the
+    // coverage texel and src-over would paint it over the content. Safe to read
+    // the mode here because this runs on the thread that opened the frame.
+    return m_frameInterlockMode == gpu::InterlockMode::rasterOrdering;
+}
+
+bool RenderContext::supportsLayerMask() const
+{
+    // Device capability only, and deliberately nothing per-frame.
+    //
+    // This is asked by a recording session, on the producer thread, while the
+    // render thread may be inside beginFrame on this same context -- the whole
+    // point of the DeferredFrame snapshot is that recording the next frame
+    // overlaps replaying the last one. Reading m_frameInterlockMode here was
+    // therefore a data race, and it answered with whichever frame happened to
+    // have started last: after one MSAA frame chose depthStencil, later
+    // recordings would report no support and quietly stop masking.
+    //
+    // platformFeatures() is settled in the backend's constructor and never
+    // written again, so reading it across threads is safe. The mask rides the
+    // modulated-image path to get its texel, which rasterOrdering always has,
+    // and select_interlock_mode cannot choose that mode without this flag.
+    //
+    // What this cannot know is the descriptor of the frame that will replay the
+    // recording. A capable device whose next frame asks for MSAA lands on
+    // depthStencil, where applyLayerMask no-ops -- and by then the rasters are
+    // already sized to the content-and-coverage intersection, so that layer
+    // comes back unmasked and cropped. Closing that needs the capability handed
+    // in from the target before recording, or an uncropped box whenever the
+    // answer is a guess; frameSupportsLayerMask() below is the precise form,
+    // but it is only answerable on the replay thread inside the frame, which is
+    // too late to choose a box.
+    // The frame half comes from an atomic that beginFrame publishes rather than
+    // from m_frameInterlockMode directly, which is what made this racy. Same
+    // value, read safely.
+    //
+    // It can still be the PREVIOUS frame's answer, and that is inherent: a
+    // recording is made before the frame that will replay it exists, so the
+    // last one is the only evidence there is. Being wrong that way costs a
+    // layer that comes back unmasked and cropped, since the rasters were sized
+    // to the content-and-coverage intersection by then. Closing it properly
+    // means the replay target handing the capability in before recording
+    // starts, or keeping an uncropped box whenever the answer is a guess -- and
+    // that second option gives up the tight bounds this whole change is for.
+    // frameSupportsLayerMask() is exact but is only answerable on the replay
+    // thread inside the frame, far too late to pick a box.
+    return platformFeatures().supportsRasterOrderingMode &&
+           m_frameCanApplyLayerMask.load(std::memory_order_relaxed);
+}
+
+uint32_t RenderContext::generateClipID(IAABB contentBounds,
+                                       uint32_t parentClipID,
+                                       AABBu16 tightenedBounds)
 {
     assert(m_didBeginFrame);
     assert(!m_logicalFlushes.empty());
-    return m_logicalFlushes.back()->generateClipID(contentBounds);
+    return m_logicalFlushes.back()->generateClipID(contentBounds,
+                                                   parentClipID,
+                                                   tightenedBounds);
 }
 
-uint32_t RenderContext::LogicalFlush::generateClipID(const IAABB& contentBounds)
+uint32_t RenderContext::LogicalFlush::generateClipID(IAABB contentBounds,
+                                                     uint32_t parentClipID,
+                                                     AABBu16 tightenedBounds)
 {
     if (m_clips.size() < m_ctx->m_maxPathID) // maxClipID == maxPathID.
     {
-        m_clips.emplace_back(contentBounds);
+        m_clips.emplace_back(contentBounds, parentClipID, tightenedBounds);
         assert(m_ctx->m_clipContentID != m_clips.size());
         return math::lossless_numeric_cast<uint32_t>(m_clips.size());
     }
@@ -402,15 +578,6 @@ RenderContext::LogicalFlush::ClipInfo& RenderContext::LogicalFlush::
     return m_clips[clipID - 1];
 }
 
-void RenderContext::LogicalFlush::addClipReadBounds(uint32_t clipID,
-                                                    const IAABB& bounds)
-{
-    assert(clipID > 0);
-    assert(clipID <= m_clips.size());
-    ClipInfo& clipInfo = getWritableClipInfo(clipID);
-    clipInfo.readBounds = clipInfo.readBounds.join(bounds);
-}
-
 bool RenderContext::pushDraws(DrawUniquePtr draws[], size_t drawCount)
 {
     assert(m_didBeginFrame);
@@ -421,7 +588,7 @@ bool RenderContext::pushDraws(DrawUniquePtr draws[], size_t drawCount)
 bool RenderContext::LogicalFlush::pushDraws(DrawUniquePtr draws[],
                                             size_t drawCount)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     assert(!m_hasDoneLayout);
 
     PUSH_DISABLE_CLANG_SIMD_ABI_WARNING()
@@ -451,16 +618,16 @@ bool RenderContext::LogicalFlush::pushDraws(DrawUniquePtr draws[],
     int passCountInBatch = 0;
     for (size_t i = 0; i < drawCount; ++i)
     {
-        draws[i]->countSubpasses();
+        draws[i]->countSubpasses(platformFeatures());
         assert(draws[i]->prepassCount() >= 0);
         assert(draws[i]->subpassCount() >= 0);
         assert(draws[i]->prepassCount() + draws[i]->subpassCount() >= 1);
         passCountInBatch += draws[i]->prepassCount() + draws[i]->subpassCount();
     }
 
-    // We can only reorder 32k draws at a time in atomic and msaa modes since
-    // the sort key addresses them with a signed 16-bit index. Make sure we
-    // don't exceed that limit.
+    // We can only reorder 32k draws at a time in atomic and depthStencil modes
+    // since the sort key addresses them with a signed 16-bit index. Make sure
+    // we don't exceed that limit.
     if (m_ctx->frameInterlockMode() != gpu::InterlockMode::rasterOrdering &&
         m_drawPassCount + passCountInBatch > kMaxReorderedDrawPassCount)
     {
@@ -477,7 +644,7 @@ bool RenderContext::LogicalFlush::pushDraws(DrawUniquePtr draws[],
             //
             // FIXME: This works today, but the surrounding code could be
             // modified to inadvertently leave a stale dangling reference to one
-            // of these draws in m_pendingAtlasDraws. This needs to be
+            // of these draws in m_pendingFeatherAtlasDraws. This needs to be
             // revisited.
             return false;
         }
@@ -486,9 +653,10 @@ bool RenderContext::LogicalFlush::pushDraws(DrawUniquePtr draws[],
     for (size_t i = 0; i < drawCount; ++i)
     {
         m_draws.push_back(std::move(draws[i]));
-        m_combinedDrawBounds =
-            m_combinedDrawBounds.join(m_draws.back()->pixelBounds());
-        m_combinedDrawContents |= m_draws.back()->drawContents();
+        // Note: not updating m_combinedDrawBounds here because it will get done
+        // in tightenClipBounds later, after we've determined the minimal write
+        // sizes for any clips.
+        m_combinedDrawContents |= m_draws.back()->combinedDrawContents();
     }
 
     m_resourceCounts = countsWithNewBatch;
@@ -500,7 +668,7 @@ bool RenderContext::LogicalFlush::allocateGradient(
     const Gradient* gradient,
     gpu::ColorRampLocation* colorRampLocation)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(!m_hasDoneLayout);
 
     const float* stops = gradient->stops();
@@ -584,43 +752,44 @@ bool RenderContext::LogicalFlush::allocateGradient(
     return true;
 }
 
-bool RenderContext::LogicalFlush::allocateAtlasDraw(
+bool RenderContext::LogicalFlush::allocateFeatherAtlasDraw(
     PathDraw* pathDraw,
     uint16_t drawWidth,
     uint16_t drawHeight,
     uint16_t desiredPadding,
     uint16_t* x,
     uint16_t* y,
-    TAABB<uint16_t>* paddedRegion)
+    AABBu16* paddedRegion)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
 
-    if (m_atlasRectanizer == nullptr)
+    if (m_featherAtlasRectanizer == nullptr)
     {
-        uint16_t atlasMaxSize = m_ctx->atlasMaxSize();
-        // Use an atlas larger than atlasMaxSize if it's too small for the
-        // request (meaning the render target is larger than atlasMaxSize).
-        m_atlasRectanizer = std::make_unique<rive::RectanizerSkyline>(
+        uint16_t atlasMaxSize = m_ctx->featherAtlasMaxSize();
+        // Use an atlas larger than featherAtlasMaxSize if it's too small for
+        // the request (meaning the render target is larger than
+        // featherAtlasMaxSize).
+        m_featherAtlasRectanizer = std::make_unique<rive::RectanizerSkyline>(
             std::max(atlasMaxSize, drawWidth),
             std::max(atlasMaxSize, drawHeight));
     }
 
-    const uint16_t atlasMaxWidth = m_atlasRectanizer->width();
-    const uint16_t atlasMaxHeight = m_atlasRectanizer->height();
+    const uint16_t atlasMaxWidth = m_featherAtlasRectanizer->width();
+    const uint16_t atlasMaxHeight = m_featherAtlasRectanizer->height();
     uint16_t paddedWidth =
         std::min<uint16_t>(drawWidth + desiredPadding * 2, atlasMaxWidth);
     uint16_t paddedHeight =
         std::min<uint16_t>(drawHeight + desiredPadding * 2, atlasMaxHeight);
     int16_t ix, iy;
-    if (!m_atlasRectanizer->addRect(paddedWidth, paddedHeight, &ix, &iy))
+    if (!m_featherAtlasRectanizer->addRect(paddedWidth, paddedHeight, &ix, &iy))
     {
         // Delete the rectanizer of it wasn't big enough for this path. It will
         // be reallocated to a large enough size on the next call.
         if (drawWidth > atlasMaxWidth || drawHeight > atlasMaxHeight)
         {
-            m_atlasRectanizer = nullptr;
+            m_featherAtlasRectanizer = nullptr;
         }
-        m_atlasRectanizer = nullptr;
+        m_featherAtlasRectanizer = nullptr;
         return false;
     }
 
@@ -631,24 +800,30 @@ bool RenderContext::LogicalFlush::allocateAtlasDraw(
 
     *x = ix + (paddedWidth - drawWidth) / 2;
     *y = iy + (paddedHeight - drawHeight) / 2;
-    *paddedRegion = {ix, iy, ix + paddedWidth, iy + paddedHeight};
-    assert((TAABB<uint16_t>{0, 0, atlasMaxWidth, atlasMaxHeight})
-               .contains(*paddedRegion));
+    *paddedRegion = {math::lossless_numeric_cast<uint16_t>(ix),
+                     math::lossless_numeric_cast<uint16_t>(iy),
+                     math::lossless_numeric_cast<uint16_t>(ix + paddedWidth),
+                     math::lossless_numeric_cast<uint16_t>(iy + paddedHeight)};
+    assert(
+        (AABBu16{0, 0, atlasMaxWidth, atlasMaxHeight}).contains(*paddedRegion));
 
-    m_atlasMaxX = std::max<uint32_t>(m_atlasMaxX, paddedRegion->right);
-    m_atlasMaxY = std::max<uint32_t>(m_atlasMaxY, paddedRegion->bottom);
-    assert(m_atlasMaxX <= atlasMaxWidth);
-    assert(m_atlasMaxY <= atlasMaxHeight);
+    m_featherAtlasMaxX =
+        std::max<uint32_t>(m_featherAtlasMaxX, paddedRegion->right);
+    m_featherAtlasMaxY =
+        std::max<uint32_t>(m_featherAtlasMaxY, paddedRegion->bottom);
+    assert(m_featherAtlasMaxX <= atlasMaxWidth);
+    assert(m_featherAtlasMaxY <= atlasMaxHeight);
 
-    m_pendingAtlasDraws.push_back(pathDraw);
+    m_pendingFeatherAtlasDraws.push_back(pathDraw);
     return true;
 }
 
 size_t RenderContext::LogicalFlush::allocateCoverageBufferRange(size_t length)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwiseAtomic);
-    assert(length % (32 * 32) == 0u); // Allocations must support 32x32 tiles.
+    // Allocations must be aligned to the tile size.
+    assert(length % (BUFFER_IMAGE_TILE_SIZE * BUFFER_IMAGE_TILE_SIZE) == 0u);
     uint32_t offset = m_coverageBufferLength;
     if (offset + length > m_ctx->platformFeatures().maxCoverageBufferLength)
     {
@@ -673,12 +848,14 @@ void RenderContext::logicalFlush()
 
 void RenderContext::flush(const FlushResources& flushResources)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(0)
     assert(m_didBeginFrame);
     assert(flushResources.renderTarget->width() ==
            m_frameDescriptor.renderTargetWidth);
     assert(flushResources.renderTarget->height() ==
            m_frameDescriptor.renderTargetHeight);
+
+    m_triangulationController.endFrame();
 
     m_clipContentID = 0;
 
@@ -697,7 +874,6 @@ void RenderContext::flush(const FlushResources& flushResources)
     // flush.
     const ResourceAllocationCounts resourceRequirements = {
         .flushUniformBufferCount = m_logicalFlushes.size(),
-        .imageDrawUniformBufferCount = totalFrameResourceCounts.imageDrawCount,
         .pathBufferCount =
             totalFrameResourceCounts.pathCount + layoutCounts.pathPaddingCount,
         .paintBufferCount =
@@ -711,11 +887,17 @@ void RenderContext::flush(const FlushResources& flushResources)
         .tessSpanBufferCount =
             totalFrameResourceCounts.maxTessellatedSegmentCount,
         .triangleVertexBufferCount =
-            totalFrameResourceCounts.maxTriangleVertexCount,
+            totalFrameResourceCounts.maxTriangleVertexCount > 0
+                ? totalFrameResourceCounts.maxTriangleVertexCount +
+                      (m_logicalFlushes.size() + 1) *
+                          (kTriangleVertexGroupSize - 1)
+                : 0,
+        .imageRectInstanceBufferCount = totalFrameResourceCounts.imageRectCount,
+        .imageMeshInstanceBufferCount = totalFrameResourceCounts.imageMeshCount,
         .gradTextureHeight = layoutCounts.maxGradTextureHeight,
         .tessTextureHeight = layoutCounts.maxTessTextureHeight,
-        .atlasTextureWidth = layoutCounts.maxAtlasWidth,
-        .atlasTextureHeight = layoutCounts.maxAtlasHeight,
+        .featherAtlasTextureWidth = layoutCounts.maxFeatherAtlasWidth,
+        .featherAtlasTextureHeight = layoutCounts.maxFeatherAtlasHeight,
         .plsTransientBackingWidth =
             (layoutCounts.maxPLSTransientBackingPlaneCount > 0)
                 ? static_cast<size_t>(m_frameDescriptor.renderTargetWidth)
@@ -740,11 +922,13 @@ void RenderContext::flush(const FlushResources& flushResources)
     // Ensure we're within hardware limits.
     assert(resourceRequirements.gradTextureHeight <= kMaxTextureHeight);
     assert(resourceRequirements.tessTextureHeight <= kMaxTextureHeight);
-    assert(resourceRequirements.atlasTextureWidth <= atlasMaxSize() ||
-           resourceRequirements.atlasTextureWidth <=
+    assert(resourceRequirements.featherAtlasTextureWidth <=
+               featherAtlasMaxSize() ||
+           resourceRequirements.featherAtlasTextureWidth <=
                frameDescriptor().renderTargetWidth);
-    assert(resourceRequirements.atlasTextureHeight <= atlasMaxSize() ||
-           resourceRequirements.atlasTextureHeight <=
+    assert(resourceRequirements.featherAtlasTextureHeight <=
+               featherAtlasMaxSize() ||
+           resourceRequirements.featherAtlasTextureHeight <=
                frameDescriptor().renderTargetHeight);
     assert(resourceRequirements.plsTransientBackingWidth <=
            m_frameDescriptor.renderTargetWidth);
@@ -768,7 +952,6 @@ void RenderContext::flush(const FlushResources& flushResources)
     // create some slack for growth.
     constexpr static ResourceAllocationCounts OVERALLOC_x4 = {
         .flushUniformBufferCount = 5,        // 125%
-        .imageDrawUniformBufferCount = 5,    // 125%
         .pathBufferCount = 5,                // 125%
         .paintBufferCount = 5,               // 125%
         .paintAuxBufferCount = 5,            // 125%
@@ -776,10 +959,12 @@ void RenderContext::flush(const FlushResources& flushResources)
         .gradSpanBufferCount = 5,            // 125%
         .tessSpanBufferCount = 5,            // 125%
         .triangleVertexBufferCount = 5,      // 125%
+        .imageRectInstanceBufferCount = 5,   // 125%
+        .imageMeshInstanceBufferCount = 5,   // 125%
         .gradTextureHeight = 5,              // 125%
         .tessTextureHeight = 5,              // 125%
-        .atlasTextureWidth = 5,              // 125%
-        .atlasTextureHeight = 5,             // 125%
+        .featherAtlasTextureWidth = 5,       // 125%
+        .featherAtlasTextureHeight = 5,      // 125%
         .plsTransientBackingWidth = 4,       // 100% (i.e., don't overallocate)
         .plsTransientBackingHeight = 4,      // 100% (i.e., don't overallocate)
         .plsTransientBackingPlaneCount = 4,  // 100% (i.e., don't overallocate)
@@ -799,12 +984,12 @@ void RenderContext::flush(const FlushResources& flushResources)
         std::min<size_t>(allocs.gradTextureHeight, kMaxTextureHeight);
     allocs.tessTextureHeight =
         std::min<size_t>(allocs.tessTextureHeight, kMaxTextureHeight);
-    allocs.atlasTextureWidth = std::min<size_t>(
-        allocs.atlasTextureWidth,
-        std::max(atlasMaxSize(), frameDescriptor().renderTargetWidth));
-    allocs.atlasTextureHeight = std::min<size_t>(
-        allocs.atlasTextureHeight,
-        std::max(atlasMaxSize(), frameDescriptor().renderTargetHeight));
+    allocs.featherAtlasTextureWidth = std::min<size_t>(
+        allocs.featherAtlasTextureWidth,
+        std::max(featherAtlasMaxSize(), frameDescriptor().renderTargetWidth));
+    allocs.featherAtlasTextureHeight = std::min<size_t>(
+        allocs.featherAtlasTextureHeight,
+        std::max(featherAtlasMaxSize(), frameDescriptor().renderTargetHeight));
     allocs.coverageBufferLength =
         std::min(allocs.coverageBufferLength,
                  platformFeatures().maxCoverageBufferLength);
@@ -820,7 +1005,6 @@ void RenderContext::flush(const FlushResources& flushResources)
         // threshold.
         constexpr static ResourceAllocationCounts SHRINK_THRESHOLD_x3 = {
             .flushUniformBufferCount = 2,        // 66.7%
-            .imageDrawUniformBufferCount = 2,    // 66.7%
             .pathBufferCount = 2,                // 66.7%
             .paintBufferCount = 2,               // 66.7%
             .paintAuxBufferCount = 2,            // 66.7%
@@ -828,10 +1012,12 @@ void RenderContext::flush(const FlushResources& flushResources)
             .gradSpanBufferCount = 2,            // 66.7%
             .tessSpanBufferCount = 2,            // 66.7%
             .triangleVertexBufferCount = 2,      // 66.7%
+            .imageRectInstanceBufferCount = 2,   // 66.7%
+            .imageMeshInstanceBufferCount = 2,   // 66.7%
             .gradTextureHeight = 2,              // 66.7%
             .tessTextureHeight = 2,              // 66.7%
-            .atlasTextureWidth = 2,              // 66.7%
-            .atlasTextureHeight = 2,             // 66.7%
+            .featherAtlasTextureWidth = 2,       // 66.7%
+            .featherAtlasTextureHeight = 2,      // 66.7%
             .plsTransientBackingWidth = 3,       // 100% (i.e., always shrink)
             .plsTransientBackingHeight = 3,      // 100% (i.e., always shrink)
             .plsTransientBackingPlaneCount = 3,  // 100% (i.e., always shrink)
@@ -851,10 +1037,11 @@ void RenderContext::flush(const FlushResources& flushResources)
         // Ensure we stayed within limits.
         assert(allocs.gradTextureHeight <= kMaxTextureHeight);
         assert(allocs.tessTextureHeight <= kMaxTextureHeight);
-        assert(allocs.atlasTextureWidth <= atlasMaxSize() ||
-               allocs.atlasTextureWidth <= frameDescriptor().renderTargetWidth);
-        assert(allocs.atlasTextureHeight <= atlasMaxSize() ||
-               allocs.atlasTextureHeight <=
+        assert(allocs.featherAtlasTextureWidth <= featherAtlasMaxSize() ||
+               allocs.featherAtlasTextureWidth <=
+                   frameDescriptor().renderTargetWidth);
+        assert(allocs.featherAtlasTextureHeight <= featherAtlasMaxSize() ||
+               allocs.featherAtlasTextureHeight <=
                    frameDescriptor().renderTargetHeight);
         assert(allocs.coverageBufferLength <=
                platformFeatures().maxCoverageBufferLength);
@@ -879,8 +1066,10 @@ void RenderContext::flush(const FlushResources& flushResources)
         }
 
         assert(m_flushUniformData.elementsWritten() == m_logicalFlushes.size());
-        assert(m_imageDrawUniformData.elementsWritten() ==
-               totalFrameResourceCounts.imageDrawCount);
+        assert(m_imageRectInstanceData.elementsWritten() ==
+               totalFrameResourceCounts.imageRectCount);
+        assert(m_imageMeshInstanceData.elementsWritten() ==
+               totalFrameResourceCounts.imageMeshCount);
         assert(m_pathData.elementsWritten() ==
                totalFrameResourceCounts.pathCount +
                    layoutCounts.pathPaddingCount);
@@ -898,7 +1087,8 @@ void RenderContext::flush(const FlushResources& flushResources)
         assert(m_tessSpanData.elementsWritten() <=
                totalFrameResourceCounts.maxTessellatedSegmentCount);
         assert(m_triangleVertexData.elementsWritten() <=
-               totalFrameResourceCounts.maxTriangleVertexCount);
+               totalFrameResourceCounts.maxTriangleVertexCount +
+                   m_logicalFlushes.size() * (kTriangleVertexGroupSize - 1));
 
         unmapResourceBuffers(resourceRequirements);
 
@@ -951,23 +1141,25 @@ static uint32_t pls_transient_backing_plane_count(
         case gpu::InterlockMode::rasterOrdering:
             return 3; // clip, scratch, coverage
         case gpu::InterlockMode::atomics:
+        case gpu::InterlockMode::clockwiseAtomic:
             return 1; // only clip (coverage is atomic)
         case gpu::InterlockMode::clockwise:
         {
             uint32_t n = 1; // coverage
-            if (combinedDrawContents &
-                (gpu::DrawContents::activeClip | gpu::DrawContents::clipUpdate))
+            if (enums::any_flag_set(combinedDrawContents,
+                                    gpu::DrawContents::activeClip |
+                                        gpu::DrawContents::clipUpdate))
             {
                 ++n; // clip
             }
-            if (combinedDrawContents & gpu::DrawContents::advancedBlend)
+            if (enums::is_flag_set(combinedDrawContents,
+                                   gpu::DrawContents::advancedBlend))
             {
                 ++n; // scratch color
             }
             return n;
         }
-        case gpu::InterlockMode::clockwiseAtomic:
-        case gpu::InterlockMode::msaa:
+        case gpu::InterlockMode::depthStencil:
             return 0; // N/A
     }
     RIVE_UNREACHABLE();
@@ -977,7 +1169,8 @@ static bool wants_fixed_function_color_output(
     const gpu::PlatformFeatures& platformFeatures,
     gpu::InterlockMode interlockMode,
     gpu::DrawContents combinedDrawContents,
-    bool manuallyResolved)
+    bool manuallyResolved,
+    uint32_t msaaSampleCount)
 {
     switch (interlockMode)
     {
@@ -987,23 +1180,24 @@ static bool wants_fixed_function_color_output(
             return false;
 
         case gpu::InterlockMode::atomics:
-            return !(combinedDrawContents & gpu::DrawContents::advancedBlend);
+        case gpu::InterlockMode::clockwiseAtomic:
+            return !enums::is_flag_set(combinedDrawContents,
+                                       gpu::DrawContents::advancedBlend);
 
         case gpu::InterlockMode::clockwise:
-            assert(!(combinedDrawContents & (gpu::DrawContents::nonZeroFill |
-                                             gpu::DrawContents::evenOddFill)));
+            assert(enums::no_flags_set(combinedDrawContents,
+                                       gpu::DrawContents::nonZeroFill |
+                                           gpu::DrawContents::evenOddFill));
             return platformFeatures.supportsClockwiseFixedFunctionMode &&
-                   !(combinedDrawContents & gpu::DrawContents::advancedBlend);
+                   !enums::is_flag_set(combinedDrawContents,
+                                       gpu::DrawContents::advancedBlend);
 
-        case gpu::InterlockMode::clockwiseAtomic:
-            // clockwiseAtomic currently always sets fixedFunctionColorOutput.
-            return true;
-
-        case gpu::InterlockMode::msaa:
+        case gpu::InterlockMode::depthStencil:
             // Manual MSAA resolves read the framebuffer, so they can't use
             // fixedFunctionColorOutput.
             return !manuallyResolved &&
-                   !(combinedDrawContents & gpu::DrawContents::advancedBlend);
+                   !enums::is_flag_set(combinedDrawContents,
+                                       gpu::DrawContents::advancedBlend);
     }
 
     RIVE_UNREACHABLE();
@@ -1015,7 +1209,7 @@ void RenderContext::LogicalFlush::layoutResources(
     ResourceCounters* runningFrameResourceCounts,
     LayoutCounters* runningFrameLayoutCounts)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     assert(!m_hasDoneLayout);
 
     const FrameDescriptor& frameDescriptor = m_ctx->frameDescriptor();
@@ -1058,9 +1252,9 @@ void RenderContext::LogicalFlush::layoutResources(
 
         // outerCubic tessellation vertices reside after the midpointFan
         // vertices, aligned on a multiple of the outerCubic patch size.
-        uint32_t interiorPadding =
-            math::padding_to_align_up<gpu::kOuterCurvePatchSegmentSpan>(
-                m_midpointFanTessEndLocation);
+        uint32_t interiorPadding = math::padding_to_align_up<
+            gpu::OuterCubicPatchSegmentSpanPlusBowtie>(
+            m_midpointFanTessEndLocation);
         m_outerCubicTessVertexIdx =
             m_midpointFanTessEndLocation + interiorPadding;
         m_outerCubicTessEndLocation =
@@ -1106,6 +1300,9 @@ void RenderContext::LogicalFlush::layoutResources(
     m_flushDesc.renderTarget = flushResources.renderTarget;
     m_flushDesc.interlockMode = m_ctx->frameInterlockMode();
     m_flushDesc.msaaSampleCount = frameDescriptor.msaaSampleCount;
+    // A nonzero sample count is exactly what selects depthStencil.
+    assert((m_flushDesc.interlockMode == gpu::InterlockMode::depthStencil) ==
+           (m_flushDesc.msaaSampleCount != 0));
 
     // In atomic mode, we may be able to skip the explicit clear of the color
     // buffer and fold it into the atomic "resolve" operation instead.
@@ -1163,6 +1360,13 @@ void RenderContext::LogicalFlush::layoutResources(
         m_flushDesc.coverageClearValue = 0;
     }
 
+    // Adjust the clip bounds so that they are as tight on the writes/reads as
+    // possible, to enable minimal scissor rectangle sizes.
+    // Note: This is done here so that m_combinedDrawBounds are updated before
+    // we try to use them, to ensure they're also tightened in on the clipping
+    // (when scissor is supported).
+    tightenClipBounds();
+
     if (doClearDuringAtomicResolve ||
         m_flushDesc.colorLoadAction == gpu::LoadAction::clear)
     {
@@ -1191,20 +1395,22 @@ void RenderContext::LogicalFlush::layoutResources(
         m_flushDesc.renderTargetUpdateBounds,
         m_flushDesc.virtualTileWidth,
         m_flushDesc.virtualTileHeight,
-        m_combinedDrawContents);
+        m_combinedDrawContents,
+        m_flushDesc.msaaSampleCount);
 
     m_flushDesc.fixedFunctionColorOutput =
         wants_fixed_function_color_output(m_ctx->platformFeatures(),
                                           m_ctx->frameInterlockMode(),
                                           m_combinedDrawContents,
-                                          m_flushDesc.manuallyResolved);
+                                          m_flushDesc.manuallyResolved,
+                                          m_flushDesc.msaaSampleCount);
     if (m_flushDesc.fixedFunctionColorOutput)
     {
         m_baselineShaderMiscFlags |=
             gpu::ShaderMiscFlags::fixedFunctionColorOutput;
     }
-    m_flushDesc.atlasContentWidth = m_atlasMaxX;
-    m_flushDesc.atlasContentHeight = m_atlasMaxY;
+    m_flushDesc.featherAtlasContentWidth = m_featherAtlasMaxX;
+    m_flushDesc.featherAtlasContentHeight = m_featherAtlasMaxY;
 
     m_flushDesc.flushUniformDataOffsetInBytes =
         logicalFlushIdx * sizeof(gpu::FlushUniforms);
@@ -1253,10 +1459,12 @@ void RenderContext::LogicalFlush::layoutResources(
     runningFrameLayoutCounts->maxTessTextureHeight =
         std::max(m_flushDesc.tessDataHeight,
                  runningFrameLayoutCounts->maxTessTextureHeight);
-    runningFrameLayoutCounts->maxAtlasWidth =
-        std::max(m_atlasMaxX, runningFrameLayoutCounts->maxAtlasWidth);
-    runningFrameLayoutCounts->maxAtlasHeight =
-        std::max(m_atlasMaxY, runningFrameLayoutCounts->maxAtlasHeight);
+    runningFrameLayoutCounts->maxFeatherAtlasWidth =
+        std::max(m_featherAtlasMaxX,
+                 runningFrameLayoutCounts->maxFeatherAtlasWidth);
+    runningFrameLayoutCounts->maxFeatherAtlasHeight =
+        std::max(m_featherAtlasMaxY,
+                 runningFrameLayoutCounts->maxFeatherAtlasHeight);
     runningFrameLayoutCounts->maxPLSTransientBackingPlaneCount =
         std::max(pls_transient_backing_plane_count(m_flushDesc.interlockMode,
                                                    m_combinedDrawContents),
@@ -1278,9 +1486,39 @@ void RenderContext::LogicalFlush::layoutResources(
     RIVE_DEBUG_CODE(m_hasDoneLayout = true;)
 }
 
+void RenderContext::LogicalFlush::pushBarriers(BarrierFlags barrierFlags)
+{
+    if (m_ctx->platformFeatures()
+            .clockwiseAtomicBorrowedCoverageBarrierNeedsRenderPassInit &&
+        enums::is_flag_set(barrierFlags,
+                           gpu::BarrierFlags::clockwiseBorrowedCoverage))
+    {
+        // We need a workaround in order for input attachments to work.
+        BarrierFlags workaroundBarriers =
+            BarrierFlags::clockwiseBorrowedCoverage | BarrierFlags::plsAtomic;
+        if (enums::is_flag_set(m_combinedDrawContents,
+                               gpu::DrawContents::advancedBlend))
+        {
+            workaroundBarriers |= BarrierFlags::dstBlend;
+        }
+        m_drawList.emplace_back(m_ctx->perFrameAllocator(),
+                                gpu::DrawType::renderPassInitialize,
+                                m_baselineShaderMiscFlags,
+                                gpu::DrawContents::none,
+                                1,
+                                0,
+                                BlendMode::overlay,
+                                ImageSampler::LinearClamp(),
+                                workaroundBarriers);
+        barrierFlags &= ~gpu::BarrierFlags::clockwiseBorrowedCoverage;
+    }
+
+    m_pendingBarriers |= barrierFlags;
+}
+
 void RenderContext::LogicalFlush::writeResources()
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     const gpu::PlatformFeatures& platformFeatures = m_ctx->platformFeatures();
     assert(m_hasDoneLayout);
     assert(m_flushDesc.firstPath == m_ctx->m_pathData.elementsWritten());
@@ -1290,16 +1528,32 @@ void RenderContext::LogicalFlush::writeResources()
 
     // Wait until here before we record these texture sizes; they aren't decided
     // until after all LogicalFlushes have run layoutResources().
-    m_flushDesc.atlasTextureWidth = math::lossless_numeric_cast<uint32_t>(
-        m_ctx->m_currentResourceAllocations.atlasTextureWidth);
-    m_flushDesc.atlasTextureHeight = math::lossless_numeric_cast<uint32_t>(
-        m_ctx->m_currentResourceAllocations.atlasTextureHeight);
+    m_flushDesc.featherAtlasTextureWidth =
+        math::lossless_numeric_cast<uint32_t>(
+            m_ctx->m_currentResourceAllocations.featherAtlasTextureWidth);
+    m_flushDesc.featherAtlasTextureHeight =
+        math::lossless_numeric_cast<uint32_t>(
+            m_ctx->m_currentResourceAllocations.featherAtlasTextureHeight);
     m_gradTextureLayout.inverseHeight =
         1.f / m_ctx->m_currentResourceAllocations.gradTextureHeight;
+    m_flushDesc.gradTextureHeight = math::lossless_numeric_cast<uint32_t>(
+        m_ctx->m_currentResourceAllocations.gradTextureHeight);
 
     // Exact tessSpan/triangleVertex counts aren't known until after their data
     // is written out.
     size_t firstTessVertexSpan = m_ctx->m_tessSpanData.elementsWritten();
+    if (m_ctx->m_triangleVertexData)
+    {
+        // Start on a vertex group, so neither this flush nor the one before it
+        // shades the other's vertices through the wrong path offsets.
+        const size_t groupPadding =
+            math::padding_to_align_up<kTriangleVertexGroupSize>(
+                m_ctx->m_triangleVertexData.elementsWritten());
+        for (size_t i = 0; i < groupPadding; ++i)
+        {
+            m_ctx->m_triangleVertexData.emplace_back(Vec2D{}, 0, 0);
+        }
+    }
     size_t initialTriangleVertexDataSize =
         m_ctx->m_triangleVertexData.bytesWritten();
 
@@ -1395,10 +1649,12 @@ void RenderContext::LogicalFlush::writeResources()
     m_ctx->m_paintData.set_back(gpu::DrawContents::none,
                                 PaintType::solidColor,
                                 clearColorValue,
-                                GradTextureLayout(),
                                 /*clipID =*/0,
                                 /*hasClipRect =*/false,
-                                BlendMode::srcOver);
+                                /*hasImage =*/false,
+                                BlendMode::srcOver,
+                                /*solidUnmultiplied =*/false,
+                                /*additiveness =*/0);
     m_ctx->m_paintAuxData.skip_back();
 
     // Render padding vertices in the tessellation texture.
@@ -1423,8 +1679,8 @@ void RenderContext::LogicalFlush::writeResources()
 
     // Write out all the data for our high level draws, and build up a low-level
     // draw list.
-    if (m_ctx->frameInterlockMode() == gpu::InterlockMode::rasterOrdering ||
-        m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwise)
+    if (!platformFeatures.supportsClipScissor &&
+        m_ctx->frameInterlockMode() == gpu::InterlockMode::rasterOrdering)
     {
         for (const DrawUniquePtr& draw : m_draws)
         {
@@ -1436,7 +1692,10 @@ void RenderContext::LogicalFlush::writeResources()
             assert(draw->subpassCount() > 0);
             for (int i = 0; i < draw->subpassCount(); ++i)
             {
-                draw->pushToRenderContext(this, i);
+                // Non-depthStencil draws don't use zIndex.
+                assert(m_ctx->frameInterlockMode() !=
+                       gpu::InterlockMode::depthStencil);
+                draw->pushToRenderContext(this, i, /*zIndex =*/0);
             }
         }
     }
@@ -1446,7 +1705,7 @@ void RenderContext::LogicalFlush::writeResources()
 
         // Sort the draw list to optimize batching, since we can only batch
         // non-overlapping draws.
-        std::vector<int64_t>& indirectDrawList = m_ctx->m_indirectDrawList;
+        auto& indirectDrawList = m_ctx->m_indirectDrawList;
         indirectDrawList.clear();
         indirectDrawList.reserve(m_drawPassCount);
 
@@ -1519,110 +1778,216 @@ void RenderContext::LogicalFlush::writeResources()
             // Within sub-groups of matching draw type, sort by texture binding.
             {.entry = SortEntry::textureHash, .bitCount = 14},
 
+            // It's less expensive to change the scissorID than texture, but
+            // more expensive than the blend mode, so here's where it lives.
+            {.entry = SortEntry::scissorID, .bitCount = 15},
+
             // If using KHR_blend_equation_advanced, we need a batching barrier
             // between draws with different blend modes. If not using
             // KHR_blend_equation_advanced, sorting by blend mode may still give
             // us better branching on the GPU.
             {.entry = SortEntry::blendMode, .bitCount = 4},
 
-            // msaa mode draws strokes, fills, and even/odd with different
-            // stencil settings.
+            // depthStencil mode draws strokes, fills, and even/odd with
+            // different stencil settings.
             {.entry = SortEntry::drawContents, .bitCount = 9},
 
-            // Draw and subpass indices go at the bottom of the key so we can
-            // reference them again after sorting without affecting the order.
-            {.entry = SortEntry::drawIndex, .bitCount = 15},
+            // Finally, we need sorting by subpass. Without this, the
+            // depthStencil subpasses (and maybe others) won't run in the
+            // correct order when allSubpassesInSameDrawGroup was true.
             {.entry = SortEntry::subpassIndex, .bitCount = 3},
         };
 
-        for (size_t i = 0; i < m_draws.size(); ++i)
+        m_ctx->m_scissorIDLookup.clear();
+
+        // Set this to 0, any actual scissor IDs used will then start at 1.
+        m_ctx->m_prevScissorID = 0;
+
+        // When the dstBlend barrier has no other option than to copy out a
+        // texture, this copy destroys MSAA information and we can no longer
+        // put subpasses in different drawGroups.
+        // Otherwise, we put subpasses into different draw groups because it
+        // yields better reordering.
+        const bool allSubpassesInSameDrawGroup =
+            m_ctx->frameInterlockMode() == gpu::InterlockMode::depthStencil &&
+            !platformFeatures.supportsBlendAdvancedKHR &&
+            enums::is_flag_set(m_combinedDrawContents,
+                               gpu::DrawContents::advancedBlend);
+
+        int16_t maxZIndex = 0;
+
+        for (int16_t drawIndex = 0; drawIndex < int16_t(m_draws.size());
+             ++drawIndex)
         {
-            Draw* draw = m_draws[i].get();
-            int4 drawBounds = simd::load4i(&m_draws[i]->pixelBounds());
+            Draw* draw = m_draws[drawIndex].get();
+
+            int16_t scissorID = 0;
+            auto drawPixelBoundRect = draw->pixelBounds();
+
+            if (platformFeatures.supportsClipScissor &&
+                (draw->clipID() != 0 ||
+                 draw->clippingPixelBounds().has_value()))
+            {
+                const auto drawClipID = draw->clipID();
+
+                // Start with either the clipping pixel bounds (if they exist)
+                // or a maximally-large rectangle.
+                auto clipBounds =
+                    draw->clippingPixelBounds().value_or(IAABB::makeMaximal());
+
+                if (drawClipID != 0)
+                {
+                    // Intersect with the tightened clip bounds if there was a
+                    // clip in the stack (which may be tighter than it was when
+                    // originally rendered - but also there may have been a clip
+                    // rect that happened after this clip path, which is why the
+                    // intersect still needs to happen)
+                    clipBounds = clipBounds.intersect(
+                        getClipInfo(drawClipID).tightenedBounds);
+                }
+
+                const auto drawBounds = draw->pixelBounds();
+
+                if (needsScissor(drawBounds,
+                                 clipBounds,
+                                 frameDescriptor().renderTargetWidth,
+                                 frameDescriptor().renderTargetHeight))
+                {
+                    drawPixelBoundRect = clipBounds;
+
+                    const auto clipBoundsU16 =
+                        clipBounds.clamp_cast<uint16_t>();
+
+                    // If the value is already in the map, get it, otherwise
+                    // we'll add the next new ID (which is 1 + the size of
+                    // the array, since we're using "0" as "no scissor")
+                    auto result = m_ctx->m_scissorIDLookup.try_emplace(
+                        clipBoundsU16,
+                        m_ctx->m_prevScissorID + 1);
+                    scissorID = result.first->second;
+                    assert(scissorID > 0);
+                    if (scissorID > m_ctx->m_prevScissorID)
+                    {
+                        ++m_ctx->m_prevScissorID;
+                    }
+
+                    // Update the scissor rect for this draw so we can
+                    // ensure it doesn't batch with draws with different
+                    // scissor rects.
+                    draw->setScissorRect(clipBoundsU16);
+                }
+            }
+
+            int4 drawBounds = simd::load4i(&drawPixelBoundRect);
 
             // Add one extra pixel of padding to the draw bounds to make
             // absolutely certain we get no overlapping pixels, which destroy
             // the atomic shader.
-            constexpr int32_t kMax32i = std::numeric_limits<int32_t>::max();
-            constexpr int32_t kMin32i = std::numeric_limits<int32_t>::min();
+            constexpr int32_t Max32i = std::numeric_limits<int32_t>::max();
+            constexpr int32_t Min32i = std::numeric_limits<int32_t>::min();
             drawBounds = simd::if_then_else(
-                drawBounds != int4{kMin32i, kMin32i, kMax32i, kMax32i},
+                drawBounds != int4{Min32i, Min32i, Max32i, Max32i},
                 drawBounds + int4{-1, -1, 1, 1},
                 drawBounds);
+            if (m_ctx->frameInterlockMode() ==
+                    gpu::InterlockMode::clockwiseAtomic &&
+                draw->isClipUpdate())
+            {
+                // ***FIXME***: until we implement scissors for clipping,
+                // clockwiseAtomic clip updates can't be reordered. Expand their
+                // pixel bounds to block reordering.
+                drawBounds = {
+                    0,
+                    0,
+                    static_cast<int32_t>(
+                        m_ctx->frameDescriptor().renderTargetWidth),
+                    static_cast<int32_t>(
+                        m_ctx->frameDescriptor().renderTargetHeight),
+                };
+            }
 
             // Our top priority in re-ordering is to group non-overlapping draws
             // together, in order to maximize batching while preserving
             // correctness.
-            int maxPasses =
-                std::max(draw->prepassCount(), draw->subpassCount());
-            int16_t drawGroupIdx =
-                intersectionBoard->addRectangle(drawBounds,
-                                                kOverlapBits,
-                                                kDisallowOverlapMask,
-                                                maxPasses);
+            const int8_t maxSubpasses = math::lossless_numeric_cast<int8_t>(
+                std::max(draw->prepassCount(), draw->subpassCount()));
+            int16_t drawGroupIdx = intersectionBoard->addRectangle(
+                drawBounds,
+                kOverlapBits,
+                kDisallowOverlapMask,
+                allSubpassesInSameDrawGroup ? 1 : maxSubpasses);
             assert(drawGroupIdx > 0);
+            maxZIndex = std::max(maxZIndex, drawGroupIdx);
             const auto textureHash =
                 (draw->imageTexture() != nullptr)
                     ? draw->imageTexture()->textureResourceHash()
                     : 0;
-            int64_t key = keyBuilder.buildKey({
+            // The parts of the key that every subpass shares.
+            const int64_t drawKeyCommon = keyBuilder.buildPartialKey({
                 {SortEntry::blendMode,
                  gpu::ConvertBlendModeToPLSBlendMode(draw->blendMode())},
-                {SortEntry::drawContents, draw->drawContents()},
-                {SortEntry::drawIndex, i},
-                {SortEntry::drawGroup, drawGroupIdx},
                 {SortEntry::drawType, draw->type()},
-                {SortEntry::subpassIndex, 0}, // This gets added later
+                {SortEntry::scissorID, scissorID},
 
                 // The hash may lose bits in the key
                 {SortEntry::textureHash, textureHash, ValidateKeyEntry::no},
             });
-
-            // Add the first prepass and subpass, if any.
-            if (draw->prepassCount() > 0)
+            for (int8_t i = 0; i < maxSubpasses; ++i)
             {
-                // Negating the key is an easy way to sort the prepasses
-                // front-to-back, and before the subpasses.
-                indirectDrawList.push_back(-key);
-            }
-            if (draw->subpassCount() > 0)
-            {
-                indirectDrawList.push_back(key);
-            }
-
-            // Add any additional passes.
-            for (int i = 1; i < maxPasses; ++i)
-            {
-                // Increment the drawGroupIdx and i both at once. (The
+                // Usually each subpass gets its own drawGroup. (The
                 // intersectionBoard already reserved "maxPasses" layers of
-                // drawGroupIndices for us.)
-                static constexpr auto INCREMENT = keyBuilder.buildPartialKey({
-                    {SortEntry::drawGroup, 1},
-                    {SortEntry::subpassIndex, 1},
-                });
-                key += INCREMENT;
-
-                assert(keyBuilder.extract<int16_t>(SortEntry::drawGroup, key) ==
-                       drawGroupIdx + i);
-                assert(keyBuilder.extract<int>(SortEntry::subpassIndex, key) ==
-                       i);
-
+                // drawGroupIndices for us.) Special case: all subpasses belong
+                // to the same drawGroup, so only the subpassIndex and
+                // drawContents can differ.
+                const int16_t subpassDrawGroup = allSubpassesInSameDrawGroup
+                                                     ? drawGroupIdx
+                                                     : drawGroupIdx + i;
+                auto subpassKey = [&](int signedSubpassIdx) {
+                    // drawContents are higher order in the key than
+                    // subpassIndex. So when subpasses share a drawGroup,
+                    // mismatched drawContents could cause subpasses to go out
+                    // of order. In this case, make them all use the same
+                    // combinedDrawContents so subpasses stay in order.
+                    const auto drawContents =
+                        allSubpassesInSameDrawGroup
+                            ? draw->combinedDrawContents()
+                            : draw->subpassDrawContents(signedSubpassIdx);
+                    return drawKeyCommon +
+                           int64_t(keyBuilder.buildPartialKey({
+                               {SortEntry::drawGroup, subpassDrawGroup},
+                               {SortEntry::subpassIndex, i},
+                               {SortEntry::drawContents, drawContents},
+                           }));
+                };
                 if (i < draw->prepassCount())
                 {
                     // Negating the key is an easy way to sort the prepasses
                     // front-to-back, and before the subpasses.
-                    indirectDrawList.push_back(-key);
+                    indirectDrawList.push_back({
+                        .sortKey = -subpassKey(-1 - i),
+                        .drawIndex = drawIndex,
+                    });
                 }
                 if (i < draw->subpassCount())
                 {
-                    indirectDrawList.push_back(key);
+                    indirectDrawList.push_back({
+                        .sortKey = subpassKey(i),
+                        .drawIndex = drawIndex,
+                    });
                 }
             }
         }
         assert(indirectDrawList.size() == m_drawPassCount);
 
-        // Re-order the draws!!
-        std::sort(indirectDrawList.begin(), indirectDrawList.end());
+        // Re-order the draws
+        // TODO: If we have any overlappable draws, then we will actually need
+        // to sort using the draw index as well (negatively to go front-to-back
+        // for pre-passes and positively for standard passes). Otherwise, the
+        // order of draws *within* a given sorted key does not matter at all.
+        std::sort(
+            indirectDrawList.begin(),
+            indirectDrawList.end(),
+            [](const auto& a, const auto& b) { return a.sortKey < b.sortKey; });
 
         assert(m_pendingBarriers == BarrierFlags::none);
         if (m_ctx->frameInterlockMode() == gpu::InterlockMode::atomics &&
@@ -1642,10 +2007,12 @@ void RenderContext::LogicalFlush::writeResources()
                                     ImageSampler::LinearClamp(),
                                     BarrierFlags::none);
         }
-        else if (m_ctx->frameInterlockMode() == gpu::InterlockMode::msaa &&
+        else if (m_ctx->frameInterlockMode() ==
+                     gpu::InterlockMode::depthStencil &&
                  m_flushDesc.colorLoadAction ==
                      gpu::LoadAction::preserveRenderTarget &&
-                 platformFeatures.msaaColorPreserveNeedsDraw)
+                 platformFeatures.msaaColorPreserveNeedsDraw &&
+                 m_flushDesc.msaaSampleCount > 1)
         {
             // When implemented with a transient attachment, MSAA needs us to
             // draw the old renderTarget contents into the framebuffer at the
@@ -1670,105 +2037,326 @@ void RenderContext::LogicalFlush::writeResources()
             m_combinedDrawContents |= m_drawList.tail()->drawContents;
             // The draw that follows the this init will need a special
             // "msaaPostInit" barrier.
-            m_pendingBarriers |= BarrierFlags::msaaPostInit;
+            pushBarriers(BarrierFlags::msaaPostInit);
             assert(m_dstBlendBarrierListTail == &m_firstDstBlendBarrier);
             assert(m_firstDstBlendBarrier == nullptr);
             m_firstDstBlendBarrier = m_drawList.tail();
             m_dstBlendBarrierListTail = &m_drawList.tail()->nextDstBlendBarrier;
         }
 
+        // Indicates required barriers between draws whose keys differ on the
+        // given mask.
+        struct BarriersForKeyDiff
+        {
+            int64_t mask;
+            BarrierFlags barrier;
+        };
+        StackVector<BarriersForKeyDiff, 3> barriersForKeyDiffs;
+
         // Find a mask that tells us when to insert barriers, and which barriers
         // are needed. When the keys of two adjacent draws differ within this
         // bitmask, we insert a barrier between them.
-        int64_t needsBarrierMask = 0;
-        BarrierFlags neededBarriers = BarrierFlags::none;
         switch (m_flushDesc.interlockMode)
         {
-            case gpu::InterlockMode::rasterOrdering:
-            case gpu::InterlockMode::clockwise:
-                // rasterOrdering and clockwise modes don't reorder draws.
-                RIVE_UNREACHABLE();
-
             case gpu::InterlockMode::atomics:
+            {
                 // In atomic mode, we need barriers any time draws overlap.
                 // Insert a barrier every time the drawGroupIdx changes.
-                needsBarrierMask = keyBuilder.mask(SortEntry::drawGroup);
-                neededBarriers = BarrierFlags::plsAtomic;
+                barriersForKeyDiffs.push_back(
+                    {keyBuilder.mask(SortEntry::drawGroup),
+                     BarrierFlags::plsAtomic | BarrierFlags::drawBatchBreak});
                 // We need a plsAtomic barrier after the initial clears, loads,
                 // etc.
-                assert(m_pendingBarriers == BarrierFlags::none);
-                m_pendingBarriers = BarrierFlags::plsAtomic;
+                pushBarriers(BarrierFlags::plsAtomic |
+                             BarrierFlags::drawBatchBreak);
+                break;
+            }
+
+            case gpu::InterlockMode::rasterOrdering:
+            case gpu::InterlockMode::clockwise:
+                // clockwise and rasterOrdering modes don't need barriers, but
+                // we still reorder in order to improve batching.
                 break;
 
             case gpu::InterlockMode::clockwiseAtomic:
+            {
                 // In clockwiseAtomic mode, we only need a barrier between the
                 // borrowedCoverage prepasses and the main rendering. Prepasses
                 // have a negative key, so just insert a barrier when the sign
                 // changes.
-                needsBarrierMask = 1ll << 63;
-                neededBarriers = BarrierFlags::clockwiseBorrowedCoverage;
-                if (indirectDrawList.empty() || indirectDrawList[0] >= 0)
+                constexpr static int64_t SIGN_BIT = (1ll << 63);
+                barriersForKeyDiffs.push_back(
+                    {SIGN_BIT,
+                     BarrierFlags::clockwiseBorrowedCoverage |
+                         BarrierFlags::drawBatchBreak});
+                // Just break batching between draw groups. If we also need a
+                // dstBlend or "clip read" (plsAtomic) barrier, that will be
+                // handled with more sophisticated logic later on.
+                barriersForKeyDiffs.push_back(
+                    {keyBuilder.mask(SortEntry::drawGroup),
+                     BarrierFlags::drawBatchBreak});
+                if (indirectDrawList.empty() ||
+                    indirectDrawList[0].sortKey >= 0)
                 {
                     // There are no borrowed coverage passes. Initiate the
                     // transition to the main subpass immediately.
-                    assert(m_pendingBarriers == BarrierFlags::none);
-                    m_pendingBarriers = BarrierFlags::clockwiseBorrowedCoverage;
+                    pushBarriers(BarrierFlags::clockwiseBorrowedCoverage);
                 }
                 break;
+            }
 
-            case gpu::InterlockMode::msaa:
-                // MSAA mode can't batch draws that overlap because they both
-                // rely on the stencil buffer across subpasses. Stop batching
-                // every time the drawGroupIdx changes.
-                needsBarrierMask = keyBuilder.mask(SortEntry::drawGroup);
-                // MSAA mode draws clips, strokes, fills, and even/odd with
-                // different stencil settings, so these can't be batched.
-                needsBarrierMask |= keyBuilder.mask(SortEntry::drawContents);
+            case gpu::InterlockMode::depthStencil:
+            {
+                // depthStencil mode can't batch draws that overlap because they
+                // both rely on the stencil buffer across subpasses. Stop
+                // batching every time the drawGroupIdx changes.
+                int64_t needsBreakMask = keyBuilder.mask(SortEntry::drawGroup);
+                // depthStencil mode draws clips, strokes, fills, and even/odd
+                // with different stencil settings, so these can't be batched.
+                needsBreakMask |= keyBuilder.mask(SortEntry::drawContents);
                 if (platformFeatures.supportsBlendAdvancedKHR)
                 {
                     // If using KHR_blend_equation_advanced, we also need to
                     // stop batching between blend modes in order to change the
                     // blend equation.
-                    needsBarrierMask |= keyBuilder.mask(SortEntry::blendMode);
+                    needsBreakMask |= keyBuilder.mask(SortEntry::blendMode);
                 }
-                // MSAA barriers only need to prevent batching of draws for now.
-                // If we also need a dstBlend barrier, that will be decided
-                // later.
-                neededBarriers = BarrierFlags::drawBatchBreak;
+                // depthStencil barriers only need to prevent batching of draws
+                // for now. If we also need a dstBlend barrier, that will be
+                // decided later.
+                barriersForKeyDiffs.push_back(
+                    {needsBreakMask, BarrierFlags::drawBatchBreak});
                 break;
+            }
         }
+
+        // zIndex occupies 15 bits of our packed depth value. (See common.glsl,
+        // packNormalizedDepth().) If we don't have 15 bits worth of Z in this
+        // flush, shift our indices so we still light up that 15th bit.
+        //
+        // The reason for this is hypothetical. Hierarchical-Z is a huge
+        // optimization for us (i.e., early depth discard, full chunks at a
+        // time), but if the GPU doesn't use full precision for that coarse
+        // discard, we will benefit from spacing our Z values as far apart as
+        // possible. In practice this has not yet measured as a win on any
+        // physical device, but it only costs a shift, so we might as well.
+        const uint32_t zIndexMSB = math::msb(maxZIndex);
+        assert(zIndexMSB <= DEPTH_Z_INDEX_BIT_COUNT);
+        const uint32_t zIndexShift = DEPTH_Z_INDEX_BIT_COUNT - zIndexMSB;
+#ifndef NDEBUG
+        constexpr uint32_t DEPTH_Z_INDEX_MASK =
+            (1u << DEPTH_Z_INDEX_BIT_COUNT) - 1u;
+        constexpr uint32_t DEPTH_Z_INDEX_TOP_BIT =
+            1u << (DEPTH_Z_INDEX_BIT_COUNT - 1);
+        // Make sure nothing lands outside the zIndex field.
+        assert(((maxZIndex << zIndexShift) & ~DEPTH_Z_INDEX_MASK) == 0);
+        // Make sure the largest zIndex lights up the top bit of the field.
+        assert(maxZIndex == 0 ||
+               ((maxZIndex << zIndexShift) & DEPTH_Z_INDEX_TOP_BIT) != 0);
+#endif
 
         // Write out the draw data from the sorted draw list, and build up a
         // condensed/batched list of low-level draws.
         constexpr int64_t BEGIN_KEY = std::numeric_limits<int64_t>::min();
         int64_t priorSignedKey = BEGIN_KEY;
-        for (const int64_t signedKey : indirectDrawList)
+        int16_t currentDrawGroup = -1;
+        DrawBatch* firstBatchInCurrentDrawGroup = nullptr;
+
+        // clockwiseAtomic (CWA) needs more sophisticated barrier logic for
+        // clips.
+        bool hasCWAClipReadBarrier = false;
+        bool currentDrawGroupHasCWAClipUpdate = false;
+
+        for (const auto& sortEntry : indirectDrawList)
         {
+            auto signedKey = sortEntry.sortKey;
             assert(signedKey >= priorSignedKey);
-            // The first draw always gets barriers because we need the barriers
-            // after the initial clears, loads, etc.
-            if (priorSignedKey != BEGIN_KEY &&
-                (priorSignedKey & needsBarrierMask) !=
-                    (signedKey & needsBarrierMask))
+            // The first draw never gets simple barriers. If barriers are
+            // required before the first draw, those get scheduled outside this
+            // loop.
+            if (priorSignedKey != BEGIN_KEY)
             {
-                m_pendingBarriers |= neededBarriers;
+                for (auto [mask, barriers] : barriersForKeyDiffs)
+                {
+                    if ((priorSignedKey & mask) != (signedKey & mask))
+                    {
+                        pushBarriers(barriers);
+                    }
+                }
             }
-            int64_t key = abs(signedKey);
-            auto drawIndex =
-                keyBuilder.extract<uint32_t>(SortEntry::drawIndex, key);
-            auto subpassIndex =
-                keyBuilder.extract<int>(SortEntry::subpassIndex, key);
-            if (signedKey < 0)
+
+            auto key = abs(signedKey);
+            auto drawIndex = sortEntry.drawIndex;
+            const int8_t keySubpassIdx =
+                keyBuilder.extract<int8_t>(SortEntry::subpassIndex, key);
+            const int16_t drawGroup =
+                keyBuilder.extract<int16_t>(SortEntry::drawGroup, key);
+            assert(drawGroup > 0);
+            // All subpasses of a draw have the same zIndex, even though they're
+            // in different drawGroups. Use the zIndex of the lowest subpass.
+            assert(keySubpassIdx >= 0);
+            const int16_t baseDrawGroup = allSubpassesInSameDrawGroup
+                                              ? drawGroup
+                                              : drawGroup - keySubpassIdx;
+            assert(baseDrawGroup > 0);
+            const uint32_t zIndex = uint32_t(baseDrawGroup) << zIndexShift;
+            assert(zIndex < (1u << DEPTH_Z_INDEX_BIT_COUNT));
+
+            // Negative keys are a prepass, which pushToRenderContext() indexes
+            // negatively.
+            const int8_t signedSubpassIdx =
+                signedKey < 0 ? -1 - keySubpassIdx : keySubpassIdx;
+
+            Draw* draw = m_draws[drawIndex].get();
+
+            assert(
+                (allSubpassesInSameDrawGroup
+                     ? draw->combinedDrawContents()
+                     : draw->subpassDrawContents(signedSubpassIdx)) ==
+                keyBuilder.extract<gpu::DrawContents>(SortEntry::drawContents,
+                                                      key));
+            assert(draw->blendMode() != BlendMode::srcOver ==
+                   draw->hasAdvancedBlend());
+
+            DrawBatch* batch =
+                draw->pushToRenderContext(this, signedSubpassIdx, zIndex);
+
+            if (batch != nullptr && platformFeatures.supportsClipScissor)
             {
-                // Negative keys are a prepass. Update the subpassIndex to be
-                // negative.
-                subpassIndex = -1 - subpassIndex;
+                batch->scissorRect = draw->scissorRect();
             }
-            // FIXME: m_currentZIndex shouldn't be a stateful variable; it
-            // should be passed to pushToRenderContext() instead.
-            m_currentZIndex = math::lossless_numeric_cast<uint32_t>(
-                keyBuilder.extract<uint32_t>(SortEntry::drawGroup, key));
-            m_draws[drawIndex]->pushToRenderContext(this, subpassIndex);
+
+            // Some barriers need more sophisticated logic than "do my keys
+            // differ".
+            if ((m_ctx->frameInterlockMode() ==
+                     gpu::InterlockMode::clockwiseAtomic ||
+                 m_ctx->frameInterlockMode() ==
+                     gpu::InterlockMode::depthStencil) &&
+                signedSubpassIdx == 0 && batch != nullptr)
+            {
+                // Barriers at this level have to go on the first batch in the
+                // current drawGroup. Otherwise we might see something get
+                // reordered like this:
+                //
+                //   - drawA, subpass0
+                //   - dstBlendBarrier (because drawB has a dstBlend)
+                //   - drawB, subpass0
+                //   - drawA, subpass1
+                //   - drawB, subpass1
+                //
+                // In this scenario, drawA gets a dstBlend barrier between
+                // subpasses. When dstBlend is implemented as a texture copy, it
+                // interrupts the render pass and resolves MSAA, causing the
+                // MSAA data to be lost between supbasses of drawA.
+                //
+                // Since drawA and drawB don't overlap, the correct solution is
+                // to only apply barriers on the first batch of a drawGroup:
+                //
+                //   - dstBlendBarrier (because drawB has a dstBlend)
+                //   - drawA, subpass0
+                //   - drawB, subpass0
+                //   - drawA, subpass1
+                //   - drawB, subpass1
+                //
+                // (This also leads to fewer barriers overall.)
+                if (currentDrawGroup != drawGroup)
+                {
+                    if (currentDrawGroupHasCWAClipUpdate)
+                    {
+                        // Now that we're moving on to a new drawGroup, reset
+                        // hasCWAClipReadBarrier if the clip got written, since
+                        // any future clip reads may overlap what was written.
+                        hasCWAClipReadBarrier = false;
+                        currentDrawGroupHasCWAClipUpdate = false;
+                    }
+                    firstBatchInCurrentDrawGroup = batch;
+                    currentDrawGroup = drawGroup;
+                }
+                assert(firstBatchInCurrentDrawGroup != nullptr);
+
+                if (draw->hasAdvancedBlend() &&
+                    (m_ctx->frameInterlockMode() !=
+                         gpu::InterlockMode::depthStencil ||
+                     !m_ctx->platformFeatures()
+                          .supportsBlendAdvancedCoherentKHR))
+                {
+                    // An implementation-dependent barrier is required between
+                    // overlapping draws. Add a "dstBlend" barrier and build up
+                    // a list of "dstReads" for the batch. The dstRead list will
+                    // be required in the event that the implementation has to
+                    // handle dstReads by copying out a texture.
+                    assert(draw->nextDstRead() == nullptr);
+                    firstBatchInCurrentDrawGroup->dstReadList =
+                        draw->addToDstReadList(
+                            firstBatchInCurrentDrawGroup->dstReadList);
+                    if (!enums::is_flag_set(
+                            firstBatchInCurrentDrawGroup->barriers,
+                            BarrierFlags::dstBlend))
+                    {
+                        firstBatchInCurrentDrawGroup->barriers |=
+                            BarrierFlags::dstBlend;
+                        addBatchToDstBarrierList(firstBatchInCurrentDrawGroup);
+                    }
+                    // We either added ourselves to the dstBlendBarrier
+                    // list or merged into a batch that was already part
+                    // of it.
+                    assert(m_dstBlendBarrierListTail ==
+                           &firstBatchInCurrentDrawGroup->nextDstBlendBarrier);
+                }
+
+                // clockwiseAtomic (CWA) needs more sophisticated barrier logic
+                // for clips.
+                if (m_ctx->frameInterlockMode() ==
+                    gpu::InterlockMode::clockwiseAtomic)
+                {
+                    if (draw->isClipUpdate())
+                    {
+                        // Once the clip gets written, it needs a barrier before
+                        // it can be read again from fragment shaders.
+                        //
+                        // NOTE: This won't immediately reset
+                        // "hasCWAClipReadBarrier" because clip reads and writes
+                        // in the same drawGroup don't overlap. Instead, we
+                        // defer resetting hasCWAClipReadBarrier until we begin
+                        // the next drawGroup.
+                        //
+                        // NOTE2: It's ok of activeClip is also set here
+                        // (i.e., nested clip updates, or "clipUpdate |
+                        // activeClip"). Those don't need a barrier. Nested
+                        // clips use hardware blend to apply the existing clip,
+                        // rather than reading it in the fragment shader.
+                        currentDrawGroupHasCWAClipUpdate = true;
+                    }
+                    else if (draw->hasActiveClip() && !hasCWAClipReadBarrier)
+                    {
+                        // Clipped path draws need a barrier because they access
+                        // the clip buffer via input attachment in the fragment
+                        // shader.
+                        firstBatchInCurrentDrawGroup->barriers |=
+                            gpu::BarrierFlags::plsAtomic;
+                        hasCWAClipReadBarrier = true;
+                    }
+                }
+                else
+                {
+                    assert(m_ctx->frameInterlockMode() ==
+                           gpu::InterlockMode::depthStencil);
+
+                    // depthStencil doesn't mix srcOver draws with advanced
+                    // blend draws.
+                    assert(enums::is_flag_set(
+                               batch->shaderFeatures,
+                               gpu::ShaderFeatures::ENABLE_ADVANCED_BLEND) ==
+                           (draw->blendMode() != BlendMode::srcOver));
+
+                    // If using KHR_blend_equation_advanced, we can't mix blend
+                    // modes in a batch.
+                    assert(
+                        !m_ctx->platformFeatures().supportsBlendAdvancedKHR ||
+                        batch->firstBlendMode == draw->blendMode());
+                }
+            }
+
             priorSignedKey = signedKey;
         }
     }
@@ -1796,16 +2384,16 @@ void RenderContext::LogicalFlush::writeResources()
 
     // Write out the draws to the feather atlas. Do this after the main draws
     // (even though the atlas ones execute first) so that our path info and Z
-    // index are decided and available to pushAtlasTessellation().
-    if (!m_pendingAtlasDraws.empty())
+    // index are decided and available to pushFeatherAtlasTessellation().
+    if (!m_pendingFeatherAtlasDraws.empty())
     {
-        TAABB<uint16_t> fullAtlasViewport = {0,
-                                             0,
-                                             m_flushDesc.atlasContentWidth,
-                                             m_flushDesc.atlasContentHeight};
+        AABBu16 fullAtlasViewport = {0,
+                                     0,
+                                     m_flushDesc.featherAtlasContentWidth,
+                                     m_flushDesc.featherAtlasContentHeight};
         gpu::AtlasDrawBatch* currentBatch =
             m_ctx->m_perFrameAllocator.makePODArray<gpu::AtlasDrawBatch>(
-                m_pendingAtlasDraws.size());
+                m_pendingFeatherAtlasDraws.size());
         // Iterate the atlas draws 4 times so we can sort by fill / stroke /
         // scissored / not, and batch together the draws that don't have
         // scissor.
@@ -1813,26 +2401,26 @@ void RenderContext::LogicalFlush::writeResources()
         {
             if (stroked)
             {
-                m_flushDesc.atlasStrokeBatches = currentBatch;
+                m_flushDesc.featherAtlasStrokeBatches = currentBatch;
             }
             else
             {
-                m_flushDesc.atlasFillBatches = currentBatch;
+                m_flushDesc.featherAtlasFillBatches = currentBatch;
             }
             for (bool scissored : {false, true})
             {
                 gpu::AtlasDrawBatch* lastBatch = nullptr;
-                for (PathDraw* draw : m_pendingAtlasDraws)
+                for (PathDraw* draw : m_pendingFeatherAtlasDraws)
                 {
                     if (draw->isStroke() != stroked ||
-                        draw->atlasScissorEnabled() != scissored)
+                        draw->featherAtlasScissorEnabled() != scissored)
                     {
                         continue;
                     }
                     uint32_t tessVertexCount, tessBaseVertex;
-                    draw->pushAtlasTessellation(this,
-                                                &tessVertexCount,
-                                                &tessBaseVertex);
+                    draw->pushFeatherAtlasTessellation(this,
+                                                       &tessVertexCount,
+                                                       &tessBaseVertex);
                     if (tessVertexCount == 0)
                     {
                         continue;
@@ -1849,9 +2437,9 @@ void RenderContext::LogicalFlush::writeResources()
                     {
                         lastBatch = currentBatch++;
                         *lastBatch = {
-                            lastBatch->scissor = scissored
-                                                     ? draw->atlasScissor()
-                                                     : fullAtlasViewport,
+                            lastBatch->scissor =
+                                scissored ? draw->featherAtlasScissor()
+                                          : fullAtlasViewport,
                             lastBatch->patchCount = patchCount,
                             lastBatch->basePatch = basePatch,
                         };
@@ -1866,21 +2454,21 @@ void RenderContext::LogicalFlush::writeResources()
             }
             if (stroked)
             {
-                m_flushDesc.atlasStrokeBatchCount =
-                    currentBatch - m_flushDesc.atlasStrokeBatches;
+                m_flushDesc.featherAtlasStrokeBatchCount =
+                    currentBatch - m_flushDesc.featherAtlasStrokeBatches;
             }
             else
             {
-                m_flushDesc.atlasFillBatchCount =
-                    currentBatch - m_flushDesc.atlasFillBatches;
+                m_flushDesc.featherAtlasFillBatchCount =
+                    currentBatch - m_flushDesc.featherAtlasFillBatches;
             }
         }
-        assert(m_flushDesc.atlasFillBatchCount +
-                   m_flushDesc.atlasStrokeBatchCount ==
-               currentBatch - m_flushDesc.atlasFillBatches);
-        assert(m_flushDesc.atlasFillBatchCount +
-                   m_flushDesc.atlasStrokeBatchCount <=
-               m_pendingAtlasDraws.size());
+        assert(m_flushDesc.featherAtlasFillBatchCount +
+                   m_flushDesc.featherAtlasStrokeBatchCount ==
+               currentBatch - m_flushDesc.featherAtlasFillBatches);
+        assert(m_flushDesc.featherAtlasFillBatchCount +
+                   m_flushDesc.featherAtlasStrokeBatchCount <=
+               m_pendingFeatherAtlasDraws.size());
     }
 
     // Pad our buffers to 256-byte alignment.
@@ -1948,10 +2536,85 @@ void RenderContext::LogicalFlush::writeResources()
 #endif
 }
 
+void RenderContext::LogicalFlush::tightenClipBounds()
+{
+    assert(m_combinedDrawBounds == IAABB::makeMaximallyNegative() &&
+           "m_combinedDrawBounds should not have been updated yet");
+
+    // Iterate through the draws in reverse - this ensures that all paths
+    // clipped by a given clip update will update read bounds first, then any
+    // nested clips will update, and all bounds state should bubble nicely to
+    // the top.
+    for (size_t i = m_draws.size() - 1; i != size_t(-1); i--)
+    {
+        const auto& draw = m_draws[i];
+
+        // Depending on whether the platform supports clip scissor or not, use
+        // the clipped bounds or the pixel bounds as the default bounds for
+        // calculating the combined bounds.
+        IAABB drawBoundsForCombinedBounds =
+            m_ctx->platformFeatures().supportsClipScissor
+                ? draw->clippedPixelBounds()
+                : draw->pixelBounds();
+
+        if (draw->clipID() == 0)
+        {
+            // Do nothing here, but we'll update the combined draw bounds after
+            // the `else`s.
+        }
+        else if (draw->isClipUpdate())
+        {
+            auto& clipInfo = getWritableClipInfo(draw->clipID());
+
+            // Ensure the clip's write bounds are as tight on both the clip
+            // shape and all reads as possible.
+            clipInfo.tightenedBounds =
+                clipInfo.tightenedBounds.intersect(clipInfo.readBounds);
+
+            if (m_ctx->platformFeatures().supportsClipScissor)
+            {
+                // Bring in the draw bounds for combining based on the
+                // newly-tightened bounds.
+                assert(drawBoundsForCombinedBounds.contains(
+                    clipInfo.tightenedBounds));
+                drawBoundsForCombinedBounds =
+                    clipInfo.tightenedBounds.lossless_numeric_cast<int32_t>();
+            }
+
+            if (draw->hasActiveClip())
+            {
+                assert(clipInfo.parentClipID != 0);
+
+                // This is a nested clip so we need to additionally add its
+                // adjusted bounds to its parent clip as its read bounds.
+                auto& parentClipInfo =
+                    getWritableClipInfo(clipInfo.parentClipID);
+                parentClipInfo.readBounds =
+                    parentClipInfo.readBounds.join(clipInfo.tightenedBounds);
+            }
+            else
+            {
+                assert(clipInfo.parentClipID == 0);
+            }
+        }
+        else if (draw->hasActiveClip())
+        {
+            // Anything else with a clip should add itself to the clip's read
+            // bounds.
+            auto& clipInfo = getWritableClipInfo(draw->clipID());
+            clipInfo.readBounds = clipInfo.readBounds.join(
+                draw->clippedPixelBounds().clamp_cast<uint16_t>());
+        }
+
+        m_combinedDrawBounds =
+            m_combinedDrawBounds.join(drawBoundsForCombinedBounds);
+    }
+}
+
 void RenderContext::setResourceSizes(ResourceAllocationCounts allocs,
                                      bool forceRealloc)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
 #if 0
     class Logger
     {
@@ -2110,17 +2773,6 @@ void RenderContext::setResourceSizes(ResourceAllocationCounts allocs,
                                          sizeof(gpu::FlushUniforms));
     }
 
-    LOG_BUFFER_RING_SIZE(imageDrawUniformBufferCount,
-                         sizeof(gpu::ImageDrawUniforms));
-    if (allocs.imageDrawUniformBufferCount !=
-            m_currentResourceAllocations.imageDrawUniformBufferCount ||
-        forceRealloc)
-    {
-        m_impl->resizeImageDrawUniformBuffer(
-            allocs.imageDrawUniformBufferCount *
-            sizeof(gpu::ImageDrawUniforms));
-    }
-
     LOG_BUFFER_RING_SIZE(pathBufferCount, sizeof(gpu::PathData));
     if (allocs.pathBufferCount !=
             m_currentResourceAllocations.pathBufferCount ||
@@ -2188,6 +2840,28 @@ void RenderContext::setResourceSizes(ResourceAllocationCounts allocs,
                                            sizeof(gpu::TriangleVertex));
     }
 
+    LOG_BUFFER_RING_SIZE(imageRectInstanceBufferCount,
+                         sizeof(gpu::ImageRectInstance));
+    if (allocs.imageRectInstanceBufferCount !=
+            m_currentResourceAllocations.imageRectInstanceBufferCount ||
+        forceRealloc)
+    {
+        m_impl->resizeImageRectInstanceBuffer(
+            allocs.imageRectInstanceBufferCount *
+            sizeof(gpu::ImageRectInstance));
+    }
+
+    LOG_BUFFER_RING_SIZE(imageMeshInstanceBufferCount,
+                         sizeof(gpu::ImageMeshInstance));
+    if (allocs.imageMeshInstanceBufferCount !=
+            m_currentResourceAllocations.imageMeshInstanceBufferCount ||
+        forceRealloc)
+    {
+        m_impl->resizeImageMeshInstanceBuffer(
+            allocs.imageMeshInstanceBufferCount *
+            sizeof(gpu::ImageMeshInstance));
+    }
+
     assert(allocs.gradTextureHeight <= kMaxTextureHeight);
     LOG_TEXTURE_SIZE(gradTextureHeight, gpu::kGradTextureWidth * 4);
     if (allocs.gradTextureHeight !=
@@ -2210,23 +2884,27 @@ void RenderContext::setResourceSizes(ResourceAllocationCounts allocs,
             math::lossless_numeric_cast<uint32_t>(allocs.tessTextureHeight));
     }
 
-    assert(allocs.atlasTextureWidth <= atlasMaxSize() ||
-           allocs.atlasTextureWidth <= frameDescriptor().renderTargetWidth);
-    assert(allocs.atlasTextureHeight <= atlasMaxSize() ||
-           allocs.atlasTextureHeight <= frameDescriptor().renderTargetHeight);
-    LOG_TEXTURE_2D_SIZE("atlasTexture",
-                        atlasTextureWidth,
-                        atlasTextureHeight,
+    assert(allocs.featherAtlasTextureWidth <= featherAtlasMaxSize() ||
+           allocs.featherAtlasTextureWidth <=
+               frameDescriptor().renderTargetWidth);
+    assert(allocs.featherAtlasTextureHeight <= featherAtlasMaxSize() ||
+           allocs.featherAtlasTextureHeight <=
+               frameDescriptor().renderTargetHeight);
+    LOG_TEXTURE_2D_SIZE("featherAtlasTexture",
+                        featherAtlasTextureWidth,
+                        featherAtlasTextureHeight,
                         sizeof(uint16_t));
-    if (allocs.atlasTextureWidth !=
-            m_currentResourceAllocations.atlasTextureWidth ||
-        allocs.atlasTextureHeight !=
-            m_currentResourceAllocations.atlasTextureHeight ||
+    if (allocs.featherAtlasTextureWidth !=
+            m_currentResourceAllocations.featherAtlasTextureWidth ||
+        allocs.featherAtlasTextureHeight !=
+            m_currentResourceAllocations.featherAtlasTextureHeight ||
         forceRealloc)
     {
-        m_impl->resizeAtlasTexture(
-            math::lossless_numeric_cast<uint32_t>(allocs.atlasTextureWidth),
-            math::lossless_numeric_cast<uint32_t>(allocs.atlasTextureHeight));
+        m_impl->resizeFeatherAtlasTexture(
+            math::lossless_numeric_cast<uint32_t>(
+                allocs.featherAtlasTextureWidth),
+            math::lossless_numeric_cast<uint32_t>(
+                allocs.featherAtlasTextureHeight));
     }
 
     assert(allocs.plsTransientBackingPlaneCount <=
@@ -2295,7 +2973,7 @@ void RenderContext::setResourceSizes(ResourceAllocationCounts allocs,
 bool RenderContext::mapResourceBuffers(
     const ResourceAllocationCounts& mapCounts)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
 
 #define HANDLE_MAP_FAILURE(...)                                                \
     do                                                                         \
@@ -2314,16 +2992,6 @@ bool RenderContext::mapResourceBuffers(
             mapCounts.flushUniformBufferCount));
     }
     assert(m_flushUniformData.hasRoomFor(mapCounts.flushUniformBufferCount));
-
-    if (mapCounts.imageDrawUniformBufferCount > 0)
-    {
-        HANDLE_MAP_FAILURE(m_imageDrawUniformData.mapElements(
-            m_impl.get(),
-            &RenderContextImpl::mapImageDrawUniformBuffer,
-            mapCounts.imageDrawUniformBufferCount));
-    }
-    assert(m_imageDrawUniformData.hasRoomFor(
-        mapCounts.imageDrawUniformBufferCount > 0));
 
     if (mapCounts.pathBufferCount > 0)
     {
@@ -2389,6 +3057,26 @@ bool RenderContext::mapResourceBuffers(
     assert(
         m_triangleVertexData.hasRoomFor(mapCounts.triangleVertexBufferCount));
 
+    if (mapCounts.imageRectInstanceBufferCount > 0)
+    {
+        HANDLE_MAP_FAILURE(m_imageRectInstanceData.mapElements(
+            m_impl.get(),
+            &RenderContextImpl::mapImageRectInstanceBuffer,
+            mapCounts.imageRectInstanceBufferCount));
+    }
+    assert(m_imageRectInstanceData.hasRoomFor(
+        mapCounts.imageRectInstanceBufferCount));
+
+    if (mapCounts.imageMeshInstanceBufferCount > 0)
+    {
+        HANDLE_MAP_FAILURE(m_imageMeshInstanceData.mapElements(
+            m_impl.get(),
+            &RenderContextImpl::mapImageMeshInstanceBuffer,
+            mapCounts.imageMeshInstanceBufferCount));
+    }
+    assert(m_imageMeshInstanceData.hasRoomFor(
+        mapCounts.imageMeshInstanceBufferCount));
+
 #undef HANDLE_MAP_FAILURE
     return true;
 }
@@ -2396,20 +3084,13 @@ bool RenderContext::mapResourceBuffers(
 void RenderContext::unmapResourceBuffers(
     const ResourceAllocationCounts& mapCounts)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     if (m_flushUniformData)
     {
         m_flushUniformData.unmapElements(
             m_impl.get(),
             &RenderContextImpl::unmapFlushUniformBuffer,
             mapCounts.flushUniformBufferCount);
-    }
-    if (m_imageDrawUniformData)
-    {
-        m_imageDrawUniformData.unmapElements(
-            m_impl.get(),
-            &RenderContextImpl::unmapImageDrawUniformBuffer,
-            mapCounts.imageDrawUniformBufferCount);
     }
     if (m_pathData)
     {
@@ -2450,17 +3131,32 @@ void RenderContext::unmapResourceBuffers(
     }
     if (m_triangleVertexData)
     {
+        m_triangleVertexData.zero_unwritten();
         m_triangleVertexData.unmapElements(
             m_impl.get(),
             &RenderContextImpl::unmapTriangleVertexBuffer,
             mapCounts.triangleVertexBufferCount);
+    }
+    if (m_imageRectInstanceData)
+    {
+        m_imageRectInstanceData.unmapElements(
+            m_impl.get(),
+            &RenderContextImpl::unmapImageRectInstanceBuffer,
+            mapCounts.imageRectInstanceBufferCount);
+    }
+    if (m_imageMeshInstanceData)
+    {
+        m_imageMeshInstanceData.unmapElements(
+            m_impl.get(),
+            &RenderContextImpl::unmapImageMeshInstanceBuffer,
+            mapCounts.imageMeshInstanceBufferCount);
     }
 }
 
 uint32_t RenderContext::incrementCoverageBufferPrefix(
     bool* needsCoverageBufferClear)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(1)
     assert(m_didBeginFrame);
     assert(frameInterlockMode() == gpu::InterlockMode::clockwiseAtomic);
     do
@@ -2472,7 +3168,7 @@ uint32_t RenderContext::incrementCoverageBufferPrefix(
             // monotonically increasing.
             *needsCoverageBufferClear = true;
         }
-        m_coverageBufferPrefix += 1 << CLOCKWISE_COVERAGE_BIT_COUNT;
+        m_coverageBufferPrefix += CLOCKWISE_COVERAGE_PREFIX_ONE_VALUE;
     } while (m_coverageBufferPrefix == 0);
 
     return m_coverageBufferPrefix;
@@ -2496,33 +3192,48 @@ uint32_t RenderContext::LogicalFlush::allocateOuterCubicTessVertices(
     return location;
 }
 
-uint32_t RenderContext::LogicalFlush::pushPath(const PathDraw* draw)
+uint32_t RenderContext::LogicalFlush::pushPath(const PathDraw* draw,
+                                               gpu::DrawContents drawContents,
+                                               uint32_t zIndex)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
     ++m_currentPathID;
     assert(0 < m_currentPathID && m_currentPathID <= m_ctx->m_maxPathID);
 
-    m_ctx->m_pathData.set_back(draw->matrix(),
+    m_ctx->m_pathData.set_back(draw->paintMatrix(),
                                draw->strokeRadius(),
                                draw->featherRadius(),
-                               m_currentZIndex,
-                               draw->atlasTransform(),
+                               zIndex,
+                               draw->featherAtlasTransform(),
                                draw->coverageBufferRange());
-    m_ctx->m_paintData.set_back(draw->drawContents(),
-                                draw->paintType(),
-                                draw->simplePaintValue(),
-                                m_gradTextureLayout,
-                                draw->clipID(),
-                                draw->hasClipRect(),
-                                draw->blendMode());
-    m_ctx->m_paintAuxData.set_back(draw->matrix(),
+    m_ctx->m_paintData.set_back(
+        drawContents,
+        draw->paintType(),
+        draw->simplePaintValue(),
+        draw->clipID(),
+        draw->hasClipRect(),
+        draw->hasImageTexture(),
+        draw->blendMode(),
+        // Solid paints are unmultiplied for advanced-blend draws, except
+        // when depthStencil uses KHR_blend_equation_advanced
+        draw->blendMode() != BlendMode::srcOver &&
+            !(m_ctx->frameInterlockMode() == gpu::InterlockMode::depthStencil &&
+              m_ctx->platformFeatures().supportsBlendAdvancedKHR),
+        draw->additiveness(),
+        draw->isLayerMask(),
+        draw->layerMaskMode());
+    m_ctx->m_paintAuxData.set_back(draw->paintMatrix(),
+                                   draw->imageMatrix(),
                                    draw->paintType(),
                                    draw->simplePaintValue(),
+                                   m_gradTextureLayout,
                                    draw->gradient(),
+                                   draw->inverseGradientTransform(),
                                    draw->imageTexture(),
                                    draw->clipRectInverseMatrix(),
+                                   draw->surfaceMaterialData(),
                                    m_flushDesc.renderTarget,
                                    m_ctx->platformFeatures());
 
@@ -2551,7 +3262,7 @@ RenderContext::TessellationWriter::TessellationWriter(
     m_pathTessLocation(forwardTessLocation),
     m_pathMirroredTessLocation(mirroredTessLocation)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     RIVE_DEBUG_CODE(m_expectedPathTessEndLocation =
                         m_pathTessLocation + forwardTessVertexCount;)
     RIVE_DEBUG_CODE(m_expectedPathMirroredTessEndLocation =
@@ -2580,7 +3291,7 @@ uint32_t RenderContext::LogicalFlush::pushContour(uint32_t pathID,
                                                   bool closed,
                                                   uint32_t vertexIndex0)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(pathID != 0);
     assert(isStroke || closed);
 
@@ -2603,7 +3314,7 @@ uint32_t RenderContext::TessellationWriter::pushContour(
     bool closed,
     uint32_t paddingVertexCount)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     // The first curve of the contour will be pre-padded with
     // 'paddingVertexCount' tessellation vertices, colocated at T=0. The caller
     // must use this argument align the end of the contour on a boundary of the
@@ -2626,7 +3337,7 @@ void RenderContext::TessellationWriter::pushCubic(
     uint32_t joinSegmentCount,
     uint32_t contourIDWithFlags)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     assert(0 <= parametricSegmentCount &&
            parametricSegmentCount <= kMaxParametricSegments);
     assert(0 <= polarSegmentCount && polarSegmentCount <= kMaxPolarSegments);
@@ -2688,6 +3399,34 @@ void RenderContext::TessellationWriter::pushCubic(
     }
 }
 
+void RenderContext::TessellationWriter::pushRetrofitCubicTriStrip(
+    const Vec2D pts[],
+    size_t numPts,
+    gpu::ContourDirections contourDirections,
+    uint32_t contourIDWithFlags)
+{
+    // gpu::TessVertexSpan has 5 points into which we can retrofit strip
+    // vertices (pts[4] and joinTangent), giving us a maximum of 3 triangles we
+    // can shoehorn into a single patch. Due to the topology of an outer cubic
+    // patch, and the structure of the tessellation shader, the strip ordering
+    // has to be:
+    //
+    //   p0, p1, p3, p2, joinTangent
+    //
+    assert(3 <= numPts && numPts <= 5);
+    Vec2D cubicTriangleStrip[4] = {pts[0],
+                                   pts[1],
+                                   pts[std::min<size_t>(3, numPts - 1)],
+                                   pts[2]};
+    pushCubic(cubicTriangleStrip,
+              contourDirections,
+              pts[std::min<size_t>(4, numPts - 1)],
+              gpu::OuterCubicPatchSegmentSpan,
+              1,
+              1,
+              contourIDWithFlags | RETROFIT_TRI_STRIP_CONTOUR_FLAG);
+}
+
 RIVE_ALWAYS_INLINE void RenderContext::TessellationWriter::
     pushTessellationSpans(const Vec2D pts[4],
                           Vec2D joinTangent,
@@ -2697,7 +3436,7 @@ RIVE_ALWAYS_INLINE void RenderContext::TessellationWriter::
                           uint32_t joinSegmentCount,
                           uint32_t contourIDWithFlags)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     assert(totalVertexCount > 0);
 
     uint32_t y = m_pathTessLocation / kTessTextureWidth;
@@ -2836,7 +3575,7 @@ RIVE_ALWAYS_INLINE void RenderContext::TessellationWriter::
 void RenderContext::LogicalFlush::pushPaddingVertices(uint32_t count,
                                                       uint32_t tessLocation)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     assert(m_hasDoneLayout);
     assert(count > 0);
 
@@ -2855,14 +3594,15 @@ void RenderContext::LogicalFlush::pushPaddingVertices(uint32_t count,
                                INVALID_CONTOUR_ID_WITH_FLAGS);
 }
 
-void RenderContext::LogicalFlush::pushMidpointFanDraw(
+gpu::DrawBatch& RenderContext::LogicalFlush::pushMidpointFanDraw(
     const PathDraw* draw,
     gpu::DrawType drawType,
+    gpu::DrawContents drawContents,
     uint32_t tessVertexCount,
     uint32_t tessLocation,
     gpu::ShaderMiscFlags shaderMiscFlags)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
     uint32_t baseInstance = math::lossless_numeric_cast<uint32_t>(
@@ -2874,63 +3614,87 @@ void RenderContext::LogicalFlush::pushMidpointFanDraw(
     // flush() is responsible for alignment.
     assert(instanceCount * kMidpointFanPatchSegmentSpan == tessVertexCount);
 
-    pushPathDraw(draw, drawType, shaderMiscFlags, instanceCount, baseInstance);
+    return pushPathDraw(draw,
+                        drawType,
+                        drawContents,
+                        shaderMiscFlags,
+                        instanceCount,
+                        baseInstance);
 }
 
-void RenderContext::LogicalFlush::pushOuterCubicsDraw(
+gpu::DrawBatch& RenderContext::LogicalFlush::pushOuterCubicsDraw(
     const PathDraw* draw,
     gpu::DrawType drawType,
+    gpu::DrawContents drawContents,
     uint32_t tessVertexCount,
     uint32_t tessLocation,
     gpu::ShaderMiscFlags shaderMiscFlags)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
     uint32_t baseInstance = math::lossless_numeric_cast<uint32_t>(
-        tessLocation / kOuterCurvePatchSegmentSpan);
+        tessLocation / OuterCubicPatchSegmentSpanPlusBowtie);
     // flush() is responsible for alignment.
-    assert(baseInstance * kOuterCurvePatchSegmentSpan == tessLocation);
+    assert(baseInstance * OuterCubicPatchSegmentSpanPlusBowtie == tessLocation);
 
-    uint32_t instanceCount = tessVertexCount / kOuterCurvePatchSegmentSpan;
+    uint32_t instanceCount =
+        tessVertexCount / OuterCubicPatchSegmentSpanPlusBowtie;
     // flush() is responsible for alignment.
-    assert(instanceCount * kOuterCurvePatchSegmentSpan == tessVertexCount);
+    assert(instanceCount * OuterCubicPatchSegmentSpanPlusBowtie ==
+           tessVertexCount);
 
-    pushPathDraw(draw, drawType, shaderMiscFlags, instanceCount, baseInstance);
+    return pushPathDraw(draw,
+                        drawType,
+                        drawContents,
+                        shaderMiscFlags,
+                        instanceCount,
+                        baseInstance);
 }
 
-size_t RenderContext::LogicalFlush::pushInteriorTriangulationDraw(
+gpu::DrawBatch* RenderContext::LogicalFlush::pushInteriorTriangulationDraw(
     const PathDraw* draw,
+    gpu::DrawContents drawContents,
     uint32_t pathID,
     gpu::WindingFaces windingFaces,
-    gpu::ShaderMiscFlags shaderMiscFlags)
+    gpu::ShaderMiscFlags shaderMiscFlags RIVE_DEBUG_CODE(,
+                                                         size_t* vertexCounter))
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
     assert(pathID != 0);
 
     uint32_t baseVertex = math::lossless_numeric_cast<uint32_t>(
         m_ctx->m_triangleVertexData.elementsWritten());
-    size_t actualVertexCount =
-        draw->triangulator()->polysToTriangles(pathID,
-                                               windingFaces,
-                                               &m_ctx->m_triangleVertexData);
+    size_t actualVertexCount = draw->triangulator()->polysToTriangles(
+        pathID,
+        draw->pathFillRule(),
+        draw->triangulatorReverseTriangles(),
+        draw->triangulatorNegateWinding(),
+        windingFaces,
+        &m_ctx->m_triangleVertexData);
     assert(baseVertex + actualVertexCount ==
            m_ctx->m_triangleVertexData.elementsWritten());
+    RIVE_DEBUG_CODE(*vertexCounter += actualVertexCount;)
     if (actualVertexCount > 0)
     {
-        pushPathDraw(draw,
-                     DrawType::interiorTriangulation,
-                     shaderMiscFlags,
-                     math::lossless_numeric_cast<uint32_t>(actualVertexCount),
-                     baseVertex);
+        return &pushPathDraw(
+            draw,
+            DrawType::interiorTriangulation,
+            drawContents,
+            shaderMiscFlags,
+            math::lossless_numeric_cast<uint32_t>(actualVertexCount),
+            baseVertex);
     }
-    return actualVertexCount;
+    return nullptr;
 }
 
-void RenderContext::LogicalFlush::pushAtlasBlit(PathDraw* draw, uint32_t pathID)
+gpu::DrawBatch& RenderContext::LogicalFlush::pushFeatherAtlasBlit(
+    PathDraw* draw,
+    gpu::DrawContents drawContents,
+    uint32_t pathID)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     auto baseVertex = math::lossless_numeric_cast<uint32_t>(
         m_ctx->m_triangleVertexData.elementsWritten());
     auto [l, t, r, b] = AABB(draw->pixelBounds());
@@ -2940,101 +3704,201 @@ void RenderContext::LogicalFlush::pushAtlasBlit(PathDraw* draw, uint32_t pathID)
     m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, b}, 1, pathID);
     m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, t}, 1, pathID);
     m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, t}, 1, pathID);
-    pushPathDraw(draw,
-                 DrawType::atlasBlit,
-                 m_baselineShaderMiscFlags,
-                 6,
-                 baseVertex);
+    return pushPathDraw(draw,
+                        DrawType::featherAtlasBlit,
+                        drawContents,
+                        m_baselineShaderMiscFlags,
+                        6,
+                        baseVertex);
 }
 
-void RenderContext::LogicalFlush::pushImageRectDraw(ImageRectDraw* draw)
+gpu::DrawBatch& RenderContext::LogicalFlush::pushImageRectDraw(
+    ImageRectDraw* draw,
+    gpu::DrawContents drawContents,
+    uint32_t zIndex)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
     // If we support image paints for paths, the client should use pushPath()
     // with an image paint instead of calling this method.
     assert(!m_ctx->frameSupportsImagePaintForPaths());
 
-    size_t imageDrawDataOffset = m_ctx->m_imageDrawUniformData.bytesWritten();
-    m_ctx->m_imageDrawUniformData.emplace_back(draw->matrix(),
-                                               draw->opacity(),
-                                               draw->clipRectInverseMatrix(),
-                                               draw->clipID(),
-                                               draw->blendMode(),
-                                               m_currentZIndex);
+    const uint32_t imageRectBaseInstance =
+        math::lossless_numeric_cast<uint32_t>(
+            m_ctx->m_imageRectInstanceData.elementsWritten());
+
+    uint32_t gradientType = 0;
+    Mat2D gradientMatrix;
+    int32_t gradientX = 0;
+    uint32_t gradientY = 0;
+    if (draw->gradient() != nullptr)
+    {
+        // a gradientType of 0 is used to signify "no gradient" so these had
+        // better not be 0
+        static_assert(int(PaintType::linearGradient) != 0);
+        static_assert(int(PaintType::radialGradient) != 0);
+        gradientType = uint32_t(draw->gradient()->paintType());
+        getGradientMatrixAndCoord(draw->gradient(),
+                                  draw->rampLocation(),
+                                  m_gradTextureLayout,
+                                  draw->inverseGradientTransform(),
+                                  draw->gradientMatrix(),
+                                  m_flushDesc.renderTarget,
+                                  m_ctx->platformFeatures(),
+                                  gradientMatrix,
+                                  gradientX,
+                                  gradientY);
+    }
+
+    m_ctx->m_imageRectInstanceData.emplace_back(draw->paintMatrix(),
+                                                draw->modulatedColor(),
+                                                draw->clipRectInverseMatrix(),
+                                                draw->clipID(),
+                                                draw->blendMode(),
+                                                zIndex,
+                                                draw->imageMatrix(),
+                                                gradientMatrix,
+                                                gradientType,
+                                                gradientX,
+                                                gradientY,
+                                                draw->additiveness());
 
     DrawBatch& batch = pushDraw(draw,
                                 DrawType::imageRect,
+                                drawContents,
                                 m_baselineShaderMiscFlags,
-                                PaintType::image,
+                                PaintType::solidColor,
                                 1,
-                                0);
-    batch.imageDrawDataOffset =
-        math::lossless_numeric_cast<uint32_t>(imageDrawDataOffset);
+                                imageRectBaseInstance);
+    return batch;
 }
 
-void RenderContext::LogicalFlush::pushImageMeshDraw(ImageMeshDraw* draw)
+gpu::DrawBatch& RenderContext::LogicalFlush::pushImageMeshDraw(
+    ImageMeshDraw* draw,
+    gpu::DrawContents drawContents,
+    uint32_t zIndex)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
-    size_t imageDrawDataOffset = m_ctx->m_imageDrawUniformData.bytesWritten();
-    m_ctx->m_imageDrawUniformData.emplace_back(draw->matrix(),
-                                               draw->opacity(),
-                                               draw->clipRectInverseMatrix(),
-                                               draw->clipID(),
-                                               draw->blendMode(),
-                                               m_currentZIndex);
+    const uint32_t imageMeshBaseInstance =
+        math::lossless_numeric_cast<uint32_t>(
+            m_ctx->m_imageMeshInstanceData.elementsWritten());
+    m_ctx->m_imageMeshInstanceData.emplace_back(draw->imageMatrix(),
+                                                draw->modulatedColor(),
+                                                draw->clipRectInverseMatrix(),
+                                                draw->clipID(),
+                                                draw->blendMode(),
+                                                zIndex,
+                                                draw->additiveness(),
+                                                draw->uvTranslate(),
+                                                draw->uvScale());
 
     DrawBatch& batch = pushDraw(draw,
                                 DrawType::imageMesh,
+                                drawContents,
                                 m_baselineShaderMiscFlags,
-                                PaintType::image,
-                                draw->indexCount(),
-                                0);
+                                PaintType::solidColor,
+                                1, // one instance (the mesh)
+                                imageMeshBaseInstance);
+    batch.indexCountPerInstance = draw->indexCount();
     batch.vertexBuffer = draw->vertexBuffer();
     batch.uvBuffer = draw->uvBuffer();
     batch.indexBuffer = draw->indexBuffer();
-    batch.imageDrawDataOffset =
-        math::lossless_numeric_cast<uint32_t>(imageDrawDataOffset);
+    return batch;
 }
 
-void RenderContext::LogicalFlush::pushStencilClipResetDraw(
-    StencilClipReset* draw)
+gpu::DrawBatch& RenderContext::LogicalFlush::pushImageMeshInstancedDraw(
+    ImageMeshInstancedDraw* draw,
+    gpu::DrawContents drawContents,
+    uint32_t zIndex)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(2)
+    assert(m_hasDoneLayout);
+
+    assert(!draw->instancesHaveBeenEditedSinceCreation());
+
+    Span<const ImageMeshInstanceData> instances =
+        draw->instances().instanceData();
+    assert(!instances.empty());
+
+    const uint32_t imageMeshBaseInstance =
+        math::lossless_numeric_cast<uint32_t>(
+            m_ctx->m_imageMeshInstanceData.elementsWritten());
+
+    const Mat2D& ctm = draw->imageMatrix();
+    const ColorInt modulatedColor = draw->modulatedColor();
+    const float modulatedOpacity = draw->modulatedOpacity();
+    for (const ImageMeshInstanceData& instance : instances)
+    {
+        m_ctx->m_imageMeshInstanceData.emplace_back(
+            ctm * instance.transform,
+            colorModulate(0xFFFFFFFF,
+                          modulatedColor,
+                          instance.opacity * modulatedOpacity),
+            draw->clipRectInverseMatrix(),
+            draw->clipID(),
+            BlendMode::srcOver,
+            zIndex,
+            math::clamp(instance.additiveness, 0.0f, 1.0f),
+            instance.uvTranslate,
+            instance.uvScale);
+    }
+
+    DrawBatch& batch =
+        pushDraw(draw,
+                 DrawType::imageMesh,
+                 drawContents,
+                 m_baselineShaderMiscFlags,
+                 PaintType::solidColor,
+                 math::lossless_numeric_cast<uint32_t>(instances.size()),
+                 imageMeshBaseInstance);
+    batch.indexCountPerInstance = draw->indexCount();
+    batch.vertexBuffer = draw->vertexBuffer();
+    batch.uvBuffer = draw->uvBuffer();
+    batch.indexBuffer = draw->indexBuffer();
+    return batch;
+}
+
+gpu::DrawBatch& RenderContext::LogicalFlush::pushClipResetDraw(
+    ClipReset* draw,
+    gpu::DrawContents drawContents,
+    uint32_t zIndex)
+{
+    RIVE_PROF_SCOPE_L(2)
     assert(m_hasDoneLayout);
 
     uint32_t baseVertex = math::lossless_numeric_cast<uint32_t>(
         m_ctx->m_triangleVertexData.elementsWritten());
     auto [l, t, r, b] = AABB(getClipInfo(draw->previousClipID()).contentBounds);
-    uint32_t z = m_currentZIndex;
     assert(AABB(l, t, r, b).round() == draw->pixelBounds());
     assert(draw->resourceCounts().maxTriangleVertexCount == 6);
     assert(m_ctx->m_triangleVertexData.hasRoomFor(6));
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, b}, 0, z);
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, t}, 0, z);
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, b}, 0, z);
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, b}, 0, z);
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, t}, 0, z);
-    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, t}, 0, z);
-    pushDraw(draw,
-             DrawType::msaaStencilClipReset,
-             m_baselineShaderMiscFlags,
-             PaintType::clipUpdate,
-             6,
-             baseVertex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, b}, 0, zIndex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, t}, 0, zIndex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, b}, 0, zIndex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, b}, 0, zIndex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{l, t}, 0, zIndex);
+    m_ctx->m_triangleVertexData.emplace_back(Vec2D{r, t}, 0, zIndex);
+    return pushDraw(draw,
+                    DrawType::clipReset,
+                    drawContents,
+                    gpu::ShaderMiscFlags::none,
+                    PaintType::clipUpdate,
+                    6,
+                    baseVertex);
 }
 
 gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
     const PathDraw* draw,
     DrawType drawType,
+    gpu::DrawContents drawContents,
     gpu::ShaderMiscFlags shaderMiscFlags,
     uint32_t vertexCount,
     uint32_t baseVertex)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     assert(m_hasDoneLayout);
 
     // Clockwise fills get their own shaders in rasterOrdering mode.
@@ -3042,41 +3906,43 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
     // draws in rasterOrdering mode, instead of just making a variant of
     // draw_raster_order_path.frag.
     if (m_ctx->frameInterlockMode() == gpu::InterlockMode::rasterOrdering &&
-        (draw->drawContents() & gpu::DrawContents::clockwiseFill))
+        enums::is_flag_set(drawContents, gpu::DrawContents::clockwiseFill))
     {
         shaderMiscFlags |= gpu::ShaderMiscFlags::clockwiseFill;
     }
 
-    // Clockwise mode gives clip updates a dedicated draw by setting
-    // gpu::ShaderMiscFlags::clipUpdateOnly.
-    if (m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwise &&
-        (draw->drawContents() & gpu::DrawContents::clipUpdate))
-    {
-        shaderMiscFlags |= gpu::ShaderMiscFlags::clipUpdateOnly;
-    }
-
     DrawBatch& batch = pushDraw(draw,
                                 drawType,
+                                drawContents,
                                 shaderMiscFlags,
                                 draw->paintType(),
                                 vertexCount,
                                 baseVertex);
+#ifdef RIVE_WEBGL
+    if (draw->hasSurfaceMaterial())
+    {
+        // Materials share the existing HSL helper permutation but do not need
+        // destination reads or advanced-blend render passes.
+        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    }
+#endif
 
     auto pathShaderFeatures = gpu::ShaderFeatures::NONE;
     if (draw->featherRadius() != 0 &&
         drawType != gpu::DrawType::interiorTriangulation &&
-        drawType != gpu::DrawType::atlasBlit)
+        drawType != gpu::DrawType::featherAtlasBlit)
     {
         pathShaderFeatures |= ShaderFeatures::ENABLE_FEATHER;
     }
-    if (draw->drawContents() & gpu::DrawContents::evenOddFill)
+    if (enums::is_flag_set(drawContents, gpu::DrawContents::evenOddFill))
     {
-        assert(!(batch.shaderMiscFlags & gpu::ShaderMiscFlags::clockwiseFill));
+        assert(!enums::is_flag_set(batch.shaderMiscFlags,
+                                   gpu::ShaderMiscFlags::clockwiseFill));
         pathShaderFeatures |= ShaderFeatures::ENABLE_EVEN_ODD;
     }
     constexpr static gpu::DrawContents NESTED_CLIP_FLAGS =
         gpu::DrawContents::clipUpdate | gpu::DrawContents::activeClip;
-    if ((draw->drawContents() & NESTED_CLIP_FLAGS) == NESTED_CLIP_FLAGS)
+    if (enums::all_flags_set(drawContents, NESTED_CLIP_FLAGS))
     {
         pathShaderFeatures |= ShaderFeatures::ENABLE_NESTED_CLIPPING;
     }
@@ -3092,7 +3958,7 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
 
 RIVE_ALWAYS_INLINE static bool can_combine_shader_misc_flags(
     const gpu::DrawBatch* batch,
-    const Draw* draw,
+    gpu::DrawContents drawContents,
     gpu::ShaderMiscFlags shaderMiscFlags)
 {
     // If a path doesn't have ANY_PATH_FILL bits, it means it's a stroke.
@@ -3104,14 +3970,14 @@ RIVE_ALWAYS_INLINE static bool can_combine_shader_misc_flags(
 
     // Strokes draw identically in the clockwise and legacy shaders, so strokes
     // can be combined with paths of any fill type.
-    if ((!(batch->drawContents & ANY_PATH_FILL) ||
-         !(draw->drawContents() & ANY_PATH_FILL)))
+    if ((enums::no_flags_set(batch->drawContents, ANY_PATH_FILL) ||
+         enums::no_flags_set(drawContents, ANY_PATH_FILL)))
     {
         compareMask &= ~gpu::ShaderMiscFlags::clockwiseFill;
     }
 
-    return (batch->shaderMiscFlags & compareMask).bits() ==
-           (shaderMiscFlags & compareMask).bits();
+    return (batch->shaderMiscFlags & compareMask) ==
+           (shaderMiscFlags & compareMask);
 }
 
 RIVE_ALWAYS_INLINE static bool can_combine_draw_images(
@@ -3132,19 +3998,259 @@ RIVE_ALWAYS_INLINE static bool can_combine_draw_images(
            (currentImageSamplerKey == nextImageSamplerKey);
 }
 
+constexpr uint32_t patchIndexCount(DrawType drawType)
+{
+    switch (drawType)
+    {
+        case DrawType::midpointFanPatches:
+            return kMidpointFanPatchIndexCount;
+        case DrawType::midpointFanCenterAAPatches:
+            return kMidpointFanCenterAAPatchIndexCount;
+        case DrawType::outerCurvePatches:
+            return kOuterCurvePatchIndexCount;
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+            return DSMidpointFanFillPatchIndexCount;
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+            return DSOuterCubicFillPatchIndexCount;
+        case DrawType::interiorTriangulation:
+        case DrawType::featherAtlasBlit:
+        case DrawType::imageRect:
+        case DrawType::imageMesh:
+        case DrawType::clipReset:
+        case DrawType::renderPassInitialize:
+        case DrawType::renderPassResolve:
+            RIVE_UNREACHABLE();
+        case DrawType::depthStrokes:
+        case DrawType::depthAAOuterHairline:
+            return DSStrokePatchIndexCount;
+        case DrawType::depthAAStrokes:
+            return DSAAStrokePatchIndexCount;
+    }
+    RIVE_UNREACHABLE();
+}
+
+constexpr uint32_t patchBaseIndex(DrawType drawType)
+{
+    switch (drawType)
+    {
+        case DrawType::midpointFanPatches:
+            return kMidpointFanPatchBaseIndex;
+        case DrawType::midpointFanCenterAAPatches:
+            return kMidpointFanCenterAAPatchBaseIndex;
+        case DrawType::outerCurvePatches:
+            return kOuterCurvePatchBaseIndex;
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+            return DSMidpointFanFillBaseIndex;
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+            return DSOuterCubicFillBaseIndex;
+        case DrawType::interiorTriangulation:
+        case DrawType::featherAtlasBlit:
+        case DrawType::imageRect:
+        case DrawType::imageMesh:
+        case DrawType::clipReset:
+        case DrawType::renderPassInitialize:
+        case DrawType::renderPassResolve:
+            RIVE_UNREACHABLE();
+        case DrawType::depthStrokes:
+        case DrawType::depthAAOuterHairline:
+            return DSStrokePatchBaseIndex;
+        case DrawType::depthAAStrokes:
+            return DSAAStrokePatchBaseIndex;
+    }
+    RIVE_UNREACHABLE();
+}
+
+constexpr bool drawTypeIsDepthStencilIndexPattern(DrawType drawType)
+{
+    switch (drawType)
+    {
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+        case DrawType::depthStrokes:
+        case DrawType::depthAAStrokes:
+        case DrawType::depthAAOuterHairline:
+            return true;
+        case DrawType::midpointFanPatches:
+        case DrawType::midpointFanCenterAAPatches:
+        case DrawType::outerCurvePatches:
+        case DrawType::interiorTriangulation:
+        case DrawType::featherAtlasBlit:
+        case DrawType::imageRect:
+        case DrawType::imageMesh:
+        case DrawType::clipReset:
+        case DrawType::renderPassInitialize:
+        case DrawType::renderPassResolve:
+            return false;
+    }
+    RIVE_UNREACHABLE();
+}
+
+// Rive-specific vertex flags that a DrawType should OR into gl_VertexID.
+constexpr int32_t dsPatchVertexFlags(DrawType drawType)
+{
+    switch (drawType)
+    {
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::depthStrokes:
+        case DrawType::depthAAOuterHairline:
+            return 0;
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+            return VERTEX_FLAG_OUTER_CUBIC_FILL;
+        case DrawType::depthAAStrokes:
+            return VERTEX_FLAG_AA_POLAR_STROKE;
+        default:
+            RIVE_UNREACHABLE();
+    }
+}
+
+static void assignDrawIndices(DrawType drawType, gpu::DrawBatch* batch)
+{
+    switch (drawType)
+    {
+        case DrawType::midpointFanPatches:
+        case DrawType::midpointFanCenterAAPatches:
+        case DrawType::outerCurvePatches:
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+        case DrawType::depthStrokes:
+        case DrawType::depthAAStrokes:
+        case DrawType::depthAAOuterHairline:
+            batch->indexCountPerInstance = patchIndexCount(drawType);
+            batch->baseIndex = patchBaseIndex(drawType);
+            break;
+        case DrawType::imageRect:
+            batch->indexCountPerInstance = std::size(kImageRectIndices);
+            batch->baseIndex = 0;
+            break;
+        case DrawType::imageMesh:
+        case DrawType::interiorTriangulation:
+        case DrawType::featherAtlasBlit:
+        case DrawType::clipReset:
+        case DrawType::renderPassInitialize:
+        case DrawType::renderPassResolve:
+            batch->indexCountPerInstance = 0;
+            batch->baseIndex = 0;
+            break;
+    }
+}
+
 gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
     const Draw* draw,
     DrawType drawType,
+    gpu::DrawContents drawContents,
     gpu::ShaderMiscFlags shaderMiscFlags,
     gpu::PaintType paintType,
     uint32_t elementCount,
     uint32_t baseElement)
 {
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(3)
     assert(m_hasDoneLayout);
     assert(elementCount > 0);
 
     shaderMiscFlags |= m_baselineShaderMiscFlags;
+
+    if ((m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwise ||
+         (m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwiseAtomic &&
+          !enums::is_flag_set(shaderMiscFlags,
+                              gpu::ShaderMiscFlags::borrowedCoveragePass))) &&
+        enums::is_flag_set(drawContents, gpu::DrawContents::clipUpdate))
+    {
+        // Clockwise modes give clip updates a dedicated draw by setting
+        // gpu::ShaderMiscFlags::clipUpdateOnly.
+        shaderMiscFlags |= gpu::ShaderMiscFlags::clipUpdateOnly;
+        if (m_ctx->frameInterlockMode() ==
+                gpu::InterlockMode::clockwiseAtomic &&
+            enums::is_flag_set(drawContents, gpu::DrawContents::activeClip))
+        {
+            // clockwiseAtomic takes it a step futher and separates out nested
+            // clip updates into their own draw type.
+            shaderMiscFlags |= gpu::ShaderMiscFlags::nestedClipUpdateOnly;
+        }
+    }
+
+    // In clockwiseAtomic and depthStencil modes, individual draws can use
+    // fixedFunctionColorOutput even if the render pass as a whole does not.
+    if (m_ctx->frameInterlockMode() == gpu::InterlockMode::clockwiseAtomic)
+    {
+        if (enums::is_flag_set(shaderMiscFlags,
+                               gpu::ShaderMiscFlags::borrowedCoveragePass) ||
+            draw->blendMode() == BlendMode::srcOver)
+        {
+            shaderMiscFlags |= gpu::ShaderMiscFlags::fixedFunctionColorOutput;
+        }
+    }
+    else if (m_ctx->frameInterlockMode() == gpu::InterlockMode::depthStencil &&
+             draw->blendMode() == BlendMode::srcOver)
+    {
+        shaderMiscFlags |= gpu::ShaderMiscFlags::fixedFunctionColorOutput;
+    }
+
+    // DrawBatch::baseElement on a depthStencil draw means baseVertex.
+    uint32_t elementStrideLog2 = 0;
+    if (drawTypeIsDepthStencilIndexPattern(drawType))
+    {
+        elementStrideLog2 = dsPatchStrideLog2(drawType);
+        baseElement =
+            (baseElement << elementStrideLog2) | dsPatchVertexFlags(drawType);
+        if (!gpu::get_color_write_enable(drawType,
+                                         m_ctx->frameInterlockMode(),
+                                         shaderMiscFlags,
+                                         m_flushDesc.fixedFunctionColorOutput,
+                                         drawContents))
+        {
+            baseElement |= VERTEX_FLAG_DISABLE_COLOR_WRITE;
+        }
+    }
 
     bool canMergeWithPreviousBatch;
     switch (drawType)
@@ -3153,38 +4259,58 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
         case DrawType::midpointFanCenterAAPatches:
         case DrawType::outerCurvePatches:
         case DrawType::interiorTriangulation:
-        case DrawType::atlasBlit:
-        case DrawType::msaaStrokes:
-        case DrawType::msaaMidpointFanBorrowedCoverage:
-        case DrawType::msaaMidpointFans:
-        case DrawType::msaaMidpointFanStencilReset:
-        case DrawType::msaaMidpointFanPathsStencil:
-        case DrawType::msaaMidpointFanPathsCover:
-        case DrawType::msaaOuterCubics:
-        case DrawType::msaaStencilClipReset:
-            if (!m_drawList.empty() && m_pendingBarriers == BarrierFlags::none)
+        case DrawType::featherAtlasBlit:
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilOuterCubics:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+        case DrawType::clipReset:
+        case DrawType::depthStrokes:
+        case DrawType::depthAAStrokes:
+        case DrawType::depthAAOuterHairline:
+            if (!m_drawList.empty() &&
+                !enums::is_flag_set(m_pendingBarriers,
+                                    gpu::BarrierFlags::drawBatchBreak))
             {
                 const DrawBatch* currentBatch = m_drawList.tail();
                 canMergeWithPreviousBatch =
                     currentBatch->drawType == drawType &&
                     can_combine_shader_misc_flags(currentBatch,
-                                                  draw,
+                                                  drawContents,
                                                   shaderMiscFlags) &&
                     can_combine_draw_images(currentBatch->imageTexture,
                                             draw->imageTexture(),
                                             currentBatch->imageSampler,
                                             draw->imageSampler());
                 if (canMergeWithPreviousBatch &&
-                    currentBatch->baseElement + currentBatch->elementCount !=
+                    currentBatch->baseElement +
+                            (currentBatch->elementCount << elementStrideLog2) !=
                         baseElement)
                 {
-                    // In MSAA mode, multiple subpasses reference the same
-                    // tessellation data. Although rare, this breaks the
+                    // In depthStencil mode, multiple subpasses reference the
+                    // same tessellation data. Although rare, this breaks the
                     // guarantee we have in other modes that mergeable batches
                     // will always have contiguous patches.
                     assert(m_ctx->frameInterlockMode() ==
-                           gpu::InterlockMode::msaa);
+                           gpu::InterlockMode::depthStencil);
                     canMergeWithPreviousBatch = false;
+                }
+
+                // Also break if there is a scissor rect mismatch
+                if (m_ctx->platformFeatures().supportsClipScissor)
+                {
+                    if (currentBatch->scissorRect != draw->scissorRect())
+                    {
+                        canMergeWithPreviousBatch = false;
+                    }
                 }
                 break;
             }
@@ -3203,45 +4329,47 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
     DrawBatch* batch;
     if (!canMergeWithPreviousBatch)
     {
-        batch = m_drawList.emplace_back(
-            m_ctx->perFrameAllocator(),
-            drawType,
-            shaderMiscFlags,
-            draw->drawContents(),
-            elementCount,
-            baseElement,
-            draw->blendMode(),
-            draw->imageSampler(),
-            std::exchange(m_pendingBarriers, BarrierFlags::none));
+        batch = m_drawList.emplace_back(m_ctx->perFrameAllocator(),
+                                        drawType,
+                                        shaderMiscFlags,
+                                        drawContents,
+                                        elementCount,
+                                        baseElement,
+                                        draw->blendMode(),
+                                        draw->imageSampler(),
+                                        m_pendingBarriers);
+        assignDrawIndices(drawType, batch);
     }
     else
     {
         batch = m_drawList.tail();
-        assert(m_pendingBarriers == BarrierFlags::none);
         assert(batch->drawType == drawType);
-        assert(batch->baseElement + batch->elementCount == baseElement);
+        assert(batch->baseElement +
+                   (batch->elementCount << elementStrideLog2) ==
+               baseElement);
 
         batch->elementCount += elementCount;
 
         // clockwise doesn't mix regular draws and clip updates.
-        assert(
-            m_ctx->frameInterlockMode() != gpu::InterlockMode::clockwise ||
-            (batch->drawContents & gpu::DrawContents::clipUpdate).bits() ==
-                (draw->drawContents() & gpu::DrawContents::clipUpdate).bits());
+        assert(m_ctx->frameInterlockMode() != gpu::InterlockMode::clockwise ||
+               (batch->drawContents & gpu::DrawContents::clipUpdate) ==
+                   (drawContents & gpu::DrawContents::clipUpdate));
 
         // Feathered fills should never combine with fills, strokes, or
         // feathered strokes because they use a different DrawType.
-        assert(
-            (batch->drawContents & gpu::DrawContents::featheredFill).bits() ==
-            (draw->drawContents() & gpu::DrawContents::featheredFill).bits());
+        assert((batch->drawContents & gpu::DrawContents::featheredFill) ==
+               (drawContents & gpu::DrawContents::featheredFill));
 
-        // msaa can't mix drawContents in a batch.
-        assert(m_ctx->frameInterlockMode() != gpu::InterlockMode::msaa ||
-               batch->drawContents == draw->drawContents());
+        // depthStencil can't mix drawContents in a batch.
+        assert(m_ctx->frameInterlockMode() !=
+                   gpu::InterlockMode::depthStencil ||
+               batch->drawContents == drawContents);
 
         batch->shaderMiscFlags |= shaderMiscFlags;
-        batch->drawContents |= draw->drawContents();
+        batch->drawContents |= drawContents;
+        batch->barriers |= m_pendingBarriers;
     }
+    m_pendingBarriers = gpu::BarrierFlags::none;
 
     // If the batch was merged into a previous one, this ensures it was a valid
     // merge.
@@ -3269,9 +4397,11 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
     }
 
     if (paintType != PaintType::clipUpdate &&
-        !(shaderMiscFlags & gpu::ShaderMiscFlags::borrowedCoveragePass))
+        !enums::is_flag_set(shaderMiscFlags,
+                            gpu::ShaderMiscFlags::borrowedCoveragePass))
     {
-        assert(!(shaderMiscFlags & gpu::ShaderMiscFlags::clipUpdateOnly));
+        assert(!enums::is_flag_set(shaderMiscFlags,
+                                   gpu::ShaderMiscFlags::clipUpdateOnly));
         switch (draw->blendMode())
         {
             case BlendMode::hue:
@@ -3293,19 +4423,28 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
             case BlendMode::multiply:
                 shaderFeatures |= ShaderFeatures::ENABLE_ADVANCED_BLEND;
                 break;
+            // Additive is folded into srcOver before it gets here, and
+            // additiveness needs no shader feature of its own.
+            case BlendMode::additive:
             case BlendMode::srcOver:
                 break;
         }
     }
-    batch->shaderFeatures |= shaderFeatures & m_ctx->m_frameShaderFeaturesMask;
-    assert(
-        (batch->shaderFeatures &
-         gpu::ShaderFeaturesMaskFor(drawType, m_ctx->frameInterlockMode())) ==
-        batch->shaderFeatures);
-
-    if (paintType == PaintType::image)
+    if (draw->imageTexture() != nullptr)
     {
-        assert(draw->imageTexture() != nullptr);
+        if (m_ctx->frameInterlockMode() != gpu::InterlockMode::atomics &&
+            drawType != DrawType::imageRect && drawType != DrawType::imageMesh)
+        {
+            shaderFeatures |= ShaderFeatures::ENABLE_MODULATED_IMAGE;
+        }
+
+        if (batch->imageTexture == nullptr)
+        {
+            // We merged in with a batch that did not already have an image so
+            // we need to ensure the sampler is correct.
+            batch->imageSampler = draw->imageSampler();
+        }
+
         if (batch->imageTexture == nullptr)
         {
             batch->imageTexture = draw->imageTexture();
@@ -3313,51 +4452,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
         assert(batch->imageTexture == draw->imageTexture());
     }
 
-    if (m_ctx->frameInterlockMode() == gpu::InterlockMode::msaa)
-    {
-        // msaa does't mix src-over draws with advanced blend draws.
-        assert((batch->shaderFeatures &
-                gpu::ShaderFeatures::ENABLE_ADVANCED_BLEND) ==
-               (draw->blendMode() != BlendMode::srcOver));
-        // If using KHR_blend_equation_advanced, we can't mix blend modes in a
-        // batch.
-        assert(!m_ctx->platformFeatures().supportsBlendAdvancedKHR ||
-               batch->firstBlendMode == draw->blendMode());
+    batch->shaderFeatures |= shaderFeatures & m_ctx->m_frameShaderFeaturesMask;
+    assert(
+        (batch->shaderFeatures &
+         gpu::ShaderFeaturesMaskFor(drawType, m_ctx->frameInterlockMode())) ==
+        batch->shaderFeatures);
 
-        if (draw->blendMode() != BlendMode::srcOver &&
-            !m_ctx->platformFeatures().supportsBlendAdvancedCoherentKHR)
-        {
-            // An implementation-dependent barrier is required between
-            // overlapping draws. Add a "dstBlend" barrier and build up a list
-            // of "dstReads" for the batch. The dstRead list will be required in
-            // the event that the implementation has to handle dstReads by
-            // copying out a texture.
-            //
-            // (But if the draw already has a "nextDstRead" neighbor, do
-            // nothing. It means an earlier subpass will already issue the
-            // barrier and sync this region of the framebuffer. Since nothing
-            // that overlaps will be ordered between that first subpass and us,
-            // that barrier for the first subpass is all we need.)
-            if (draw->nextDstRead() == nullptr)
-            {
-                batch->dstReadList = draw->addToDstReadList(batch->dstReadList);
-                assert(m_dstBlendBarrierListTail != nullptr);
-                if (!(batch->barriers & BarrierFlags::dstBlend))
-                {
-                    batch->barriers |= BarrierFlags::dstBlend;
-                    // Add ourselves to the "dstBlendBarrier" list.
-                    assert(*m_dstBlendBarrierListTail == nullptr);
-                    *m_dstBlendBarrierListTail = batch;
-                    assert(batch->nextDstBlendBarrier == nullptr);
-                    m_dstBlendBarrierListTail = &batch->nextDstBlendBarrier;
-                }
-                // We either added ourselves to the dstBlendBarrier list or
-                // merged into a batch that was already part of it.
-                assert(m_dstBlendBarrierListTail ==
-                       &batch->nextDstBlendBarrier);
-            }
-        }
-    }
+    assert(draw->imageTexture() == nullptr ||
+           batch->imageSampler == draw->imageSampler());
 
     m_combinedShaderFeatures |= batch->shaderFeatures;
     return *batch;

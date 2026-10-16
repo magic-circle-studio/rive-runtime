@@ -14,14 +14,32 @@
 #include <emscripten/emscripten.h>
 #include <emscripten/html5.h>
 
-EM_JS(bool,
-      enable_WEBGL_shader_pixel_local_storage_coherent,
-      (EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gl),
-      {
-          gl = GL.getContext(gl).GLctx;
-          gl.pls = gl["getExtension"]("WEBGL_shader_pixel_local_storage");
-          return Boolean(gl.pls && gl.pls["isCoherent"]());
-      });
+EM_JS(
+    bool,
+    enable_WEBGL_shader_pixel_local_storage_coherent,
+    (EMSCRIPTEN_WEBGL_CONTEXT_HANDLE gl),
+    {
+        gl = GL.getContext(gl).GLctx;
+        const pls = gl["getExtension"]("WEBGL_shader_pixel_local_storage");
+        if (Boolean(pls) && pls["isCoherent"]())
+        {
+            // WEBGL_shader_pixel_local_storage has breaking changes from
+            // time to time, while it's still a draft extension. A 5th
+            // argument was added to this function in 2026. Only use the
+            // extension if we are on the latest spec (with 5 arguments).
+            if (pls["framebufferTexturePixelLocalStorageWEBGL"].length == 5)
+            {
+                gl.pls = pls;
+                return true;
+            }
+            else
+            {
+                console.warn(
+                    "WEBGL_shader_pixel_local_storage is advertised, but a deprecated version has been detected. Disabling.");
+            }
+        }
+        return false;
+    });
 
 EM_JS(void,
       framebufferTexturePixelLocalStorageWEBGL,
@@ -29,7 +47,8 @@ EM_JS(void,
        GLint plane,
        GLuint backingtexture,
        GLint level,
-       GLint layer),
+       GLint layer,
+       GLenum usage),
       {
           const pls = GL.getContext(gl).GLctx.pls;
           if (pls)
@@ -38,7 +57,8 @@ EM_JS(void,
                   plane,
                   GL.textures[backingtexture],
                   level,
-                  layer);
+                  layer,
+                  usage);
           }
       });
 
@@ -67,7 +87,7 @@ EM_JS(void,
           if (pls)
           {
               pls["beginPixelLocalStorageWEBGL"](
-                  Module["HEAPU32"].subarray(loadopsIdx, loadopsIdx + n));
+                  new Uint32Array(wasmMemory.buffer, loadopsIdx * 4, n));
           }
       });
 
@@ -79,7 +99,7 @@ EM_JS(void,
           if (pls)
           {
               pls["endPixelLocalStorageWEBGL"](
-                  Module["HEAPU32"].subarray(storeopsIdx, storeopsIdx + n));
+                  new Uint32Array(wasmMemory.buffer, storeopsIdx * 4, n));
           }
       });
 
@@ -126,14 +146,16 @@ bool webgl_enable_WEBGL_shader_pixel_local_storage_coherent()
 void glFramebufferTexturePixelLocalStorageANGLE(GLint plane,
                                                 GLuint backingtexture,
                                                 GLint level,
-                                                GLint layer)
+                                                GLint layer,
+                                                GLenum usage)
 {
     framebufferTexturePixelLocalStorageWEBGL(
         emscripten_webgl_get_current_context(),
         plane,
         backingtexture,
         level,
-        layer);
+        layer,
+        usage);
 }
 
 void glFramebufferPixelLocalClearValuefvANGLE(GLint plane,
@@ -240,7 +262,8 @@ class RenderContextGLImpl::PLSImplWebGL
                 renderContextImpl->state()->setPipelineState(
                     gpu::COLOR_ONLY_PIPELINE_STATE);
                 glutils::BlitFramebuffer(desc.renderTargetUpdateBounds,
-                                         renderTarget->height());
+                                         renderTarget->height(),
+                                         renderTarget->bottomUp());
             }
         }
 
@@ -255,7 +278,8 @@ class RenderContextGLImpl::PLSImplWebGL
                                                      clearColor4f);
         }
         GLenum clipLoadAction =
-            (desc.combinedShaderFeatures & gpu::ShaderFeatures::ENABLE_CLIPPING)
+            enums::is_flag_set(desc.combinedShaderFeatures,
+                               gpu::ShaderFeatures::ENABLE_CLIPPING)
                 ? GL_LOAD_OP_ZERO_ANGLE
                 : GL_DONT_CARE;
         GLenum loadOps[4] = {webgl_load_op(desc.colorLoadAction),
@@ -295,7 +319,8 @@ class RenderContextGLImpl::PLSImplWebGL
             renderContextImpl->state()->setPipelineState(
                 gpu::COLOR_ONLY_PIPELINE_STATE);
             glutils::BlitFramebuffer(desc.renderTargetUpdateBounds,
-                                     framebufferRenderTarget->height());
+                                     framebufferRenderTarget->height(),
+                                     framebufferRenderTarget->bottomUp());
         }
     }
 

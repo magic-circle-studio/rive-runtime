@@ -1,14 +1,21 @@
 #include "rive/text/text.hpp"
+#include "rive/layout/layout_participant.hpp"
+#include "rive/importers/import_stack.hpp"
 using namespace rive;
 #ifdef WITH_RIVE_TEXT
 #include "rive/text_engine.hpp"
 #include "rive/component_dirt.hpp"
 #include "rive/math/rectangles_to_contour.hpp"
 #include "rive/math/transform_components.hpp"
+#include "rive/text/text_style_background.hpp"
 #include "rive/text/text_style_paint.hpp"
 #include "rive/text/text_value_run.hpp"
 #include "rive/text/text_modifier_group.hpp"
+#include "rive/text/text_selection_controller.hpp"
 #include "rive/shapes/paint/shape_paint.hpp"
+#include "rive/shapes/paint/color.hpp"
+#include "rive/shapes/paint/blend_mode.hpp"
+#include "rive/shapes/paint/image_sampler.hpp"
 #include "rive/viewmodel/viewmodel_instance_string.hpp"
 #include "rive/artboard.hpp"
 #include "rive/factory.hpp"
@@ -80,6 +87,7 @@ void TextValueRunListener::markDirty() { m_text->markShapeDirty(); }
 
 void TextValueRunListener::createProperties()
 {
+    CoreObjectListener::createProperties();
     createPropertyListener(SymbolType::textStyle);
     createPropertyListener(SymbolType::textContent);
 }
@@ -133,6 +141,10 @@ void TextValueRunListener::createPropertyListener(SymbolType symbolType)
 
 Text::~Text()
 {
+    if (m_selectionController != nullptr)
+    {
+        m_selectionController->remove(this);
+    }
     for (auto& textValueRun : m_valueRunListeners)
     {
         delete textValueRun;
@@ -173,6 +185,39 @@ void Text::controlSize(Vec2D size,
 
 TextSizing Text::effectiveSizing() const
 {
+#ifdef WITH_RIVE_LAYOUT
+    // Layout-controlled text (a participant, or the active child of a
+    // participating Solo) carries independent per-axis scale types; the single
+    // TextSizing enum can't express e.g. hug-width + fixed-height, so map each
+    // combination to the closest box behavior. m_layoutWidth/Height already
+    // hold the resolved slot sizes, so a hug axis reads as its content size
+    // under `fixed`.
+    //
+    // Read the scale types off the PARTICIPANT rather than off the copy
+    // controlSize leaves behind. Only the resolved slot has to wait for the
+    // solve; the scale types are authored, and controlSize hands us the
+    // participant's own values verbatim. Taking the copy meant the first
+    // measure pass -- which runs during the solve, before controlSize -- saw
+    // them unset and fell back to sizing(), so a fitFontSize text was fitted
+    // to the width the layout was offering and only settled on the next
+    // advance.
+    if (auto* participant = layoutParticipant())
+    {
+        const auto widthScaleType =
+            (LayoutScaleType)participant->layoutWidthScaleType();
+        const auto heightScaleType =
+            (LayoutScaleType)participant->layoutHeightScaleType();
+        bool wBox = widthScaleType == LayoutScaleType::fixed ||
+                    widthScaleType == LayoutScaleType::fill;
+        bool hBox = heightScaleType == LayoutScaleType::fixed ||
+                    heightScaleType == LayoutScaleType::fill;
+        if (!wBox && !hBox)
+        {
+            return sizing();
+        }
+        return wBox && !hBox ? TextSizing::autoHeight : TextSizing::fixed;
+    }
+#endif
     if (m_layoutWidthScaleType == std::numeric_limits<uint8_t>::max() ||
         m_layoutWidthScaleType == (uint8_t)LayoutScaleType::hug ||
         m_layoutHeightScaleType == (uint8_t)LayoutScaleType::hug)
@@ -189,6 +234,18 @@ void Text::clearRenderStyles()
         style->rewindPath();
     }
     m_renderStyles.clear();
+    m_drawCommands.clear();
+
+    // Backgrounds reset off the child list; a style whose glyphs are all
+    // emoji never enters m_renderStyles.
+    buildTextStylePaints();
+    for (TextStylePaint* style : m_textStylePaints)
+    {
+        if (style->background() != nullptr)
+        {
+            style->background()->resetPath();
+        }
+    }
 
     for (TextValueRun* textValueRun : m_allRuns)
     {
@@ -196,9 +253,87 @@ void Text::clearRenderStyles()
     }
 }
 
+// Vertical trim: the ascent above the first line's cap- or x-height and the
+// descent below the last line's baseline (or natural descent) that should be
+// removed from the box. Glyph layout is unchanged. Shared by computeBoundsInfo
+// (rendering) and measure (layout), so it operates on supplied lines/shape.
+static void computeVerticalTrim(
+    const SimpleArray<SimpleArray<GlyphLine>>& lines,
+    const SimpleArray<Paragraph>& shape,
+    TextTrimTop trimTop,
+    TextTrimBottom trimBottom,
+    float& topTrim,
+    float& bottomTrim)
+{
+    topTrim = 0.0f;
+    bottomTrim = 0.0f;
+    if (lines.empty() ||
+        (trimTop == TextTrimTop::none && trimBottom == TextTrimBottom::none))
+    {
+        return;
+    }
+
+    if (trimTop != TextTrimTop::none && !lines.front().empty())
+    {
+        const GlyphLine& firstLine = lines.front().front();
+        const Paragraph& firstParagraph = shape[0];
+        // Largest top edge across the runs on the first line so that no glyph
+        // is clipped. capHeight/xHeight are stored negative (up is -Y).
+        float edgePx = 0.0f;
+        for (uint32_t i = firstLine.startRunIndex; i <= firstLine.endRunIndex;
+             ++i)
+        {
+            const Font::LineMetrics& metrics =
+                firstParagraph.runs[i].font->lineMetrics();
+            float edge = trimTop == TextTrimTop::cap ? metrics.capHeight
+                                                     : metrics.xHeight;
+            edgePx = std::max(edgePx, -edge * firstParagraph.runs[i].size);
+        }
+        topTrim = std::max(0.0f, (firstLine.baseline - edgePx) - firstLine.top);
+    }
+
+    // Bottom trim uses the last non-empty paragraph's last line.
+    if (trimBottom != TextTrimBottom::none)
+    {
+        for (size_t p = lines.size(); p-- > 0;)
+        {
+            const SimpleArray<GlyphLine>& paragraphLines = lines[p];
+            if (paragraphLines.empty())
+            {
+                continue;
+            }
+            const GlyphLine& lastLine = paragraphLines.back();
+            float descentBand = lastLine.bottom - lastLine.baseline;
+            if (trimBottom == TextTrimBottom::alphabetic)
+            {
+                // Box bottom at the baseline: remove the whole descent.
+                bottomTrim = std::max(0.0f, descentBand);
+            }
+            else
+            {
+                // Box bottom at the natural descent: keep the descenders,
+                // remove only any extra leading below them.
+                const Paragraph& lastParagraph = shape[p];
+                float descentPx = 0.0f;
+                for (uint32_t i = lastLine.startRunIndex;
+                     i <= lastLine.endRunIndex;
+                     ++i)
+                {
+                    const GlyphRun& run = lastParagraph.runs[i];
+                    descentPx =
+                        std::max(descentPx,
+                                 run.font->lineMetrics().descent * run.size);
+                }
+                bottomTrim = std::max(0.0f, descentBand - descentPx);
+            }
+            break;
+        }
+    }
+}
+
 TextBoundsInfo Text::computeBoundsInfo()
 {
-    const float paragraphSpace = paragraphSpacing();
+    const float paragraphSpace = fitParagraphSpacing();
 
     // Build up ordered runs as we go.
     int paragraphIndex = 0;
@@ -217,8 +352,8 @@ TextBoundsInfo Text::computeBoundsInfo()
     bool isEllipsisLineLast = false;
     // Find the line to put the ellipsis on (line before the one that
     // overflows).
-    bool wantEllipsis = overflow() == TextOverflow::ellipsis &&
-                        effectiveSizing() == TextSizing::fixed;
+    bool wantEllipsis =
+        overflow() == TextOverflow::ellipsis && overflowAsFixed();
 
     int lastLineIndex = -1;
     for (const SimpleArray<GlyphLine>& paragraphLines : m_lines)
@@ -255,13 +390,156 @@ TextBoundsInfo Text::computeBoundsInfo()
     }
     auto totalHeight = ellipsisLine > 0 ? ellipsedHeight : y;
     isEllipsisLineLast = lastLineIndex == ellipsisLine;
+
+    // Vertical trim: shrink the box to the chosen cap/x-height + baseline band.
+    // Glyph layout is unchanged; fixed sizing keeps its authored box.
+    float topTrim = 0.0f;
+    float bottomTrim = 0.0f;
+    if (effectiveSizing() != TextSizing::fixed)
+    {
+        computeVerticalTrim(m_lines,
+                            m_shape,
+                            verticalTrimTop(),
+                            verticalTrimBottom(),
+                            topTrim,
+                            bottomTrim);
+    }
+
     return {
         minY,
         maxWidth,
         totalHeight,
         ellipsisLine,
         isEllipsisLineLast,
+        topTrim,
+        bottomTrim,
     };
+}
+
+float Text::fitFontScale()
+{
+    const TextSizing sizing = effectiveSizing();
+    // Without a fixed dimension to fit into there is nothing to search:
+    // autoWidth grows in both directions, so we keep the authored size.
+    if (sizing == TextSizing::autoWidth && !overflowAsFixed())
+    {
+        return 1.0f;
+    }
+    return fitFontScale(effectiveWidth(),
+                        overflowAsFixed() ? effectiveHeight()
+                                          : std::numeric_limits<float>::max());
+}
+
+float Text::fitFontScale(float boxWidth, float boxHeight)
+{
+    // The box we are fitting into is the *trimmed* one: computeBoundsInfo and
+    // measure both take the trim band off the content height before the box is
+    // sized, so boxHeight already excludes it (it is the height the layout
+    // handed back, or the offer measure is fitting into). Comparing the raw
+    // content height against it would charge the trim band twice and shrink
+    // the font by it, leaving exactly the dead space the trim removed. Gated
+    // like computeBoundsInfo: a fixed box keeps its authored, untrimmed size.
+    const bool boxIsTrimmed = effectiveSizing() != TextSizing::fixed;
+
+    // Largest authored font size across runs is our maximum; we search integer
+    // sizes in [1, maxSize]. Scaling all runs by a single multiplier preserves
+    // their relative proportions while stepping the largest run by integers.
+    float maxSize = 0.0f;
+    for (TextValueRun* valueRun : m_allRuns)
+    {
+        TextStylePaint* style = valueRun->style();
+        if (style != nullptr && style->font() != nullptr &&
+            !valueRun->text().empty())
+        {
+            // No scale turns inf finite (inf * 0 is NaN). std::max drops NaN.
+            if (std::isinf(style->fontSize()))
+            {
+                return 1.0f;
+            }
+            maxSize = std::max(maxSize, style->fontSize());
+        }
+    }
+
+    if (maxSize <= 1.0f)
+    {
+        return 1.0f;
+    }
+
+    StyledText styledText;
+
+    // Shapes and lays out the text at the given integer top size and reports
+    // whether it fits the bounds. Text dimensions grow monotonically with size,
+    // so this predicate is monotonic and binary-searchable.
+    auto fits = [&](int topSize) -> bool {
+        float scale = (float)topSize / maxSize;
+        if (!makeStyled(styledText, true, scale))
+        {
+            // Nothing to lay out: trivially fits.
+            return true;
+        }
+        const auto& runs = styledText.runs();
+        auto shape = runs[0].font->shapeText(styledText.unichars(), runs);
+        auto lines = BreakLines(shape, boxWidth, align(), wrap(), wordBreak());
+
+        float maxWidth = 0.0f;
+        float y = 0.0f;
+        size_t paragraphIndex = 0;
+        for (const SimpleArray<GlyphLine>& paragraphLines : lines)
+        {
+            const Paragraph& paragraph = shape[paragraphIndex++];
+            for (const GlyphLine& line : paragraphLines)
+            {
+                const GlyphRun& endRun = paragraph.runs[line.endRunIndex];
+                const GlyphRun& startRun = paragraph.runs[line.startRunIndex];
+                float width = endRun.xpos[line.endGlyphIndex] -
+                              startRun.xpos[line.startGlyphIndex];
+                maxWidth = std::max(maxWidth, width);
+            }
+            if (!paragraphLines.empty())
+            {
+                y += paragraphLines.back().bottom;
+            }
+            y += paragraphSpacing() * scale;
+        }
+
+        float topTrim = 0.0f;
+        float bottomTrim = 0.0f;
+        if (boxIsTrimmed)
+        {
+            computeVerticalTrim(lines,
+                                shape,
+                                verticalTrimTop(),
+                                verticalTrimBottom(),
+                                topTrim,
+                                bottomTrim);
+        }
+
+        bool widthFits = maxWidth <= boxWidth;
+        bool heightFits = y - topTrim - bottomTrim <= boxHeight;
+        return widthFits && heightFits;
+    };
+
+    // Above 2^24 floats skip integers, and hi + 1 must not overflow int.
+    constexpr float kMaxSearchSize = (float)(1 << 24);
+    // Binary search for the largest integer top size in [1, floor(maxSize)]
+    // that fits. If nothing fits we fall back to the minimum size (1).
+    int lo = 1;
+    int hi = (int)std::min(maxSize, kMaxSearchSize);
+    int best = 1;
+    while (lo <= hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        if (fits(mid))
+        {
+            best = mid;
+            lo = mid + 1;
+        }
+        else
+        {
+            hi = mid - 1;
+        }
+    }
+    return (float)best / maxSize;
 }
 
 LineIter Text::shouldDrawLine(float curY,
@@ -271,7 +549,7 @@ LineIter Text::shouldDrawLine(float curY,
     switch (overflow())
     {
         case TextOverflow::hidden:
-            if (effectiveSizing() == TextSizing::fixed)
+            if (overflowAsFixed())
             {
                 switch (verticalAlign())
                 {
@@ -303,7 +581,7 @@ LineIter Text::shouldDrawLine(float curY,
             }
             break;
         case TextOverflow::clipped:
-            if (effectiveSizing() == TextSizing::fixed)
+            if (overflowAsFixed())
             {
                 switch (verticalAlign())
                 {
@@ -359,6 +637,8 @@ void Text::buildRenderStyles()
     float totalHeight = info.totalHeight;
     int ellipsisLine = info.ellipsisLine;
     bool isEllipsisLineLast = info.isEllipsisLineLast;
+    float topTrim = info.topTrim;
+    float bottomTrim = info.bottomTrim;
 
     // Step 3: update modifiers
     bool hasModifiers = haveModifiers();
@@ -372,21 +652,26 @@ void Text::buildRenderStyles()
         }
     }
 
-    // Step 4: update bounds
-    const float paragraphSpace = paragraphSpacing();
+    // Step 4: update bounds. A layout-controlled axis uses the layout's size
+    // so the text box always matches the layout.
+    const float paragraphSpace = fitParagraphSpacing();
+    const float boxWidth = layoutBoxWidth();
+    const float boxHeight = layoutBoxHeight();
+    const float autoSizeMaxY =
+        std::isnan(boxHeight)
+            ? std::max(minY,
+                       totalHeight - paragraphSpace - topTrim - bottomTrim)
+            : minY + boxHeight;
     switch (effectiveSizing())
     {
         case TextSizing::autoWidth:
             m_bounds = AABB(0.0f,
                             minY,
-                            maxWidth,
-                            std::max(minY, totalHeight - paragraphSpace));
+                            std::isnan(boxWidth) ? maxWidth : boxWidth,
+                            autoSizeMaxY);
             break;
         case TextSizing::autoHeight:
-            m_bounds = AABB(0.0f,
-                            minY,
-                            effectiveWidth(),
-                            std::max(minY, totalHeight - paragraphSpace));
+            m_bounds = AABB(0.0f, minY, effectiveWidth(), autoSizeMaxY);
             break;
         case TextSizing::fixed:
             m_bounds =
@@ -421,8 +706,9 @@ void Text::buildRenderStyles()
             AABB(minX, minY, minX + bounds.width(), minY + bounds.height()));
     }
 
-    // Step 6: add the glyphs to render paths
-    float curY = minY;
+    // Step 6: add the glyphs to render paths. Shift content up by topTrim so
+    // the first line's cap-height line aligns with the (trimmed) box top.
+    float curY = minY - topTrim;
     int lineIndex = 0;
     int paragraphIndex = 0;
     float minX = std::numeric_limits<float>::max();
@@ -468,8 +754,6 @@ void Text::buildRenderStyles()
                 GlyphID glyphId = run->glyphs[glyphIndex];
                 float advance = run->advances[glyphIndex];
 
-                RawPath path = font->getPath(glyphId);
-
                 // Step 6.1: translate to the glyph's origin and scale.
                 Vec2D curPos(curX, renderY);
                 float centerX = advance / 2.0f;
@@ -511,33 +795,59 @@ void Text::buildRenderStyles()
                                          curPos.y + offset.y) *
                     pathTransform;
 
-                path.transformInPlace(pathTransform);
-
                 assert(run->styleId < m_allRuns.size());
                 TextValueRun* textValueRun = m_allRuns[run->styleId];
                 TextStylePaint* style = textValueRun->style();
-                // TextValueRun::onAddedDirty botches loading if it cannot
-                // resolve a style, so we're confident we have a style here.
                 assert(style != nullptr);
 
-                if (style->addPath(path, opacity))
+                // Check for color glyph (emoji) -- draw individually
+                // with per-layer colors instead of accumulating.
+                if (font->isColorGlyph(glyphId))
                 {
-                    // This was the first path added to the style, so let's
-                    // mark it in our draw list.
-                    m_renderStyles.push_back(style);
-                    style->propagateOpacity(renderOpacity());
+                    TextDrawCommand cmd;
+                    cmd.type = TextDrawCommand::kColorGlyph;
+                    cmd.colorGlyph = {run->font,
+                                      glyphId,
+                                      pathTransform,
+                                      style->foregroundColor(),
+                                      opacity};
+                    m_drawCommands.push_back(std::move(cmd));
+                }
+                else
+                {
+                    RawPath path = font->getPath(glyphId);
+                    path.transformInPlace(pathTransform);
+
+                    if (style->addPath(path, opacity))
+                    {
+                        // This was the first path added to the style, so
+                        // let's mark it in our draw list.
+                        m_renderStyles.push_back(style);
+                        style->propagateOpacity(renderOpacity());
+
+                        TextDrawCommand cmd;
+                        cmd.type = TextDrawCommand::kStylePath;
+                        cmd.style = style;
+                        m_drawCommands.push_back(std::move(cmd));
+                    }
                 }
 
                 // Bounds of the glyph
-                if (textValueRun->isHitTarget())
+                if (textValueRun->isHitTarget() ||
+                    style->background() != nullptr)
                 {
-                    Vec2D topLeft = Vec2D(curX, curY + line.top);
-                    Vec2D bottomRight =
-                        Vec2D(curX + advance, curY + line.bottom);
-                    textValueRun->addHitRect(AABB(topLeft.x,
-                                                  topLeft.y,
-                                                  bottomRight.x,
-                                                  bottomRight.y));
+                    AABB glyphBounds(curX,
+                                     curY + line.top,
+                                     curX + advance,
+                                     curY + line.bottom);
+                    if (textValueRun->isHitTarget())
+                    {
+                        textValueRun->addHitRect(glyphBounds);
+                    }
+                    if (style->background() != nullptr)
+                    {
+                        style->background()->addRect(glyphBounds);
+                    }
                 }
                 curX += advance;
             }
@@ -552,7 +862,7 @@ void Text::buildRenderStyles()
         {
             curY += paragraphLines.back().bottom;
         }
-        curY += paragraphSpacing();
+        curY += fitParagraphSpacing();
     }
 skipLines:
     // Step 7: consider fit mode, and update local transform
@@ -561,14 +871,14 @@ skipLines:
     auto yOffset = -m_bounds.height() * originY();
     if (overflow() == TextOverflow::fit)
     {
-        auto xScale = (effectiveSizing() != TextSizing::autoWidth &&
+        auto xScale = ((effectiveSizing() != TextSizing::autoWidth ||
+                        overflowAsFixed()) &&
                        maxWidth > m_bounds.width())
                           ? m_bounds.width() / maxWidth
                           : 1;
         auto baseline = fitFromBaseline() ? m_lines[0][0].baseline : 0;
         auto yScale =
-            (effectiveSizing() == TextSizing::fixed &&
-             totalHeight > m_bounds.height())
+            (overflowAsFixed() && totalHeight > m_bounds.height())
                 ? (m_bounds.height() - baseline) / (totalHeight - baseline)
                 : 1;
         if (xScale != 1 || yScale != 1)
@@ -592,7 +902,7 @@ skipLines:
     }
     if (verticalAlign() != VerticalTextAlign::top)
     {
-        if (effectiveSizing() == TextSizing::fixed)
+        if (overflowAsFixed())
         {
             yOffset = -m_bounds.height() * originY();
             if (verticalAlign() == VerticalTextAlign::middle)
@@ -619,6 +929,15 @@ skipLines:
             textValueRun->computeHitContours();
         }
     }
+    for (TextStylePaint* style : m_textStylePaints)
+    {
+        TextStyleBackground* background = style->background();
+        if (background != nullptr)
+        {
+            background->updatePath();
+            background->propagateOpacity(renderOpacity());
+        }
+    }
 }
 
 const TextStylePaint* Text::styleFromShaperId(uint16_t id) const
@@ -629,7 +948,7 @@ const TextStylePaint* Text::styleFromShaperId(uint16_t id) const
 
 void Text::draw(Renderer* renderer)
 {
-    if (m_needsSaveOperation)
+    if (needsSaveOperation())
     {
         renderer->save();
     }
@@ -642,14 +961,157 @@ void Text::draw(Renderer* renderer)
         renderer->clipPath(m_clipPath.renderPath(this));
     }
     auto worldTransform = shapeWorldTransform();
-    for (auto style : m_renderStyles)
+    // Backgrounds first so they sit behind every glyph, in style child order.
+    for (TextStylePaint* style : m_textStylePaints)
     {
-        style->draw(renderer, worldTransform);
+        TextStyleBackground* background = style->background();
+        if (background != nullptr)
+        {
+            background->draw(renderer, worldTransform);
+        }
     }
-    if (m_needsSaveOperation)
+    if (m_selectionController != nullptr)
+    {
+        m_selectionController->draw(this, renderer);
+    }
+    for (auto& cmd : m_drawCommands)
+    {
+        if (cmd.type == TextDrawCommand::kStylePath)
+        {
+            cmd.style->draw(renderer, worldTransform);
+        }
+        else
+        {
+            drawColorGlyph(renderer, cmd.colorGlyph, worldTransform);
+        }
+    }
+    if (needsSaveOperation())
     {
         renderer->restore();
     }
+}
+
+void rive::drawColorGlyphLayer(Renderer* renderer,
+                               Factory* factory,
+                               Font::ColorGlyphLayer& layer,
+                               float opacity)
+{
+    using PaintType = Font::ColorGlyphPaintType;
+    auto paint = factory->makeRenderPaint();
+    paint->style(RenderPaintStyle::fill);
+    Mat2D toUnitCircle;
+    bool isLinear = layer.paintType == PaintType::linearGradient;
+    bool isRadial = layer.paintType == PaintType::radialGradient &&
+                    layer.radialTransform.invert(&toUnitCircle);
+    if (layer.stops.size() < 2 || (!isLinear && !isRadial))
+    {
+        ColorInt color =
+            layer.paintType == PaintType::solid || layer.stops.empty()
+                ? layer.color
+                : layer.stops.front().color;
+        paint->color(colorModulateOpacity(color, opacity));
+        renderer->drawPath(
+            factory->makeRenderPath(layer.path, FillRule::nonZero).get(),
+            paint.get());
+        return;
+    }
+
+    std::vector<ColorInt> colors;
+    std::vector<float> stops;
+    colors.reserve(layer.stops.size());
+    stops.reserve(layer.stops.size());
+    for (const auto& stop : layer.stops)
+    {
+        colors.push_back(colorModulateOpacity(stop.color, opacity));
+        stops.push_back(stop.offset);
+    }
+    if (isLinear)
+    {
+        paint->shader(factory->makeLinearGradient(layer.x0,
+                                                  layer.y0,
+                                                  layer.x1,
+                                                  layer.y1,
+                                                  colors.data(),
+                                                  stops.data(),
+                                                  colors.size()));
+        renderer->drawPath(
+            factory->makeRenderPath(layer.path, FillRule::nonZero).get(),
+            paint.get());
+        return;
+    }
+
+    // Radial shaders are circles, so draw in the gradient's own space.
+    paint->shader(factory->makeRadialGradient(0,
+                                              0,
+                                              1,
+                                              colors.data(),
+                                              stops.data(),
+                                              colors.size()));
+    layer.path.transformInPlace(toUnitCircle);
+    renderer->save();
+    renderer->transform(layer.radialTransform);
+    renderer->drawPath(
+        factory->makeRenderPath(layer.path, FillRule::nonZero).get(),
+        paint.get());
+    renderer->restore();
+}
+
+void Text::drawColorGlyph(Renderer* renderer,
+                          const TextDrawCommand::ColorGlyphInfo& info,
+                          const Mat2D& worldTransform)
+{
+    std::vector<Font::ColorGlyphLayer> layers;
+    size_t count =
+        info.font->getColorLayers(info.glyphId, layers, info.foregroundColor);
+    if (count == 0)
+    {
+        return;
+    }
+
+    Factory* factory = artboard()->factory();
+    renderer->save();
+    renderer->transform(worldTransform * info.transform);
+
+    for (auto& layer : layers)
+    {
+        if (layer.paintType == Font::ColorGlyphPaintType::image)
+        {
+            // Decode and draw bitmap emoji (SBIX/CBDT).
+            ColorGlyphCacheKey cacheKey{info.font.get(), info.glyphId};
+            auto it = m_emojiImageCache.find(cacheKey);
+            if (it == m_emojiImageCache.end())
+            {
+                auto image = factory->decodeImage(
+                    {layer.imageBytes.data(), layer.imageBytes.size()});
+                it =
+                    m_emojiImageCache.emplace(cacheKey, std::move(image)).first;
+            }
+            if (it->second != nullptr)
+            {
+                renderer->save();
+                // Transform from glyph space: position at bearing and
+                // scale from image pixels to glyph extent units.
+                float scaleX = layer.imageExtentX / (float)layer.imageWidth;
+                float scaleY = layer.imageExtentY / (float)layer.imageHeight;
+                renderer->transform(Mat2D(scaleX,
+                                          0,
+                                          0,
+                                          scaleY,
+                                          layer.imageBearingX,
+                                          layer.imageBearingY));
+                renderer->drawImage(it->second.get(),
+                                    ImageSampler::LinearClamp(),
+                                    BlendMode::srcOver,
+                                    info.opacity);
+                renderer->restore();
+            }
+        }
+        else
+        {
+            drawColorGlyphLayer(renderer, factory, layer, info.opacity);
+        }
+    }
+    renderer->restore();
 }
 
 void Text::addRun(TextValueRun* run)
@@ -657,6 +1119,21 @@ void Text::addRun(TextValueRun* run)
     m_runs.push_back(run);
     m_allRuns.push_back(run);
 }
+
+#ifdef WITH_RIVE_EDITOR
+void Text::sortRunsForEditor(
+    const std::function<bool(TextValueRun*, TextValueRun*)>& cmp)
+{
+    if (std::is_sorted(m_runs.begin(), m_runs.end(), cmp) &&
+        std::is_sorted(m_allRuns.begin(), m_allRuns.end(), cmp))
+    {
+        return;
+    }
+    std::sort(m_runs.begin(), m_runs.end(), cmp);
+    std::sort(m_allRuns.begin(), m_allRuns.end(), cmp);
+    markShapeDirty();
+}
+#endif
 
 void Text::addModifierGroup(TextModifierGroup* group)
 {
@@ -689,9 +1166,21 @@ void Text::alignValueChanged() { markShapeDirty(); }
 
 void Text::sizingValueChanged() { markShapeDirty(); }
 
+void Text::wordBreakValueChanged() { markShapeDirty(); }
+
+void Text::fitFontSizeResizesBoxChanged()
+{
+    // Only fitFontSize consults the flag, and only to decide what measure()
+    // reports, so nothing else needs re-shaping.
+    if (overflow() == TextOverflow::fitFontSize)
+    {
+        markShapeDirty();
+    }
+}
+
 void Text::overflowValueChanged()
 {
-    if (effectiveSizing() != TextSizing::autoWidth)
+    if (effectiveSizing() != TextSizing::autoWidth || overflowAsFixed())
     {
         markShapeDirty();
     }
@@ -705,7 +1194,17 @@ void Text::widthChanged()
     }
 }
 
-void Text::paragraphSpacingChanged() { markPaintDirty(); }
+void Text::paragraphSpacingChanged()
+{
+    if (overflow() == TextOverflow::fitFontSize)
+    {
+        markShapeDirty();
+    }
+    else
+    {
+        markPaintDirty();
+    }
+}
 
 void Text::heightChanged()
 {
@@ -741,7 +1240,9 @@ void StyledText::append(rcp<Font> font,
         {std::move(font), size, lineHeight, letterSpacing, n, 0, styleId});
 }
 
-bool Text::makeStyled(StyledText& styledText, bool withModifiers) const
+bool Text::makeStyled(StyledText& styledText,
+                      bool withModifiers,
+                      float fontScale) const
 {
     styledText.clear();
     uint16_t runIndex = 0;
@@ -754,10 +1255,21 @@ bool Text::makeStyled(StyledText& styledText, bool withModifiers) const
             runIndex++;
             continue;
         }
+        // A custom line height (>= 0) is an absolute value that overrides the
+        // font-metric spacing, so it must scale with the font to keep
+        // fitFontScale a true uniform scale of the authored layout. The -1
+        // sentinel ("derive from font metrics") is left untouched. Letter
+        // spacing is likewise an absolute advance added after glyph shaping, so
+        // it scales for the same reason.
+        float lineHeight = style->lineHeight();
+        if (lineHeight >= 0.0f)
+        {
+            lineHeight *= fontScale;
+        }
         styledText.append(style->font(),
-                          style->fontSize(),
-                          style->lineHeight(),
-                          style->letterSpacing(),
+                          style->fontSize() * fontScale,
+                          lineHeight,
+                          style->letterSpacing() * fontScale,
                           text,
                           runIndex++);
     }
@@ -775,7 +1287,9 @@ SimpleArray<SimpleArray<GlyphLine>> Text::BreakLines(
     const SimpleArray<Paragraph>& paragraphs,
     float width,
     TextAlign align,
-    TextWrap wrap)
+    TextWrap wrap,
+    TextWordBreak wordBreak,
+    float minAlignWidth)
 {
     bool autoWidth = width == -1.0f;
     float paragraphWidth = width;
@@ -787,7 +1301,8 @@ SimpleArray<SimpleArray<GlyphLine>> Text::BreakLines(
     {
         lines[paragraphIndex] = GlyphLine::BreakLines(
             para.runs,
-            (autoWidth || wrap == TextWrap::noWrap) ? -1.0f : width);
+            (autoWidth || wrap == TextWrap::noWrap) ? -1.0f : width,
+            wordBreak);
         if (autoWidth)
         {
             paragraphWidth = std::max(
@@ -796,6 +1311,9 @@ SimpleArray<SimpleArray<GlyphLine>> Text::BreakLines(
         }
         paragraphIndex++;
     }
+    // Align within the field when it's wider than the text; text that
+    // overflows the field aligns within itself (effectively left aligned).
+    paragraphWidth = std::max(paragraphWidth, minAlignWidth);
     paragraphIndex = 0;
     for (auto& para : paragraphs)
     {
@@ -851,10 +1369,15 @@ void Text::update(ComponentDirt value)
         bool precomputeModifierCoverage = modifierRangesNeedShape();
         bool parentIsLayoutNotArtboard =
             parent()->is<LayoutComponent>() && !parent()->is<Artboard>();
+        // For fitFontSize, find the largest integer font size that fits the
+        // bounds, then shape/lay out the text at that size below.
+        float fontScale =
+            overflow() == TextOverflow::fitFontSize ? fitFontScale() : 1.0f;
+        m_fitFontScale = fontScale;
         if (precomputeModifierCoverage &&
-            makeStyled(m_modifierStyledText, false))
+            makeStyled(m_modifierStyledText, false, fontScale))
         {
-            auto runs = m_modifierStyledText.runs();
+            const auto& runs = m_modifierStyledText.runs();
             m_modifierShape =
                 runs[0].font->shapeText(m_modifierStyledText.unichars(), runs);
             m_modifierLines =
@@ -864,7 +1387,8 @@ void Text::update(ComponentDirt value)
                                ? -1.0f
                                : effectiveWidth(),
                            align(),
-                           wrap());
+                           wrap(),
+                           wordBreak());
             m_glyphLookup.compute(m_modifierStyledText.unichars(),
                                   m_modifierShape);
             uint32_t textSize =
@@ -878,9 +1402,9 @@ void Text::update(ComponentDirt value)
                 group->computeCoverage(textSize);
             }
         }
-        if (makeStyled(m_styledText))
+        if (makeStyled(m_styledText, true, fontScale))
         {
-            auto runs = m_styledText.runs();
+            const auto& runs = m_styledText.runs();
             m_shape = runs[0].font->shapeText(m_styledText.unichars(), runs);
 
             m_lines = BreakLines(m_shape,
@@ -889,7 +1413,8 @@ void Text::update(ComponentDirt value)
                                      ? -1.0f
                                      : effectiveWidth(),
                                  align(),
-                                 wrap());
+                                 wrap(),
+                                 wordBreak());
             if (!precomputeModifierCoverage && haveModifiers())
             {
                 m_glyphLookup.compute(m_styledText.unichars(), m_shape);
@@ -912,6 +1437,7 @@ void Text::update(ComponentDirt value)
         }
         m_orderedLines.clear();
         m_ellipsisRun = {};
+        m_emojiImageCache.clear();
 
         // Immediately build render styles so dimensions get computed.
         buildRenderStyles();
@@ -928,6 +1454,13 @@ void Text::update(ComponentDirt value)
         {
             style->propagateOpacity(renderOpacity());
         }
+        for (TextStylePaint* style : m_textStylePaints)
+        {
+            if (style->background() != nullptr)
+            {
+                style->background()->propagateOpacity(renderOpacity());
+            }
+        }
     }
 
     if (hasDirt(value,
@@ -938,34 +1471,64 @@ void Text::update(ComponentDirt value)
         m_shapeWorldTransform = m_WorldTransform * m_transform;
         m_clipPath.addPath(m_clipRect, &m_shapeWorldTransform);
     }
+    if (m_selectionController != nullptr &&
+        hasDirt(value, ComponentDirt::Path | ComponentDirt::Paint))
+    {
+        m_selectionController->textUpdated(this,
+                                           hasDirt(value, ComponentDirt::Path));
+    }
 }
 
 Vec2D Text::measure(Vec2D maxSize)
 {
-    if (makeStyled(m_styledText))
+    auto measuringWidth = 0.0f;
+    switch (effectiveSizing())
     {
-        const float paragraphSpace = paragraphSpacing();
-        auto runs = m_styledText.runs();
+        case TextSizing::autoHeight:
+        case TextSizing::fixed:
+            // The authored width only governs while the text owns its width
+            // axis. Under a layout that boxes it -- fill, or a fixed slot the
+            // layout resolves -- the authored value is stale and the real
+            // width is the one being offered in maxSize, so leave it
+            // unbounded and let the min() below take the offer. Reading
+            // m_layoutWidth instead would not work: controlSize writes it
+            // after the solve, so it is still NAN here.
+            measuringWidth =
+                layoutOwnsWidth() ? std::numeric_limits<float>::max() : width();
+            break;
+        default:
+            measuringWidth = std::numeric_limits<float>::max();
+            break;
+    }
+    // fitFontSize shrinks the font until the text fits its box, so the box we
+    // report back to the layout engine has to be measured at the *fitted*
+    // size. Measuring at the authored size hands the layout a slot taller
+    // than the text that will actually be drawn into it, which shows up as
+    // dead space under a hug-height text. The fit runs against the space the
+    // layout is offering here (maxSize/measuringWidth), not against
+    // m_layoutWidth/Height -- those still hold the previous pass's slot.
+    const float fitWidth = std::min(maxSize.x, measuringWidth);
+    float fontScale = 1.0f;
+    // Gate this the way fitFontScale() gates the update side -- overflow is
+    // inert below 7.3 (FileFeatures::layoutSizesBox) -- minus one clause.
+    if (overflow() == TextOverflow::fitFontSize &&
+        fitFontSizeResizesBoxActive() &&
+        hasFileFeature(FileFeatures::layoutSizesBox) &&
+        fitWidth != std::numeric_limits<float>::max())
+    {
+        fontScale = fitFontScale(fitWidth, maxSize.y);
+    }
+    if (makeStyled(m_styledText, true, fontScale))
+    {
+        const float paragraphSpace = paragraphSpacing() * fontScale;
+        const auto& runs = m_styledText.runs();
         auto shape = runs[0].font->shapeText(m_styledText.unichars(), runs);
-        auto measuringWidth = 0.0f;
-        switch (effectiveSizing())
-        {
-            case TextSizing::autoHeight:
-            case TextSizing::fixed:
-                measuringWidth = width();
-                break;
-            default:
-                measuringWidth = std::numeric_limits<float>::max();
-                break;
-        }
         auto measuringWrap = maxSize.x == std::numeric_limits<float>::max() &&
                                      effectiveSizing() != TextSizing::autoHeight
                                  ? TextWrap::noWrap
                                  : wrap();
-        auto lines = BreakLines(shape,
-                                std::min(maxSize.x, measuringWidth),
-                                align(),
-                                measuringWrap);
+        auto lines =
+            BreakLines(shape, fitWidth, align(), measuringWrap, wordBreak());
         float y = 0;
         float computedHeight = 0.0f;
         float minY = 0;
@@ -1015,14 +1578,27 @@ Vec2D Text::measure(Vec2D maxSize)
             y += paragraphSpace;
         }
     doneMeasuring:
+        // Match the rendered box: trim the ascent/descent band for auto sizing.
+        float topTrim = 0.0f;
+        float bottomTrim = 0.0f;
+        computeVerticalTrim(lines,
+                            shape,
+                            verticalTrimTop(),
+                            verticalTrimBottom(),
+                            topTrim,
+                            bottomTrim);
         Vec2D bounds;
         switch (sizing())
         {
             case TextSizing::autoWidth:
-                bounds = Vec2D(maxWidth, std::max(minY, computedHeight));
+                bounds = Vec2D(
+                    maxWidth,
+                    std::max(minY, computedHeight - topTrim - bottomTrim));
                 break;
             case TextSizing::autoHeight:
-                bounds = Vec2D(width(), std::max(minY, computedHeight));
+                bounds = Vec2D(
+                    width(),
+                    std::max(minY, computedHeight - topTrim - bottomTrim));
                 break;
             case TextSizing::fixed:
                 bounds = Vec2D(width(), minY + height());
@@ -1071,6 +1647,13 @@ void Text::originYChanged()
     markWorldTransformDirty();
 }
 
+void Text::verticalTrimValueChanged()
+{
+    // Trim affects both the rendered box and the layout-measured size, so go
+    // through the shape/layout path like sizing does.
+    markShapeDirty();
+}
+
 #else
 // Text disabled.
 Text::~Text() {}
@@ -1084,7 +1667,9 @@ void Text::update(ComponentDirt value) {}
 void Text::onDirty(ComponentDirt value) {}
 void Text::alignValueChanged() {}
 void Text::sizingValueChanged() {}
+void Text::wordBreakValueChanged() {}
 void Text::overflowValueChanged() {}
+void Text::fitFontSizeResizesBoxChanged() {}
 void Text::widthChanged() {}
 void Text::heightChanged() {}
 void Text::markPaintDirty() {}
@@ -1099,6 +1684,7 @@ AABB Text::localBounds() const { return AABB(); }
 void Text::originValueChanged() {}
 void Text::originXChanged() {}
 void Text::originYChanged() {}
+void Text::verticalTrimValueChanged() {}
 Vec2D Text::measureLayout(float width,
                           LayoutMeasureMode widthMode,
                           float height,
@@ -1112,6 +1698,110 @@ void Text::controlSize(Vec2D size,
                        LayoutDirection direction)
 {}
 #endif
+
+StatusCode Text::import(ImportStack& importStack)
+{
+    // A layout has always sized the text itself (effectiveWidth/Height), but
+    // before 7.3 an auto-sized text still took its *box* from the content, so
+    // the box could disagree with the slot and every overflow mode stayed
+    // inert. Keep that for those files; newer ones box to the slot. See
+    // File::minorVersion.
+    int major = importStack.majorVersion();
+    int minor = importStack.minorVersion();
+    auto atLeast = [major, minor](int wantMinor) {
+        return major > 7 || (major == 7 && minor >= wantMinor);
+    };
+    m_fileFeatures = FileFeatures::none;
+    if (atLeast(3))
+    {
+        m_fileFeatures |= FileFeatures::layoutSizesBox;
+    }
+    // 7.4 measures a fitFontSize text at its fitted size. Older files laid
+    // their layouts out against the unshrunk box, so honoring the flag there
+    // would reflow them; fitFontSizeResizesBox defaults to true and those
+    // files never wrote it.
+    if (atLeast(4))
+    {
+        m_fileFeatures |= FileFeatures::fitFontSizeResizesBox;
+    }
+    return Super::import(importStack);
+}
+
+Core* Text::clone() const
+{
+    Text* twin = TextBase::clone()->as<Text>();
+    twin->m_fileFeatures = m_fileFeatures;
+    return twin;
+}
+
+Vec2D Text::layoutBaseTranslation(LayoutParticipant* participant) const
+{
+    assert(participant != nullptr);
+    return Vec2D(
+        participant->resolvedLeft() + originX() * participant->resolvedWidth(),
+        participant->resolvedTop() + originY() * participant->resolvedHeight());
+}
+
+void Text::composeWorldTransform()
+{
+    // The base composes m_WorldTransform = parentWorld * m_Transform; insert
+    // the origin-based slot base instead when participating (text sizes via its
+    // own layout, not a geometric scale).
+#ifdef WITH_RIVE_LAYOUT
+    auto* participant = layoutParticipant();
+    if (participant != nullptr && m_ParentTransformComponent != nullptr)
+    {
+        Mat2D base = Mat2D::fromTranslation(layoutBaseTranslation(participant));
+        m_WorldTransform =
+            m_ParentTransformComponent->worldTransform() * base * m_Transform;
+        return;
+    }
+#endif
+    Super::composeWorldTransform();
+}
+
+void Text::updateConstraints()
+{
+#ifdef WITH_RIVE_LAYOUT
+    auto* participant = layoutParticipant();
+    if (participant != nullptr)
+    {
+        participant->applyLayoutConstraints();
+    }
+#endif
+    Super::updateConstraints();
+}
+
+LayoutParticipant* Text::layoutParticipant() const
+{
+    for (auto* child : children())
+    {
+        if (child->is<LayoutParticipant>())
+        {
+            return child->as<LayoutParticipant>();
+        }
+    }
+    return nullptr;
+}
+
+bool Text::isParticipatingInLayout() const
+{
+    return layoutParticipant() != nullptr;
+}
+
+bool Text::layoutOwnsWidth() const
+{
+#ifdef WITH_RIVE_LAYOUT
+    if (auto* participant = layoutParticipant())
+    {
+        const auto widthScaleType =
+            (LayoutScaleType)participant->layoutWidthScaleType();
+        return widthScaleType == LayoutScaleType::fixed ||
+               widthScaleType == LayoutScaleType::fill;
+    }
+#endif
+    return false;
+}
 
 TextAlign Text::align() const
 {
@@ -1185,3 +1875,16 @@ void Text::buildTextStylePaints()
     }
 }
 #endif
+
+BoundsFidelity Text::paintedWorldBounds(AABB* out)
+{
+    const BoundsFidelity fidelity =
+        paintedBoundsFromLocal(localBounds(), worldTransform(), nullptr, out);
+    if (fidelity == BoundsFidelity::none)
+    {
+        return fidelity;
+    }
+    // Never better than approximate: see the note on the declaration. The ink
+    // can reach past the layout box, so an exact claim here would crop glyphs.
+    return BoundsFidelity::approximate;
+}

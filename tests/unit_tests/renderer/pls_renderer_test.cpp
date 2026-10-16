@@ -6,6 +6,10 @@
 #include "rive/renderer/rive_renderer.hpp"
 #include "rive/renderer/rive_render_image.hpp"
 #include "../src/rive_render_path.hpp"
+#include "../src/rive_render_paint.hpp"
+#include "shaders/constants.glsl"
+#include <array>
+#include <cstring>
 #include <catch.hpp>
 
 namespace rive::gpu
@@ -294,8 +298,8 @@ static RawPath& make_cusp(const IAABB& rect)
     return path;
 }
 
-// Check that clip readBounds and contentBounds get tracked properly.
-TEST_CASE("clip-content-read-bounds", "[RiveRenderer]")
+// Check that clip contentBounds get tracked properly.
+TEST_CASE("clip-content-bounds", "[RiveRenderer]")
 {
     std::unique_ptr<RenderContext> renderContext =
         RenderContextNULL::MakeContext();
@@ -328,39 +332,68 @@ TEST_CASE("clip-content-read-bounds", "[RiveRenderer]")
                       Mat2D::fromTranslate(-1, 3).scale({2, 3})};
 
     RiveRenderer renderer(renderContext.get());
+    auto emptyClipID = 0u;
+
+    const auto screenRect = IAABB::MakeWH(s_frameDescriptor.renderTargetWidth,
+                                          s_frameDescriptor.renderTargetHeight);
     for (const Mat2D& m : xforms)
     {
+        // Flush and re-start the frame so that
         renderer.save();
         renderer.clipPath(cuspA.get());
         renderer.transform(m);
         renderer.drawPath(cuspB.get(), paint.get());
 
-        uint32_t clipAID = renderContext->getClipContentID();
-        REQUIRE(clipAID != 0);
-        // clipA is not transformed.
         auto clipAContentBounds = cuspA->getBounds().roundOut();
-        CHECK(renderContext->getClipContentBounds(clipAID) ==
-              clipAContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipAID) ==
-              m.mapBoundingBox({-1, -1, 1, 1}).roundOut());
+        const auto clipBContentBounds =
+            m.mapBoundingBox(cuspB->getBounds()).roundOut();
+
+        uint32_t clipAID = renderContext->getClipContentID();
+        if (clipAContentBounds.overlaps(clipBContentBounds))
+        {
+            REQUIRE(clipAID != emptyClipID);
+            CHECK(renderContext->getClipContentBounds(clipAID) ==
+                  clipAContentBounds);
+        }
+        else
+        {
+            // Without any overlap, A will not have even been added into the
+            // clip stack.
+            REQUIRE(clipAID == emptyClipID);
+        }
+        // clipA is not transformed.
 
         renderer.clipPath(cuspC.get());
         renderer.drawPath(cuspB.get(), paint.get());
         uint32_t clipCID = renderContext->getClipContentID();
         REQUIRE(clipCID != 0);
-        REQUIRE(clipCID != clipAID);
         auto clipCContentBounds =
             m.mapBoundingBox(cuspC->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clipCID) ==
-              clipCContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipCID) ==
-              m.mapBoundingBox({-1, -1, 1, 1}).roundOut());
 
-        // clipAID read bounds should have expanded from the nested clipping.
-        CHECK(renderContext->getClipContentBounds(clipAID) ==
-              clipAContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipAID) ==
-              m.mapBoundingBox({-1, -1, 5, 1}).roundOut());
+        const auto clipsOverlap =
+            clipAContentBounds.intersect(clipBContentBounds)
+                .overlaps(clipCContentBounds);
+        if (clipsOverlap)
+        {
+            const auto overlapBounds = screenRect.intersect(clipAContentBounds)
+                                           .intersect(clipCContentBounds);
+
+            REQUIRE(clipCID != clipAID);
+            CHECK(renderContext->getClipContentBounds(clipCID) ==
+                  clipCContentBounds);
+            CHECK(renderContext->getTightenedClipBounds(clipCID) ==
+                  overlapBounds);
+        }
+        else
+        {
+            REQUIRE(clipCID == clipAID);
+
+            if (clipAID != emptyClipID)
+            {
+                CHECK(renderContext->getClipContentBounds(clipAID) ==
+                      clipAContentBounds);
+            }
+        }
 
         // Each nested clip is read only by the one directly below it.
         auto cusp6 = static_rcp_cast<RiveRenderPath>(
@@ -393,42 +426,42 @@ TEST_CASE("clip-content-read-bounds", "[RiveRenderer]")
         renderer.drawPath(cuspC.get(), paint.get());
         uint32_t clip6ID = renderContext->getClipContentID();
 
-        // clipA bounds should not have been affected by deeper nested clips.
-        CHECK(renderContext->getClipContentBounds(clipAID) ==
-              clipAContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipAID) ==
-              m.mapBoundingBox({-1, -1, 5, 1}).roundOut());
-
-        // Each nested clip is read only by the one directly below it. Outer
-        // clips are not read by the draw either.
-        CHECK(renderContext->getClipContentBounds(clipCID) ==
-              clipCContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipCID) ==
-              m.mapBoundingBox({-1, -1, 1, 9}).roundOut());
         auto clip9ContentBounds =
             m.mapBoundingBox(cusp9->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clip9ID) ==
-              clip9ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip9ID) ==
-              m.mapBoundingBox({-1, -1, 1, 8}).roundOut());
         auto clip8ContentBounds =
             m.mapBoundingBox(cusp8->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip8ID) ==
-              m.mapBoundingBox({-1, -1, 1, 7}).roundOut());
         auto clip7ContentBounds =
             m.mapBoundingBox(cusp7->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clip7ID) ==
-              clip7ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip7ID) ==
-              m.mapBoundingBox({-1, -1, 1, 6}).roundOut());
         auto clip6ContentBounds =
             m.mapBoundingBox(cusp6->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clip6ID) ==
-              clip6ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip6ID) ==
-              m.mapBoundingBox({0, 0, 5, 1}).roundOut());
+
+        if (clipsOverlap)
+        {
+            // clipA bounds should not have been affected by deeper nested
+            // clips.
+            CHECK(renderContext->getClipContentBounds(clipAID) ==
+                  clipAContentBounds);
+
+            // Each nested clip is read only by the one directly below it. Outer
+            // clips are not read by the draw either.
+            CHECK(renderContext->getClipContentBounds(clipCID) ==
+                  clipCContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip9ID) ==
+                  clip9ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip8ID) ==
+                  clip8ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip7ID) ==
+                  clip7ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip6ID) ==
+                  clip6ContentBounds);
+        }
+        else
+        {
+            CHECK(clip9ID == emptyClipID);
+            CHECK(clip8ID == emptyClipID);
+            CHECK(clip7ID == emptyClipID);
+            CHECK(clip6ID == emptyClipID);
+        }
 
         // Pop back and do some more reading from clip8.
         renderer.restore();
@@ -437,54 +470,67 @@ TEST_CASE("clip-content-read-bounds", "[RiveRenderer]")
 
         // Since clip8 got obliterated and redrawn, this next read shouldn't
         // affect it.
-        CHECK(secondClip8ID != clip8ID);
-        CHECK(renderContext->getClipContentBounds(clip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip8ID) ==
-              m.mapBoundingBox({-1, -1, 1, 7}).roundOut());
-        // ... But should affect the clip currently in the clip buffer.
-        CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipReadBounds(secondClip8ID) ==
-              m.mapBoundingBox({0, 0, 5, 1}).roundOut());
+        if (clipsOverlap)
+        {
+            CHECK(secondClip8ID != clip8ID);
+            CHECK(renderContext->getClipContentBounds(clip8ID) ==
+                  clip8ContentBounds);
+            // ... But should affect the clip currently in the clip buffer.
+            CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
+                  clip8ContentBounds);
+        }
+        else
+        {
+            CHECK(secondClip8ID == emptyClipID);
+        }
 
         renderer.clipPath(cuspB.get());
         renderer.drawPath(cuspC.get(), paint.get());
-        CHECK(renderContext->getClipContentBounds(clip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipReadBounds(clip8ID) ==
-              m.mapBoundingBox({-1, -1, 1, 7}).roundOut());
-        CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipReadBounds(secondClip8ID) ==
-              m.mapBoundingBox({-1, -1, 5, 1}).roundOut());
+        if (clipsOverlap)
+        {
+            CHECK(renderContext->getClipContentBounds(clip8ID) ==
+                  clip8ContentBounds);
+            CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
+                  clip8ContentBounds);
+        }
+
         uint32_t clipBID = renderContext->getClipContentID();
-        auto clipBContentBounds =
-            m.mapBoundingBox(cuspB->getBounds().roundOut()).roundOut();
-        CHECK(renderContext->getClipContentBounds(clipBID) ==
-              clipBContentBounds);
-        CHECK(renderContext->getClipReadBounds(clipBID) ==
-              m.mapBoundingBox({0, 0, 5, 1}).roundOut());
+        if (clipsOverlap)
+        {
+            CHECK(renderContext->getClipContentBounds(clipBID) ==
+                  clipBContentBounds);
+        }
+        else
+        {
+            CHECK(clipBID == emptyClipID);
+        }
 
         renderer.restore();
 
         // Clip content bounds should never change.
-        CHECK(renderContext->getClipContentBounds(clipAID) ==
-              clipAContentBounds);
-        CHECK(renderContext->getClipContentBounds(clipCID) ==
-              clipCContentBounds);
-        CHECK(renderContext->getClipContentBounds(clip9ID) ==
-              clip9ContentBounds);
-        CHECK(renderContext->getClipContentBounds(clip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipContentBounds(clip7ID) ==
-              clip7ContentBounds);
-        CHECK(renderContext->getClipContentBounds(clip6ID) ==
-              clip6ContentBounds);
-        CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
-              clip8ContentBounds);
-        CHECK(renderContext->getClipContentBounds(clipBID) ==
-              clipBContentBounds);
+        if (clipsOverlap)
+        {
+            CHECK(renderContext->getClipContentBounds(clipAID) ==
+                  clipAContentBounds);
+            CHECK(renderContext->getClipContentBounds(clipCID) ==
+                  clipCContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip9ID) ==
+                  clip9ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip8ID) ==
+                  clip8ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip7ID) ==
+                  clip7ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clip6ID) ==
+                  clip6ContentBounds);
+            CHECK(renderContext->getClipContentBounds(secondClip8ID) ==
+                  clip8ContentBounds);
+            CHECK(renderContext->getClipContentBounds(clipBID) ==
+                  clipBContentBounds);
+        }
+
+        // If the next iteration doesn't overlap, then track which clipID we
+        // represents the "nothing got added to the clip stack" value.
+        emptyClipID = renderContext->getClipContentID();
     }
 
     renderContext->flush({.renderTarget = renderTarget.get()});
@@ -515,20 +561,21 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
 
     renderContext->beginFrame(s_frameDescriptor);
 
-    auto rectA = renderContext->makeRenderPath(make_rect({0, 0, 1, 5}),
+    auto rectA = renderContext->makeRenderPath(make_rect({0, 0, 100, 500}),
                                                FillRule::nonZero);
-    auto rectB = renderContext->makeRenderPath(make_rect({1, -1, 2, 4}),
+    auto rectB = renderContext->makeRenderPath(make_rect({1, -1, 20, 40}),
                                                FillRule::nonZero);
-    auto rectC = renderContext->makeRenderPath(make_rect({0, 0, 3, 6}),
+    auto rectC = renderContext->makeRenderPath(make_rect({0, 0, 300, 600}),
                                                FillRule::nonZero);
-    auto ovalA = renderContext->makeRenderPath(make_oval({0, 0, 1, 4}),
+    auto ovalA = renderContext->makeRenderPath(make_oval({0, 0, 100, 400}),
                                                FillRule::nonZero);
-    auto ovalB = renderContext->makeRenderPath(make_oval({0, 0, 2, 5}),
+    auto ovalB = renderContext->makeRenderPath(make_oval({0, 0, 200, 500}),
                                                FillRule::nonZero);
-    auto ovalC = renderContext->makeRenderPath(make_oval({0, 0, 3, 6}),
+    auto ovalC = renderContext->makeRenderPath(make_oval({0, 0, 300, 600}),
                                                FillRule::nonZero);
-    auto drawablePath = renderContext->makeRenderPath(make_oval({0, 0, 7, 8}),
-                                                      FillRule::nonZero);
+    auto drawablePath =
+        renderContext->makeRenderPath(make_oval({-100, -100, 700, 800}),
+                                      FillRule::nonZero);
 
     auto paint = renderContext->makeRenderPaint();
     paint->color(0xffffffff);
@@ -555,7 +602,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == clipID);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 0, 0, 1, 5);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 0, 0, 100, 500);
     CHECK(renderer.getClipRectMatrix() == Mat2D());
 
     // Doubly nested rectangles get combined into a single clipRect.
@@ -567,7 +614,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == clipID);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1, 0, 1, 4);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1, 0, 20, 40);
     CHECK(renderer.getClipRectMatrix() == Mat2D());
 
     // Nested rectangles don't get combined if their matrices are incompatible.
@@ -583,7 +630,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     clipID = renderContext->getClipContentID();
     renderer.restore();
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1, 0, 1, 4);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1, 0, 20, 40);
     CHECK(renderer.getClipRectMatrix() == Mat2D());
 
     // Nested rectangles DO get combined if their matrices ARE compatible.
@@ -598,7 +645,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == clipID);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 3, 8, 1, 4);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 3, 8, 20, 40);
     CHECK(renderer.getClipRectMatrix() == Mat2D());
     renderer.restore();
 
@@ -616,7 +663,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == 0);
     CHECK(renderer.hasClipRect());
-    CHECK(renderer.getClipRect() == AABB{0, 0, 1, 5});
+    CHECK(renderer.getClipRect() == AABB{0, 0, 100, 500});
     CHECK(renderer.getClipRectMatrix() == m);
     renderer.clipPath(rectB.get());
     renderer.drawPath(drawablePath.get(), paint.get());
@@ -626,7 +673,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == 0);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1.9f, 0, 1, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 1.9f, 0, 20, 39.9f);
     CHECK(renderer.getClipRectMatrix() == m);
     renderer.scale(10, 2);
     renderer.clipPath(rectB.get());
@@ -638,7 +685,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.clipPath(rectB.get());
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 1.9f, 1, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 1.9f, 10.9f, 39.9f);
     CHECK(renderer.getClipRectMatrix() == m);
     CHECK(renderContext->getClipContentID() == 0);
     renderer.rotate(math::PI);
@@ -646,7 +693,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.clipPath(rectB.get());
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 15.9f, 1, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 1.9f, 10.9f, 17.9f);
     CHECK(renderer.getClipRectMatrix() == m);
     CHECK(renderContext->getClipContentID() == 0);
     renderer.rotate(-math::PI / 2);
@@ -654,7 +701,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == 0);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 15.9f, -9.1f, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 1.9f, -9.1f, 17.9f);
     CHECK(renderer.getClipRectMatrix() == m);
 
     // And flips!
@@ -663,7 +710,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == 0);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 17.9f, -9.1f, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 10.9f, 17.9f, -9.1f, 17.9f);
     CHECK(renderer.getClipRectMatrix() == m);
     renderer.scale(-1, -1);
     renderer.translate(2, 0);
@@ -671,7 +718,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() == 0);
     CHECK(renderer.hasClipRect());
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 30.9f, 17.9f, -9.1f, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 30.9f, 17.9f, -9.1f, 17.9f);
     CHECK(renderer.getClipRectMatrix() == m);
 
     // ... but once the matrices become incompatible, we can't intersect with
@@ -680,7 +727,7 @@ TEST_CASE("clip-rects", "[RiveRenderer]")
     renderer.clipPath(rectB.get());
     renderer.drawPath(drawablePath.get(), paint.get());
     CHECK(renderContext->getClipContentID() != 0);
-    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 30.9f, 17.9f, -9.1f, 3.9f);
+    CHECK_AABB_NEARLY_EQUAL(renderer.getClipRect(), 30.9f, 17.9f, -9.1f, 17.9f);
     CHECK(renderer.getClipRectMatrix() == m);
 
     renderer.restore();
@@ -1264,6 +1311,200 @@ TEST_CASE("image-sample-option-conversions", "[RiveRenderer]")
     CHECK(wrapy(mirrorClampMipNearestOptionsKey) == rive::ImageWrap::clamp);
     CHECK(filter(mirrorClampMipNearestOptionsKey) ==
           rive::ImageFilter::nearest);
+}
+
+TEST_CASE("image draws use scoped materials without caching shared paths",
+          "[RiveRenderer]")
+{
+    std::unique_ptr<RenderContext> renderContext =
+        RenderContextNULL::MakeContext();
+    auto desc = s_frameDescriptor;
+    desc.disableRasterOrdering = true;
+    renderContext->beginFrame(desc);
+
+    RiveRenderer renderer(renderContext.get());
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold,
+                                AABB(0, 0, 100, 100),
+                                0);
+
+    auto makeRectPath = []() {
+        return make_rcp<RiveRenderPath>(FillRule::nonZero,
+                                        make_rect({0, 0, 100, 100}));
+    };
+    auto vectorPath = makeRectPath();
+    RiveRenderPaint vectorPaint;
+    vectorPaint.color(0xffffffff);
+    renderer.drawPath(vectorPath.get(), &vectorPaint);
+    CHECK(vectorPath->hasSurfaceMaterialBinding());
+
+    auto inheritedImagePath = makeRectPath();
+    RiveRenderPaint imagePaint;
+    imagePaint.image(make_rcp<Texture>(100, 100), 1);
+    renderer.drawPath(inheritedImagePath.get(), &imagePaint);
+    CHECK_FALSE(inheritedImagePath->hasSurfaceMaterialBinding());
+
+    auto excludedImagePath = makeRectPath();
+    renderer.save();
+    renderer.setSurfaceMaterialOverride(SurfaceMaterial::none);
+    renderer.drawPath(excludedImagePath.get(), &imagePaint);
+    renderer.restore();
+    CHECK_FALSE(excludedImagePath->hasSurfaceMaterialBinding());
+
+    auto rainbowImagePath = makeRectPath();
+    renderer.save();
+    renderer.setSurfaceMaterialOverride(SurfaceMaterial::rainbow);
+    renderer.drawPath(rainbowImagePath.get(), &imagePaint);
+    renderer.restore();
+    CHECK_FALSE(rainbowImagePath->hasSurfaceMaterialBinding());
+
+    auto target = renderContext->static_impl_cast<RenderContextNULL>()
+                      ->makeRenderTarget(desc.renderTargetWidth,
+                                         desc.renderTargetHeight);
+    renderContext->flush({.renderTarget = target.get()});
+}
+
+// Inspect the material payload sent to shaders without a GPU backend.
+class MaterialCaptureContext : public RenderContextNULL
+{
+public:
+    std::vector<std::array<float, 8>> materials;
+
+    void* mapPaintAuxBuffer(size_t sizeInBytes) override
+    {
+        void* data = RenderContextNULL::mapPaintAuxBuffer(sizeInBytes);
+        m_paintAuxBytes = static_cast<const uint8_t*>(data);
+        return data;
+    }
+
+    void flush(const FlushDescriptor& desc) override
+    {
+        // Path ID zero is reserved; firstPaintAux is a record offset.
+        for (uint32_t pathID = 1; pathID < desc.pathCount; ++pathID)
+        {
+            std::array<float, 8> material;
+            memcpy(material.data(),
+                   m_paintAuxBytes + (desc.firstPaintAux + pathID) * sizeof(PaintAuxData) +
+                       PAINT_AUX_MATERIAL_MATRIX_OFFSET * 4 * sizeof(float),
+                   sizeof(material));
+            materials.push_back(material);
+        }
+    }
+
+private:
+    const uint8_t* m_paintAuxBytes = nullptr;
+};
+
+TEST_CASE("outside strokes retain material coordinates across poses",
+          "[RiveRenderer][SurfaceMaterial]")
+{
+    RenderContext context(std::make_unique<MaterialCaptureContext>());
+    auto* capture = context.static_impl_cast<MaterialCaptureContext>();
+    auto target = capture->makeRenderTarget(100, 100);
+    RiveRenderer renderer(&context);
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold, AABB(0, 0, 100, 100), 0);
+    auto path = make_rcp<RiveRenderPath>(FillRule::clockwise, make_rect({20, 20, 60, 60}));
+    RiveRenderPaint paint;
+    paint.color(0xffffffff);
+    paint.style(RenderPaintStyle::stroke);
+    paint.thickness(8);
+    paint.strokePosition(StrokePosition::outside);
+
+    for (float shift : {0.f, 10.f})
+    {
+        context.beginFrame(s_frameDescriptor);
+        capture->materials.clear();
+        renderer.save();
+        renderer.translate(shift, 0);
+        renderer.drawPath(path.get(), &paint);
+        renderer.restore();
+        context.flush({.renderTarget = target.get()});
+
+        size_t materialDrawCount = 0;
+        for (const auto& data : capture->materials)
+        {
+            if (data[6] == 0) // Clip paths have no material.
+            {
+                continue;
+            }
+            ++materialDrawCount;
+            CHECK(data[6] == static_cast<float>(SurfaceMaterial::gold));
+            Mat2D matrix(data[0], data[1], data[2], data[3], data[4], data[5]);
+            Vec2D uv = matrix * Vec2D{18 + shift, 40};
+            CHECK(uv.x == Approx(.18f));
+            CHECK(uv.y == Approx(.4f));
+        }
+        CHECK(materialDrawCount > 0);
+    }
+}
+
+TEST_CASE("luminance masks do not inherit surface materials", "[RiveRenderer][SurfaceMaterial]")
+{
+    RenderContext context(std::make_unique<MaterialCaptureContext>());
+    auto* capture = context.static_impl_cast<MaterialCaptureContext>();
+    auto target = capture->makeRenderTarget(100, 100);
+    RiveRenderer renderer(&context);
+    renderer.setSurfaceMaterial(SurfaceMaterial::gold, AABB(0, 0, 100, 100), 0);
+    auto image = make_rcp<RiveRenderImage>(make_rcp<Texture>(100, 100));
+
+    for (LayerMaskMode mode : {LayerMaskMode::luminance, LayerMaskMode::invertedLuminance})
+    {
+        context.beginFrame(s_frameDescriptor);
+        REQUIRE(context.frameSupportsLayerMask());
+        capture->materials.clear();
+        renderer.applyLayerMask(image.get(), ImageSampler::LinearClamp(), mode);
+        context.flush({.renderTarget = target.get()});
+        REQUIRE_FALSE(capture->materials.empty());
+        for (const auto& data : capture->materials)
+        {
+            CHECK(data[6] == 0);
+        }
+    }
+
+    // Excluding masks must not clear the enclosing material scope.
+    context.beginFrame(s_frameDescriptor);
+    capture->materials.clear();
+    renderer.drawImage(image.get(), ImageSampler::LinearClamp(), BlendMode::srcOver, 1);
+    context.flush({.renderTarget = target.get()});
+    REQUIRE_FALSE(capture->materials.empty());
+    for (const auto& data : capture->materials)
+    {
+        CHECK(data[6] == static_cast<float>(SurfaceMaterial::gold));
+    }
+}
+
+TEST_CASE("cached pixel bounds match transformed path points", "[RiveRenderer][PixelBounds]")
+{
+    RiveRenderPath path;
+    const Mat2D transforms[] = {
+        Mat2D(),
+        Mat2D::fromScaleAndTranslation(2, 3, .25f, -.75f),
+        Mat2D::fromScaleAndTranslation(-2, -3, .25f, -.75f),
+        Mat2D::fromScaleAndTranslation(0, -3, .25f, -.75f),
+        Mat2D(0, 1, -1, 0, .25f, -.75f),
+        Mat2D(2, .5f, -.5f, 3, .25f, -.75f),
+    };
+    for (int mutation = 0; mutation < 4; ++mutation)
+    {
+        if (mutation == 1)
+        {
+            path.moveTo(-7, 2);
+            path.cubicTo(10, -20, -30, 40, 15, 8);
+            path.close();
+        }
+        else if (mutation == 2)
+        {
+            path.lineTo(50, -60);
+        }
+        else if (mutation == 3)
+        {
+            path.rewind();
+        }
+        for (const auto& matrix : transforms)
+        {
+            CHECK(path.calculatePixelBounds(matrix, {}, 0) ==
+                  matrix.mapBoundingBox(path.getRawPath().points()).roundOut());
+        }
+    }
 }
 
 // Ensure the renderer gracefully handles a null texture within a

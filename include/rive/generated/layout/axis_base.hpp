@@ -13,20 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 492;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case AxisBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t offsetPropertyKey = 675;
@@ -44,8 +30,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     inline bool normalized() const { return m_Normalized; }
@@ -55,8 +43,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(normalizedPropertyKey, &m_Normalized, &value);
         m_Normalized = value;
-        normalizedChanged();
+        notifyPropertyChanged(normalizedPropertyKey);
     }
 
     void copy(const AxisBase& object)
@@ -82,7 +71,9 @@ public:
 
 protected:
     virtual void offsetChanged() {}
-    virtual void normalizedChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/layout/axis_ext.inl"
+#endif
 };
 } // namespace rive
 

@@ -1,6 +1,7 @@
 #ifndef _RIVE_ELASTIC_SCROLL_PHYSICS_HPP_
 #define _RIVE_ELASTIC_SCROLL_PHYSICS_HPP_
 #include "rive/generated/constraints/scrolling/elastic_scroll_physics_base.hpp"
+#include <memory>
 #include <stdio.h>
 namespace rive
 {
@@ -31,6 +32,15 @@ public:
 
     bool isRunning() { return m_isRunning; }
     float target() { return m_target; }
+    float current() { return m_current; }
+    // Content resized above moves the far end with it; the near end stays.
+    void shift(float delta)
+    {
+        m_target += delta;
+        m_current += delta;
+        m_snapTarget += delta;
+        m_runRangeMin += delta;
+    }
     float clamp(float rangeMin, float rangeMax, float value);
     void run(float acceleration,
              float rangeMin,
@@ -49,15 +59,16 @@ public:
 class ElasticScrollPhysics : public ElasticScrollPhysicsBase
 {
 private:
-    ElasticScrollPhysicsHelper* m_physicsX;
-    ElasticScrollPhysicsHelper* m_physicsY;
+    std::unique_ptr<ElasticScrollPhysicsHelper> m_physicsX;
+    std::unique_ptr<ElasticScrollPhysicsHelper> m_physicsY;
 
 public:
-    ~ElasticScrollPhysics();
     bool enabled() override
     {
         return m_physicsX != nullptr || m_physicsY != nullptr;
     }
+    // reset() destroys the helpers, and only prepare() rebuilds them.
+    bool isPrimed() override { return enabled(); }
     bool isRunning() override
     {
         return (m_physicsX != nullptr && m_physicsX->isRunning()) ||
@@ -74,13 +85,14 @@ public:
     bool hasTargetX() override { return m_physicsX != nullptr; }
     bool hasTargetY() override { return m_physicsY != nullptr; }
     Vec2D advance(float elapsedSeconds) override;
+    void shift(Vec2D delta) override;
     Vec2D clamp(Vec2D rangeMin, Vec2D rangeMax, Vec2D value) override;
     void run(Vec2D rangeMin,
              Vec2D rangeMax,
              Vec2D value,
              std::vector<Vec2D> snappingPoints,
-             float contentSize,
-             float viewportSize) override;
+             Vec2D contentSize,
+             Vec2D viewportSize) override;
     void prepare(DraggableConstraintDirection dir) override;
     void reset() override;
 

@@ -1,6 +1,7 @@
 #ifndef _RIVE_SCRIPTED_DRAWABLE_HPP_
 #define _RIVE_SCRIPTED_DRAWABLE_HPP_
 #include "rive/generated/scripted/scripted_drawable_base.hpp"
+#include "rive/animation/listener_invocation.hpp"
 #include "rive/animation/state_machine_instance.hpp"
 #include "rive/advancing_component.hpp"
 #include "rive/assets/script_asset.hpp"
@@ -21,7 +22,8 @@ class ScriptedDrawable : public ScriptedDrawableBase,
 {
 public:
 #ifdef WITH_RIVE_SCRIPTING
-    bool scriptInit(ScriptingVM* vm) override;
+    void didHydrateScriptInputs() override;
+    void didReinit() override;
 #endif
     void draw(Renderer* renderer) override;
     void update(ComponentDirt value) override;
@@ -56,10 +58,34 @@ public:
     bool worldToLocal(Vec2D world, Vec2D* local);
     void markNeedsUpdate() override;
     bool willDraw() override;
+#ifdef WITH_RIVE_SCRIPTING
+    bool gamepadDispatch(const ListenerInvocation& invocation);
+#endif
     Component* component() override { return this; }
+    bool keyInput(Key key,
+                  KeyModifiers modifiers,
+                  bool isPressed,
+                  bool isRepeat);
+    bool textInput(const std::string& text);
+    // Re-arm the advance loop after an input event is dispatched to the
+    // script; the handler may have changed state (e.g. fired a trigger on a
+    // scripted artboard) that only the next scriptAdvance can consume.
+    void wakeAdvance();
+    /// Whether a scroll gesture this script claimed is still in flight.
+    bool scrollLatched() const { return m_scrollLatched; }
+    void scrollLatched(bool value)
+    {
+        m_scrollLatched = value;
+        m_scrollIdleSeconds = 0;
+    }
 
 private:
     bool m_isAdvanceActive = true;
+    bool m_scrollLatched = false;
+    float m_scrollIdleSeconds = 0;
+    // One zero step after a reinit so advance driven content, like gpu
+    // canvas fills, re-records while paused.
+    bool m_forceAdvance = false;
 };
 
 class HitScriptedDrawable : public HitComponent
@@ -78,6 +104,7 @@ public:
     }
 
     bool hitTest(Vec2D position) const override { return true; }
+    bool hitTestBounded(Vec2D position) const override;
     void prepareEvent(Vec2D position,
                       ListenerType hitType,
                       int pointerId) override
@@ -87,7 +114,22 @@ public:
                            ListenerType hitType,
                            bool canHit,
                            float timeStamp,
-                           int pointerId) override;
+                           int pointerId,
+                           PointerButton button) override;
+    HitResult processGamepadInvocation(
+        const ListenerInvocation& invocation,
+        ScriptedDrawable* alreadyDispatched) override;
+    bool hasScrollTarget(Vec2D position) override;
+    bool wantsScroll(Vec2D position, const ScrollEvent& event) override
+    {
+        return hasScrollTarget(position);
+    }
+    bool scrollGestureActive() override;
+    void cancelScroll() override { m_drawable->scrollLatched(false); }
+    HitResult processScroll(Vec2D position,
+                            const ScrollEvent& event,
+                            float timeStamp,
+                            int pointerId) override;
 };
 } // namespace rive
 

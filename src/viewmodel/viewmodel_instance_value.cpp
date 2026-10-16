@@ -3,13 +3,35 @@
 #include <array>
 #include <algorithm>
 
+#include "rive/artboard.hpp"
 #include "rive/viewmodel/viewmodel_instance.hpp"
 #include "rive/viewmodel/viewmodel_instance_value.hpp"
+#include "rive/viewmodel/viewmodel_property_symbol_list_index.hpp"
+#include "rive/importers/artboard_importer.hpp"
 #include "rive/importers/viewmodel_instance_importer.hpp"
 #include "rive/data_bind/data_bind.hpp"
 #include "rive/refcnt.hpp"
 
 using namespace rive;
+
+StatusCode ViewModelInstanceValue::onAddedDirty(CoreContext* context)
+{
+    StatusCode result = Super::onAddedDirty(context);
+    if (result != StatusCode::Ok)
+    {
+        return result;
+    }
+
+    // If parent is a ViewModelInstance, register with it.
+    // This handles stateful ViewModelInstances (children of NestedArtboard)
+    // where values are cloned separately during artboard cloning.
+    if (parent() != nullptr && parent()->is<ViewModelInstance>())
+    {
+        parent()->as<ViewModelInstance>()->addValue(this);
+    }
+
+    return StatusCode::Ok;
+}
 
 StatusCode ViewModelInstanceValue::import(ImportStack& importStack)
 {
@@ -22,44 +44,76 @@ StatusCode ViewModelInstanceValue::import(ImportStack& importStack)
     }
     viewModelInstanceImporter->addValue(this);
 
-    return Super::import(importStack);
+    // If we're inside an artboard context, import through Component so we're
+    // added to the artboard's object list and can be resolved by ID.
+    auto artboardImporter =
+        importStack.latest<ArtboardImporter>(ArtboardBase::typeKey);
+    if (artboardImporter != nullptr)
+    {
+        return Super::import(importStack);
+    }
+
+    return Core::import(importStack);
 }
 
-bool ViewModelInstanceValue::hasChanged()
+void ViewModelInstanceValue::registerSymbol()
 {
-    return m_changeFlags & ValueFlags::valueChanged;
+
+    if (m_ViewModelProperty != nullptr && m_viewModelInstance != nullptr)
+    {
+        if (m_ViewModelProperty->is<ViewModelPropertySymbolListIndex>())
+        {
+            m_viewModelInstance->propertyValue(SymbolType::itemIndex, this);
+        }
+        else if ((SymbolType)m_ViewModelProperty->symbolTypeValue() !=
+                 SymbolType::none)
+        {
+            m_viewModelInstance->propertyValue(
+                (SymbolType)m_ViewModelProperty->symbolTypeValue(),
+                this);
+        }
+    }
 }
 
 void ViewModelInstanceValue::viewModelProperty(ViewModelProperty* value)
 {
     m_ViewModelProperty = value;
+    registerSymbol();
 }
 ViewModelProperty* ViewModelInstanceValue::viewModelProperty()
 {
     return m_ViewModelProperty;
 }
 
-void ViewModelInstanceValue::addDependent(Dirtyable* value)
+void ViewModelInstanceValue::addDependent(ViewModelValueDependent* value)
 {
     m_DependencyHelper.addDependent(value);
 }
 
-void ViewModelInstanceValue::removeDependent(Dirtyable* value)
+void ViewModelInstanceValue::removeDependent(ViewModelValueDependent* value)
 {
     m_DependencyHelper.removeDependent(value);
 }
 
 void ViewModelInstanceValue::addDirt(ComponentDirt value)
 {
-    m_DependencyHelper.addDirt(value);
+    m_DependencyHelper.addDirtToDependents(value);
 }
 
 void ViewModelInstanceValue::setRoot(rcp<ViewModelInstance> viewModelInstance)
 {
-    m_DependencyHelper.dependecyRoot(&viewModelInstance);
+    // No-op. Previously stored &viewModelInstance (address of a stack-local
+    // parameter) into DependencyHelper::m_dependecyRoot. The stored pointer
+    // dangled the moment this function returned but was never dereferenced
+    // because onComponentDirty is never called on a ViewModelInstanceValue's
+    // dependents — so the latent bug never manifested. The CRTP refactor
+    // dropped the field entirely; the method stays for ABI compatibility
+    // with overrides in subclasses.
+    (void)viewModelInstance;
 }
 
 std::string ViewModelInstanceValue::defaultName = "";
+std::atomic<uint64_t> ViewModelInstanceValue::s_changeSequence{0};
 
 const std::string& ViewModelInstanceValue::name() const
 {
@@ -70,10 +124,10 @@ const std::string& ViewModelInstanceValue::name() const
     return defaultName;
 }
 
-void ViewModelInstanceValue::advanced()
+void ViewModelInstanceValue::viewModelInstance(ViewModelInstance* value)
 {
-    m_usedLayers.clear();
-    m_changeFlags &= ~ValueFlags::valueChanged;
+    m_viewModelInstance = value;
+    registerSymbol();
 }
 
 void ViewModelInstanceValue::addDelegate(
@@ -86,18 +140,17 @@ void ViewModelInstanceValue::addDelegate(
 void ViewModelInstanceValue::removeDelegate(
     ViewModelInstanceValueDelegate* delegate)
 {
-    auto itr = std::find(m_delegates.begin(), m_delegates.end(), delegate);
-    if (itr == m_delegates.end())
+    auto sizeBefore = m_delegates.size();
+    m_delegates.eraseAll(delegate);
+    if (m_delegates.size() != sizeBefore)
     {
-        return;
+        m_changeFlags |= ValueFlags::delegatesChanged;
     }
-    m_delegates.erase(itr);
-    m_changeFlags |= ValueFlags::delegatesChanged;
 }
 
 bool ViewModelInstanceValue::suppressDelegation()
 {
-    if (m_changeFlags & ValueFlags::delegating)
+    if (enums::is_flag_set(m_changeFlags, ValueFlags::delegating))
     {
         return false;
     }
@@ -112,18 +165,29 @@ void ViewModelInstanceValue::restoreDelegation()
 
 void ViewModelInstanceValue::onValueChanged()
 {
-    m_changeFlags |= ValueFlags::valueChanged;
+    // One sequence for every value, so a state machine can tell the changes
+    // made since its last transition search from the rest with one number.
+    // Atomic because files on other threads change their values too.
+    m_changeSequence = nextChangeSequence();
 
-    if (m_changeFlags & ValueFlags::delegatesChanged)
+    // Common case: no delegates ever registered. Skip the snapshot+iterate
+    // logic entirely.
+    if (m_delegates.empty())
+    {
+        return;
+    }
+
+    if (enums::is_flag_set(m_changeFlags, ValueFlags::delegatesChanged))
     {
         m_delegatesCopy.clear();
-        std::copy(m_delegates.begin(),
-                  m_delegates.end(),
-                  std::back_inserter(m_delegatesCopy));
+        for (auto* d : m_delegates)
+        {
+            m_delegatesCopy.push_back(d);
+        }
         m_changeFlags &= ~ValueFlags::delegatesChanged;
     }
 
-    if (m_changeFlags & ValueFlags::delegating)
+    if (enums::is_flag_set(m_changeFlags, ValueFlags::delegating))
     {
         // We're already calling delegates for this value change, changing the
         // value in a delegate will not report the change.
@@ -135,7 +199,7 @@ void ViewModelInstanceValue::onValueChanged()
 
     // Iterate over a copy of the delegates in case delegates get changed in
     // valueChanged callbacks.
-    for (auto delegate : m_delegatesCopy)
+    for (auto* delegate : m_delegatesCopy)
     {
         delegate->valueChanged();
     }

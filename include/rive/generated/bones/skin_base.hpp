@@ -12,21 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 43;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case SkinBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t xxPropertyKey = 104;
@@ -52,8 +37,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xxPropertyKey, &m_Xx, &value);
         m_Xx = value;
-        xxChanged();
+        notifyPropertyChanged(xxPropertyKey);
     }
 
     inline float yx() const { return m_Yx; }
@@ -63,8 +49,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yxPropertyKey, &m_Yx, &value);
         m_Yx = value;
-        yxChanged();
+        notifyPropertyChanged(yxPropertyKey);
     }
 
     inline float xy() const { return m_Xy; }
@@ -74,8 +61,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xyPropertyKey, &m_Xy, &value);
         m_Xy = value;
-        xyChanged();
+        notifyPropertyChanged(xyPropertyKey);
     }
 
     inline float yy() const { return m_Yy; }
@@ -85,8 +73,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yyPropertyKey, &m_Yy, &value);
         m_Yy = value;
-        yyChanged();
+        notifyPropertyChanged(yyPropertyKey);
     }
 
     inline float tx() const { return m_Tx; }
@@ -96,8 +85,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(txPropertyKey, &m_Tx, &value);
         m_Tx = value;
-        txChanged();
+        notifyPropertyChanged(txPropertyKey);
     }
 
     inline float ty() const { return m_Ty; }
@@ -107,8 +97,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(tyPropertyKey, &m_Ty, &value);
         m_Ty = value;
-        tyChanged();
+        notifyPropertyChanged(tyPropertyKey);
     }
 
     Core* clone() const override;
@@ -150,12 +141,9 @@ public:
     }
 
 protected:
-    virtual void xxChanged() {}
-    virtual void yxChanged() {}
-    virtual void xyChanged() {}
-    virtual void yyChanged() {}
-    virtual void txChanged() {}
-    virtual void tyChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/bones/skin_ext.inl"
+#endif
 };
 } // namespace rive
 

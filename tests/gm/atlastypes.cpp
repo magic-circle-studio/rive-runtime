@@ -22,8 +22,25 @@ using namespace rive;
 using namespace rivegm;
 
 // Validate all our atlas fallbacks by rendering feathered strokes and fills
-// with every AtlasType.
-DEF_SIMPLE_GM_WITH_CLEAR_COLOR(atlastypes, 0x80000000, 1600, 1600, renderer)
+// with every FeatherAtlasRenderType.
+class AtlasTypesGM : public GM
+{
+public:
+    AtlasTypesGM() : GM(1600, 1600) {}
+
+    ColorInt clearColor() const override { return 0x80000000; }
+
+    void updateFrameOptions(TestingWindow::FrameOptions* options) const override
+    {
+        // Reduce this to test the canvas 2D renderer's atlas flush
+        options->maxCanvasAtlasSize = 1024;
+    }
+
+    void onDraw(Renderer* renderer) override;
+};
+GMREGISTER(atlastypes, return new AtlasTypesGM)
+
+void AtlasTypesGM::onDraw(Renderer* renderer)
 {
     gpu::RenderContext* renderContext = TestingWindow::Get()->renderContext();
     gpu::RenderContext::FrameDescriptor frameDescriptor;
@@ -55,6 +72,11 @@ DEF_SIMPLE_GM_WITH_CLEAR_COLOR(atlastypes, 0x80000000, 1600, 1600, renderer)
     starStroke->style(RenderPaintStyle::stroke);
     starStroke->thickness(.05f);
 
+#ifndef RIVE_TOOLS_NO_GL
+    auto originalFeatherAtlasRenderType =
+        gpu::RenderContextGLImpl::FeatherAtlasRenderType::r16f;
+#endif
+
     for (int i = 0; i < 6; ++i)
     {
         if (renderContext != nullptr)
@@ -64,9 +86,30 @@ DEF_SIMPLE_GM_WITH_CLEAR_COLOR(atlastypes, 0x80000000, 1600, 1600, renderer)
                     TestingWindow::Get()->renderContextGLImpl())
             {
                 TestingWindow::Get()->flushPLSContext();
-                glImpl->testingOnly_resetAtlasDesiredType(
-                    renderContext,
-                    static_cast<gpu::RenderContextGLImpl::AtlasType>(i));
+                auto desiredRenderType = static_cast<
+                    gpu::RenderContextGLImpl::FeatherAtlasRenderType>(i);
+                if (desiredRenderType >=
+#ifndef RIVE_ANDROID
+                    gpu::RenderContextGLImpl::FeatherAtlasRenderType::
+                        r8PixelLocalStorageEXT
+#else
+                    gpu::RenderContextGLImpl::FeatherAtlasRenderType::
+                        r32uiPixelLocalStorageANGLE
+#endif
+                )
+                {
+                    desiredRenderType = static_cast<
+                        gpu::RenderContextGLImpl::FeatherAtlasRenderType>(i +
+                                                                          1);
+                }
+                auto lastAtlasRenderType =
+                    glImpl->testingOnly_resetFeatherAtlasDesiredRenderType(
+                        renderContext,
+                        desiredRenderType);
+                if (i == 0)
+                {
+                    originalFeatherAtlasRenderType = lastAtlasRenderType;
+                }
                 renderContext->beginFrame(frameDescriptor);
             }
 #endif
@@ -79,16 +122,20 @@ DEF_SIMPLE_GM_WITH_CLEAR_COLOR(atlastypes, 0x80000000, 1600, 1600, renderer)
         text.render(renderer);
 
         Rand rando;
-        for (size_t i = 0; i < 30; ++i)
+        for (size_t j = 0; j < 30; ++j)
         {
             Path star;
             star->fillRule(FillRule::clockwise);
-            rivegm::path_add_star(star,
-                                  rando.u32(2, 4) * 2 + 1,
-                                  rando.f32(),
-                                  1);
+            // Sequence Rand calls into named locals — C++ doesn't specify
+            // argument evaluation order, so passing them directly causes the
+            // draws to interleave differently across compilers.
+            uint32_t numPts = rando.u32(2, 4) * 2 + 1;
+            float phase = rando.f32();
+            rivegm::path_add_star(star, numPts, phase, 1);
             renderer->save();
-            renderer->translate(rando.f32(-50, 750), rando.f32(-50, 350));
+            float tx = rando.f32(-50, 750);
+            float ty = rando.f32(-50, 350);
+            renderer->translate(tx, ty);
             float s = rando.f32(50, 100);
             renderer->scale(s, s);
             float f = rando.f32(.1f, .5f);
@@ -103,15 +150,15 @@ DEF_SIMPLE_GM_WITH_CLEAR_COLOR(atlastypes, 0x80000000, 1600, 1600, renderer)
 
     if (renderContext != nullptr)
     {
-        // Restore the most ideal AtlasType for future tests.
+        // Restore the most ideal FeatherAtlasRenderType for future tests.
 #ifndef RIVE_TOOLS_NO_GL
         if (gpu::RenderContextGLImpl* glImpl =
                 TestingWindow::Get()->renderContextGLImpl())
         {
             TestingWindow::Get()->flushPLSContext();
-            glImpl->testingOnly_resetAtlasDesiredType(
+            glImpl->testingOnly_resetFeatherAtlasDesiredRenderType(
                 renderContext,
-                gpu::RenderContextGLImpl::AtlasType::r32f);
+                originalFeatherAtlasRenderType);
             renderContext->beginFrame(frameDescriptor);
         }
 #endif

@@ -6,10 +6,20 @@
 #include "rive/nested_animation.hpp"
 #include "rive/scene.hpp"
 
+#include <memory>
+#include <unordered_map>
+
 namespace rive
 {
 class LinearAnimation;
 class NestedEventNotifier;
+class InterpolatingKeyFrame;
+class ScriptedInterpolator;
+class DataBind;
+class KeyFrame;
+class BindableProperty;
+class BlendAccumulator;
+struct LAIBindingExtras;
 
 class LinearAnimationInstance : public Scene, public NestedEventNotifier
 {
@@ -29,6 +39,27 @@ public:
 
     // Returns a pointer to the instance's animation
     const LinearAnimation* animation() const { return m_animation; }
+
+    // Returns the per-instance holder receiving the data-bound value for the
+    // given keyframe in this animation instance, lazily building it on first
+    // request. On first use for a keyframe that has a source data bind (see
+    // Artboard::keyFrameSourceBind), it clones that bind onto a freshly created
+    // BindableProperty holder, parks the clone on the artboard's data-bind
+    // container (advanced with the rest each frame), and caches the holder.
+    // Returns nullptr when the keyframe is not data bound; keyframes then fall
+    // back to their authored value in effectiveValue(context). This makes data
+    // binding work for ANY playback path (state machine, joystick, nested,
+    // standalone), mirroring the scripted-interpolator mechanism below. Holders
+    // and clones are owned by this LAI and torn down in the destructor.
+    BindableProperty* keyFrameValueHolder(const KeyFrame* keyframe) const;
+
+    // Where this instance's number and color writes go instead of straight to
+    // the objects, when a blend state owns it; see BlendAccumulator.
+    BlendAccumulator* blendAccumulator() const { return m_blendAccumulator; }
+    void blendAccumulator(BlendAccumulator* value)
+    {
+        m_blendAccumulator = value;
+    }
 
     // Returns the current point in time at which this instance has advance
     // to
@@ -62,8 +93,19 @@ public:
     // other animations applied to the artboard.
     void apply(float mix = 1.0f) const
     {
-        m_animation->apply(m_artboardInstance, m_time, mix);
+        m_animation->apply(m_artboardInstance, m_time, mix, this);
     }
+
+    // Returns a per-(this LAI, keyframe) stateful clone of the given
+    // ScriptedInterpolator, lazily creating it on first call. Returns nullptr
+    // when scripting is disabled or the clone cannot be vended; callers
+    // should fall back to the shared template (which already degrades to
+    // identity/linear when its Lua side isn't ready). Time-seeking via
+    // `time(float)` and `reset()` intentionally does NOT clear the cache —
+    // statefulness is the whole point.
+    ScriptedInterpolator* statefulInterpolator(
+        const InterpolatingKeyFrame* keyframe,
+        const ScriptedInterpolator* shared) const;
 
     // Set when the animation is advanced, true if the animation has stopped
     // (oneShot), reached the end (loop), or changed direction (pingPong)
@@ -109,6 +151,7 @@ public:
     void reportEvent(Event* event, float secondsDelay = 0.0f) override;
 
 private:
+    BlendAccumulator* m_blendAccumulator = nullptr;
     const LinearAnimation* m_animation = nullptr;
     float m_time;
     float m_speedDirection;
@@ -118,8 +161,26 @@ private:
 
     // float because it gets multiplied with other floats
     float m_direction;
-    bool m_didLoop;
+    // Initialized here because the primary ctor does not set it; didLoop()
+    // is readable before the first advance().
+    bool m_didLoop = false;
     int m_loopValue = -1;
+
+    // The four data-binding / scripted-interpolator containers this instance
+    // used to hold inline (80 B, and 40 vs 56 of it depending on the standard
+    // library) now live in one heap struct, allocated on first use. See
+    // linear_animation_instance_extras.hpp for what is in it and why. `mutable`
+    // because both the scripted-interpolator and keyframe-value caches populate
+    // from the const apply() path. Deliberately not copied by the copy ctor —
+    // a copied LAI starts with an empty cluster.
+    mutable std::unique_ptr<LAIBindingExtras> m_bindingExtras;
+
+    // Allocates the cold cluster on first use and returns it.
+    LAIBindingExtras& ensureBindingExtras() const;
+
+    // Lazily clones the source bind onto a holder and parks it on the artboard.
+    BindableProperty* buildKeyFrameValueHolder(const KeyFrame* keyframe,
+                                               DataBind* sourceBind) const;
 };
 } // namespace rive
 #endif

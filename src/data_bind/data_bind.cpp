@@ -1,5 +1,6 @@
 #include "rive/data_bind/data_bind.hpp"
 #include "rive/artboard.hpp"
+#include "rive/layout_component.hpp"
 #include "rive/data_bind_flags.hpp"
 #include "rive/generated/core_registry.hpp"
 #include "rive/data_bind/bindable_property_artboard.hpp"
@@ -12,10 +13,13 @@
 #include "rive/data_bind/bindable_property_boolean.hpp"
 #include "rive/data_bind/bindable_property_trigger.hpp"
 #include "rive/data_bind/bindable_property_integer.hpp"
+#include "rive/data_bind/bindable_property_viewmodel.hpp"
 #include "rive/data_bind/data_bind_container.hpp"
 #include "rive/data_bind/context/context_value.hpp"
 #include "rive/data_bind/context/context_value_any.hpp"
 #include "rive/data_bind/context/context_value_asset_image.hpp"
+#include "rive/data_bind/context/context_value_asset_font.hpp"
+#include "rive/data_bind/context/context_value_asset_blob.hpp"
 #include "rive/data_bind/context/context_value_artboard.hpp"
 #include "rive/data_bind/context/context_value_boolean.hpp"
 #include "rive/data_bind/context/context_value_number.hpp"
@@ -25,15 +29,22 @@
 #include "rive/data_bind/context/context_value_color.hpp"
 #include "rive/data_bind/context/context_value_trigger.hpp"
 #include "rive/data_bind/context/context_value_symbol_list_index.hpp"
+#include "rive/data_bind/context/context_value_viewmodel.hpp"
 #include "rive/data_bind/data_values/data_type.hpp"
 #include "rive/data_bind/converters/data_converter.hpp"
 #include "rive/data_bind/converters/formula/formula_token.hpp"
+#include "rive/constraints/scrolling/scroll_constraint.hpp"
 #include "rive/animation/transition_viewmodel_condition.hpp"
 #include "rive/animation/state_machine.hpp"
 #include "rive/artboard_component_list.hpp"
+#include "rive/generated/node_base.hpp"
 #include "rive/importers/artboard_importer.hpp"
 #include "rive/importers/state_machine_importer.hpp"
 #include "rive/importers/backboard_importer.hpp"
+#include "rive/importers/viewmodel_instance_importer.hpp"
+#include "rive/viewmodel/viewmodel_instance.hpp"
+#include "rive/component.hpp"
+#include "rive/viewmodel/write_attribution.hpp"
 
 using namespace rive;
 
@@ -77,6 +88,11 @@ StatusCode DataBind::import(ImportStack& importStack)
                         importer->addDataBind(this);
                     }
                 }
+                else if (input->scriptedObject()->addDataBindFromScriptedObject(
+                             this))
+                {
+                    ownsDataBind = false;
+                }
             }
             input->dataBind(this, ownsDataBind);
         }
@@ -101,6 +117,7 @@ StatusCode DataBind::import(ImportStack& importStack)
                 case BindablePropertyTriggerBase::typeKey:
                 case BindablePropertyIntegerBase::typeKey:
                 case BindablePropertyAssetBase::typeKey:
+                case BindablePropertyViewModelBase::typeKey:
                 case BindablePropertyListBase::typeKey:
                 case TransitionPropertyViewModelComparatorBase::typeKey:
                 case StateTransitionBase::typeKey:
@@ -118,6 +135,21 @@ StatusCode DataBind::import(ImportStack& importStack)
                 }
                 default:
                 {
+                    // Prefer the artboard that actually owns the target object.
+                    // Relying on latest<ArtboardImporter> can attach binds to
+                    // the wrong source artboard when multiple artboards are
+                    // loaded.
+                    if (target()->is<Component>())
+                    {
+                        auto comp = target()->as<Component>();
+                        auto parentArtboard = comp->artboard();
+                        if (parentArtboard != nullptr)
+                        {
+                            parentArtboard->addDataBind(this);
+                            return Super::import(importStack);
+                        }
+                    }
+
                     auto artboardImporter =
                         importStack.latest<ArtboardImporter>(
                             ArtboardBase::typeKey);
@@ -125,6 +157,20 @@ StatusCode DataBind::import(ImportStack& importStack)
                     {
                         artboardImporter->addDataBind(this);
                         return Super::import(importStack);
+                    }
+                    // A file level instance value owns its binds; they clone
+                    // with the instance and bind wherever it is bound.
+                    if (target()->is<ViewModelInstanceValue>())
+                    {
+                        auto instanceImporter =
+                            importStack.latest<ViewModelInstanceImporter>(
+                                ViewModelInstance::typeKey);
+                        if (instanceImporter != nullptr)
+                        {
+                            instanceImporter->viewModelInstance()
+                                ->addValueDataBind(this);
+                            return Super::import(importStack);
+                        }
                     }
                     break;
                 }
@@ -169,31 +215,26 @@ DataType DataBind::sourceOutputType()
                 return DataType::symbolListIndex;
             case ViewModelInstanceAssetImageBase::typeKey:
                 return DataType::assetImage;
+            case ViewModelInstanceAssetFontBase::typeKey:
+                return DataType::assetFont;
+            case ViewModelInstanceAssetBlobBase::typeKey:
+                return DataType::assetBlob;
             case ViewModelInstanceArtboardBase::typeKey:
                 return DataType::artboard;
+            case ViewModelInstanceViewModelBase::typeKey:
+                return DataType::viewModel;
         }
     }
     return DataType::none;
 }
 
-void DataBind::source(ViewModelInstanceValue* value)
+void DataBind::source(rcp<ViewModelInstanceValue> value)
 {
     if (!bindsOnce())
     {
         value->addDependent(this);
-        value->ref();
     }
     m_Source = value;
-
-    // We treat this as a special case. If an ArtboardComponentList's list
-    // property is bound to a number instance, we know that the component
-    // will be provided with dettached view model instances that need to be
-    // advanced explicitly
-    if (m_Source && target() && target()->is<ArtboardComponentList>())
-    {
-        target()->as<ArtboardComponentList>()->shouldResetInstances(
-            m_Source->coreType() == ViewModelInstanceNumberBase::typeKey);
-    }
 }
 
 void DataBind::clearSource()
@@ -204,7 +245,6 @@ void DataBind::clearSource()
         if (!bindsOnce())
         {
             m_Source->removeDependent(this);
-            m_Source->unref();
         }
         m_Source = nullptr;
     }
@@ -252,8 +292,17 @@ void DataBind::bind()
         case DataType::assetImage:
             m_ContextValue = new DataBindContextValueAssetImage(this);
             break;
+        case DataType::assetFont:
+            m_ContextValue = new DataBindContextValueAssetFont(this);
+            break;
+        case DataType::assetBlob:
+            m_ContextValue = new DataBindContextValueAssetBlob(this);
+            break;
         case DataType::artboard:
             m_ContextValue = new DataBindContextValueArtboard(this);
+            break;
+        case DataType::viewModel:
+            m_ContextValue = new DataBindContextValueViewModel(this);
             break;
         case DataType::any:
             m_ContextValue = new DataBindContextValueAny(this);
@@ -265,12 +314,77 @@ void DataBind::bind()
     {
         m_dataConverter->reset();
     }
-    addDirt(ComponentDirt::Bindings, true);
+    // if this is a toSource bind on a push-capable target,
+    // subscribe to the target's notifyPropertyChanged stream instead of
+    // relying on per-frame polling. The container consults targetSupportsPush()
+    // to decide whether to also enroll the bind in m_persistingDataBinds.
+    //
+    // bind() can be called more than once on the same DataBind (e.g. when
+    // ArtboardComponentList rebinds list items as the viewmodel changes).
+    // Unsubscribe first if we previously subscribed — otherwise
+    // addPropertyObserver would prepend the same node twice and form a cycle
+    // that makes notifyPropertyChanged loop forever. The Observing flag
+    // gates this so we don't deref m_target when we never subscribed (which
+    // would be a UAF if the target was freed first).
+    if (hasFlag(Flag::Observing) && m_target != nullptr)
+    {
+        m_target->removePropertyObserver(this);
+        setFlag(Flag::Observing, false);
+    }
+    if (toSource() && m_target != nullptr && targetSupportsPush())
+    {
+        m_target->addPropertyObserver(this);
+        setFlag(Flag::Observing, true);
+    }
+    // (Re)bind is a reconcile, not a one-sided change: mark every direction the
+    // bind supports so both sides sync in favor order (as before origin gating
+    // existed). A one-sided change instead marks only its own direction bit.
+    addDirt(reconcileDirt(), true);
 }
+
+#ifndef WITH_RIVE_EDITOR
+void DataBind::target(Core* value)
+{
+    if (m_target == value)
+    {
+        return;
+    }
+    // Drop the subscription only when we actually have one — otherwise
+    // dereferencing m_target is a UAF if the old target was freed before us
+    // (we wouldn't have been notified via onTargetDestroyed because we
+    // weren't in its observer list).
+    if (hasFlag(Flag::Observing) && m_target != nullptr)
+    {
+        m_target->removePropertyObserver(this);
+        setFlag(Flag::Observing, false);
+    }
+    m_target = value;
+    // `clip` is bindable; a layout bound on clip needs its DrawableProxy up
+    // front so it exists before the artboard's one-time proxy injection, even
+    // while clip is currently false. Stamped here so it also covers instance
+    // clones, whose targets are re-assigned through this setter.
+    if (m_target != nullptr &&
+        propertyKey() == LayoutComponentBase::clipPropertyKey &&
+        m_target->is<LayoutComponent>())
+    {
+        m_target->as<LayoutComponent>()->markClipMayBeDynamic();
+    }
+    if (toSource() && m_target != nullptr && targetSupportsPush())
+    {
+        m_target->addPropertyObserver(this);
+        setFlag(Flag::Observing, true);
+    }
+}
+#endif
 
 void DataBind::unbind()
 {
     clearSource();
+    if (hasFlag(Flag::Observing) && m_target != nullptr)
+    {
+        m_target->removePropertyObserver(this);
+        setFlag(Flag::Observing, false);
+    }
     if (m_dataConverter != nullptr)
     {
         m_dataConverter->unbind();
@@ -282,10 +396,65 @@ void DataBind::unbind()
     }
 }
 
+bool DataBind::targetSupportsPush() const
+{
+    if (m_target == nullptr)
+    {
+        return false;
+    }
+    // Push works for any property whose value is exposed via a generated
+    // setter that calls notifyPropertyChanged (i.e. anything in *_base.hpp).
+    // The following targets are computed/derived and don't fit the push
+    // model — leave them on the polling path:
+    //
+    //   * Solo's activeComponentId — derived from active child, no setter
+    //   * BindablePropertyAsset's image — loaded asynchronously, no setter
+    //   * BindablePropertyViewModel's value — set via dedicated method
+    //   * ViewModelInstanceViewModel's reference — set via dedicated method
+    //   * Node's computed* properties — written multiple times per frame by
+    //     the transform/layout pipeline; pushing on every intermediate write
+    //     triggers dependent binds mid-computation and shifts per-frame
+    //     ordering. Polling at end of frame captures only the settled value.
+    auto key = propertyKey();
+    if (key == SoloBase::activeComponentIdPropertyKey ||
+        key == NodeBase::computedLocalXPropertyKey ||
+        key == NodeBase::computedLocalYPropertyKey ||
+        key == NodeBase::computedWorldXPropertyKey ||
+        key == NodeBase::computedWorldYPropertyKey ||
+        key == NodeBase::computedRootXPropertyKey ||
+        key == NodeBase::computedRootYPropertyKey ||
+        key == NodeBase::computedWidthPropertyKey ||
+        key == NodeBase::computedHeightPropertyKey ||
+        key == ShapeBase::lengthPropertyKey ||
+        key == ScrollConstraintBase::scrollIndexPropertyKey ||
+        key == ScrollConstraintBase::scrollPercentXPropertyKey ||
+        key == ScrollConstraintBase::scrollPercentYPropertyKey ||
+        key == ScrollConstraintBase::velocityXPropertyKey ||
+        key == ScrollConstraintBase::velocityYPropertyKey ||
+        key == ScrollConstraintBase::scrollActivePropertyKey ||
+        key == ScrollConstraintBase::computedContentWidthPropertyKey ||
+        key == ScrollConstraintBase::computedContentHeightPropertyKey ||
+        key == ColorChannelsBase::colorAlphaPropertyKey ||
+        key == ColorChannelsBase::colorRedPropertyKey ||
+        key == ColorChannelsBase::colorBluePropertyKey ||
+        key == ColorChannelsBase::colorGreenPropertyKey)
+    {
+        return false;
+    }
+    auto t = m_target->coreType();
+    if (t == BindablePropertyAssetBase::typeKey ||
+        t == BindablePropertyViewModelBase::typeKey ||
+        t == ViewModelInstanceViewModelBase::typeKey)
+    {
+        return false;
+    }
+    return true;
+}
+
 bool DataBind::canSkip()
 {
-    return m_target && m_target->is<Component>() &&
-           m_target->as<Component>()->isCollapsed() &&
+    auto* t = target();
+    return t && t->is<Component>() && t->as<Component>()->isCollapsed() &&
            propertyKey() != LayoutComponentStyleBase::displayValuePropertyKey;
 }
 
@@ -301,10 +470,23 @@ void DataBind::update(ComponentDirt value)
             auto flagsValue = static_cast<DataBindFlags>(flags());
             if (toTarget())
             {
-                m_ContextValue->apply(m_target,
+                // Alternative A: a TwoWay bind subscribes to its target via
+                // Core::notifyPropertyChanged. Without suppression, writing
+                // the target here would push-notify ourselves and add a
+                // spurious dirt entry, causing an extra updateSourceBinding
+                // pass in the same frame (silver tests collapse_data_binds-
+                // test_2 / virtualize_blendmode regress). Mirror the
+                // suppressDirt pattern used by the source-apply path.
+                suppressDirt(true);
+                m_ContextValue->apply(target(),
                                       propertyKey(),
                                       (flagsValue & DataBindFlags::Direction) ==
-                                          DataBindFlags::ToTarget);
+                                          DataBindFlags::ToTarget,
+                                      this);
+                // We just wrote the target; sync the cached target value so it
+                // reflects what we wrote instead of what was there before.
+                m_ContextValue->refreshTargetValue(this);
+                suppressDirt(false);
             }
         }
     }
@@ -320,18 +502,18 @@ void DataBind::updateDependents()
 
 void DataBind::updateSourceBinding(bool invalidate)
 {
-    if (toSource())
+    if (toSource() && target() && m_ContextValue != nullptr)
     {
-        if (m_ContextValue != nullptr)
+        if (invalidate)
         {
-            if (invalidate)
-            {
-                m_ContextValue->invalidate();
-            }
-            m_ContextValue->applyToSource(m_target,
-                                          propertyKey(),
-                                          isMainToSource());
+            m_ContextValue->invalidate();
+            m_ContextValue->requestSourceWrite();
         }
+        RIVE_WRITE_SOURCE(dataBind, this);
+        m_ContextValue->applyToSource(target(),
+                                      propertyKey(),
+                                      isMainToSource(),
+                                      this);
     }
 }
 
@@ -348,12 +530,39 @@ bool DataBind::sourceToTargetRunsFirst()
            DataBindFlags::SourceToTargetRunsFirst;
 }
 
+ComponentDirt DataBind::reconcileDirt()
+{
+    return (toTarget() ? ComponentDirt::Bindings : ComponentDirt::None) |
+           (toSource() ? ComponentDirt::BindingsTarget : ComponentDirt::None);
+}
+
 void DataBind::addDirt(ComponentDirt value, bool recurse)
 {
-    if (m_suppressDirt || (m_Dirt & value) == value)
+    if (hasFlag(Flag::SuppressDirt) || (m_Dirt & value) == value)
     {
         // Already marked.
         return;
+    }
+
+    // Latch the direction this change came from so a converter that re-dirties
+    // us over multiple frames (interpolators) re-asserts the same direction —
+    // per-frame dirt gets cleared and can't carry the origin forward. Placed
+    // after the guards above so a suppressed self-notify (from applying either
+    // direction) can't flip the origin. Record a single origin, never the OR:
+    // a reconcile marks both bits, in which case the favored direction wins.
+    bool hasSource = enums::is_flag_set(value, ComponentDirt::Bindings);
+    bool hasTarget = enums::is_flag_set(value, ComponentDirt::BindingsTarget);
+    if (hasSource && hasTarget)
+    {
+        setFlag(Flag::TargetOrigin, !sourceToTargetRunsFirst());
+    }
+    else if (hasTarget)
+    {
+        setFlag(Flag::TargetOrigin, true);
+    }
+    else if (hasSource)
+    {
+        setFlag(Flag::TargetOrigin, false);
     }
 
     m_Dirt |= value;
@@ -363,11 +572,12 @@ void DataBind::addDirt(ComponentDirt value, bool recurse)
         m_changedCallback();
     }
 #endif
-    if ((m_Dirt & ComponentDirt::Dependents) != 0 && m_ContextValue != nullptr)
+    if (enums::is_flag_set(m_Dirt, ComponentDirt::Dependents) &&
+        m_ContextValue != nullptr)
     {
         m_ContextValue->invalidate();
     }
-    if (m_container && !m_isCollapsed)
+    if (m_container && !hasFlag(Flag::Collapsed))
     {
         m_container->addDirtyDataBind(this);
     }
@@ -378,35 +588,37 @@ void DataBind::container(DataBindContainer* container)
     m_container = container;
 }
 
+void DataBind::relinkDataBind() { m_container->rebuildDataBind(this); }
+
 bool DataBind::bindsOnce()
 {
     auto flagsValue = static_cast<DataBindFlags>(flags());
-    return (flagsValue & DataBindFlags::Once) == DataBindFlags::Once;
+    return enums::is_flag_set(flagsValue, DataBindFlags::Once);
 }
 
 bool DataBind::toSource()
 {
     auto flagsValue = static_cast<DataBindFlags>(flags());
-    return (flagsValue & (DataBindFlags::TwoWay | DataBindFlags::ToSource)) !=
-           0;
+    return enums::any_flag_set(flagsValue,
+                               DataBindFlags::TwoWay | DataBindFlags::ToSource);
 }
 
 bool DataBind::toTarget()
 {
     auto flagsValue = static_cast<DataBindFlags>(flags());
-    return (flagsValue & DataBindFlags::TwoWay) != 0 ||
-           (flagsValue & DataBindFlags::ToSource) == 0;
+    return enums::is_flag_set(flagsValue, DataBindFlags::TwoWay) ||
+           !enums::is_flag_set(flagsValue, DataBindFlags::ToSource);
 }
 
 bool DataBind::isNameBased()
 {
     auto flagsValue = static_cast<DataBindFlags>(flags());
-    return (flagsValue & DataBindFlags::NameBased) != 0;
+    return enums::is_flag_set(flagsValue, DataBindFlags::NameBased);
 }
 
 bool DataBind::advance(float elapsedTime)
 {
-    if (converter() && m_Source && !m_isCollapsed)
+    if (converter() && m_Source && !hasFlag(Flag::Collapsed))
     {
         return converter()->advance(elapsedTime);
     }
@@ -419,17 +631,30 @@ File* DataBind::file() const { return m_file; };
 
 void DataBind::collapse(bool isCollapsed)
 {
-    if (m_isCollapsed == isCollapsed ||
+    if (hasFlag(Flag::Collapsed) == isCollapsed ||
         propertyKey() == LayoutComponentStyleBase::displayValuePropertyKey ||
-        toSource())
+        !targetSupportsPush())
     {
         return;
     }
-    m_isCollapsed = isCollapsed;
-    if (!m_isCollapsed && m_Dirt != ComponentDirt::None && m_container)
+    setFlag(Flag::Collapsed, isCollapsed);
+    if (!isCollapsed && m_Dirt != ComponentDirt::None && m_container)
     {
         m_container->addDirtyDataBind(this);
     }
+}
+
+DataBind* DataBind::cloneWithTarget(Core* newTarget) const
+{
+    auto dataBindClone = static_cast<DataBind*>(clone());
+    dataBindClone->target(newTarget);
+    dataBindClone->file(m_file);
+    dataBindClone->initialize();
+    if (m_dataConverter != nullptr)
+    {
+        dataBindClone->converter(m_dataConverter->clone()->as<DataConverter>());
+    }
+    return dataBindClone;
 }
 
 void DataBind::initialize()

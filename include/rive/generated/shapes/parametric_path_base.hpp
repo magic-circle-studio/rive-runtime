@@ -12,25 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 15;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case ParametricPathBase::typeKey:
-            case PathBase::typeKey:
-            case NodeBase::typeKey:
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t widthPropertyKey = 20;
@@ -52,8 +33,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(widthPropertyKey, &m_Width, &value);
         m_Width = value;
-        widthChanged();
+        RIVE_EDITOR_CHANGED(widthChanged());
+        notifyPropertyChanged(widthPropertyKey);
     }
 
     inline float height() const { return m_Height; }
@@ -63,8 +46,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(heightPropertyKey, &m_Height, &value);
         m_Height = value;
-        heightChanged();
+        RIVE_EDITOR_CHANGED(heightChanged());
+        notifyPropertyChanged(heightPropertyKey);
     }
 
     inline float originX() const { return m_OriginX; }
@@ -74,8 +59,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(originXPropertyKey, &m_OriginX, &value);
         m_OriginX = value;
-        originXChanged();
+        RIVE_EDITOR_CHANGED(originXChanged());
+        notifyPropertyChanged(originXPropertyKey);
     }
 
     inline float originY() const { return m_OriginY; }
@@ -85,8 +72,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(originYPropertyKey, &m_OriginY, &value);
         m_OriginY = value;
-        originYChanged();
+        RIVE_EDITOR_CHANGED(originYChanged());
+        notifyPropertyChanged(originYPropertyKey);
     }
 
     void copy(const ParametricPathBase& object)
@@ -123,6 +112,9 @@ protected:
     virtual void heightChanged() {}
     virtual void originXChanged() {}
     virtual void originYChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/parametric_path_ext.inl"
+#endif
 };
 } // namespace rive
 

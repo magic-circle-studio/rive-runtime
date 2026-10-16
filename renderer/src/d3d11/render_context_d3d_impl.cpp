@@ -6,10 +6,16 @@
 
 #include "rive/renderer/d3d/d3d_constants.hpp"
 
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_canvas.hpp"
+#include <rive/renderer/ore/ore_context_d3d11.hpp>
+#endif
+#include "rive/renderer/stack_vector.hpp"
 #include "rive/renderer/texture.hpp"
 #include "rive/profiler/profiler_macros.h"
 
 #include <D3DCompiler.h>
+#include <vector>
 
 #include "generated/shaders/tessellate.glsl.exports.h"
 
@@ -187,24 +193,24 @@ D3D11PipelineManager::D3D11PipelineManager(
         2,
         shader::atlas::vert::g_main,
         std::size(shader::atlas::vert::g_main),
-        &m_atlasLayout));
+        &m_featherAtlasLayout));
     VERIFY_OK(this->device()->CreateVertexShader(
         shader::atlas::vert::g_main,
         std::size(shader::atlas::vert::g_main),
         nullptr,
-        &m_atlasVertexShader));
+        &m_featherAtlasVertexShader));
 
     VERIFY_OK(this->device()->CreatePixelShader(
         shader::atlas::fill::g_main,
         std::size(shader::atlas::fill::g_main),
         nullptr,
-        &m_atlasFillPixelShader));
+        &m_featherAtlasFillPixelShader));
 
     VERIFY_OK(this->device()->CreatePixelShader(
         shader::atlas::stroke::g_main,
         std::size(shader::atlas::stroke::g_main),
         nullptr,
-        &m_atlasStrokePixelShader));
+        &m_featherAtlasStrokePixelShader));
 }
 
 bool D3D11PipelineManager::setPipelineState(
@@ -242,89 +248,153 @@ bool D3D11PipelineManager::setPipelineState(
     return true;
 }
 
+inline DXGI_FORMAT getDXGIFormat(VertexElementFormat format)
+{
+    switch (format)
+    {
+        case VertexElementFormat::float1:
+            return DXGI_FORMAT_R32_FLOAT;
+        case VertexElementFormat::float2:
+            return DXGI_FORMAT_R32G32_FLOAT;
+        case VertexElementFormat::float3:
+            return DXGI_FORMAT_R32G32B32_FLOAT;
+        case VertexElementFormat::float4:
+            return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case VertexElementFormat::uint8x4:
+            return DXGI_FORMAT_R8G8B8A8_UINT;
+        case VertexElementFormat::sint8x4:
+            return DXGI_FORMAT_R8G8B8A8_SINT;
+        case VertexElementFormat::unorm8x4:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case VertexElementFormat::snorm8x4:
+            return DXGI_FORMAT_R8G8B8A8_SNORM;
+        case VertexElementFormat::uint16x2:
+            return DXGI_FORMAT_R16G16_UINT;
+        case VertexElementFormat::sint16x2:
+            return DXGI_FORMAT_R16G16_SINT;
+        case VertexElementFormat::unorm16x2:
+            return DXGI_FORMAT_R16G16_UNORM;
+        case VertexElementFormat::snorm16x2:
+            return DXGI_FORMAT_R16G16_SNORM;
+        case VertexElementFormat::uint16x4:
+            return DXGI_FORMAT_R16G16B16A16_UINT;
+        case VertexElementFormat::sint16x4:
+            return DXGI_FORMAT_R16G16B16A16_SINT;
+        case VertexElementFormat::float16x2:
+            return DXGI_FORMAT_R16G16_FLOAT;
+        case VertexElementFormat::float16x4:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case VertexElementFormat::uint32:
+            return DXGI_FORMAT_R32_UINT;
+    }
+
+    RIVE_UNREACHABLE();
+}
+
+template <typename ImageDrawInstance, uint32_t N>
+void addInstanceElements(StackVector<D3D11_INPUT_ELEMENT_DESC, N>& layoutDesc)
+{
+    for (auto& attribute : ImageDrawInstance::getAttributes())
+    {
+        layoutDesc.push_back({
+            .SemanticName = attribute.semanticName,
+            .SemanticIndex = 0,
+            .Format = getDXGIFormat(attribute.format),
+            .InputSlot = IMAGE_DRAW_INSTANCE_DATA_SLOT,
+            .AlignedByteOffset = D3D11_APPEND_ALIGNED_ELEMENT,
+            .InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA,
+            .InstanceDataStepRate = 1,
+        });
+    }
+}
 std::unique_ptr<D3D11DrawVertexShader> D3D11PipelineManager::
     compileVertexShaderBlobToFinalType(DrawType drawType, ComPtr<ID3DBlob> blob)
 {
-    D3D11_INPUT_ELEMENT_DESC layoutDesc[2];
-    uint32_t vertexAttribCount;
+    StackVector<D3D11_INPUT_ELEMENT_DESC, MaxVertexAttributeCount + 1>
+        layoutDesc;
     switch (drawType)
     {
         case DrawType::midpointFanPatches:
         case DrawType::midpointFanCenterAAPatches:
         case DrawType::outerCurvePatches:
-            layoutDesc[0] = {GLSL_a_patchVertexData,
-                             0,
-                             DXGI_FORMAT_R32G32B32A32_FLOAT,
-                             PATCH_VERTEX_DATA_SLOT,
-                             D3D11_APPEND_ALIGNED_ELEMENT,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            layoutDesc[1] = {GLSL_a_mirroredVertexData,
-                             0,
-                             DXGI_FORMAT_R32G32B32A32_FLOAT,
-                             PATCH_VERTEX_DATA_SLOT,
-                             D3D11_APPEND_ALIGNED_ELEMENT,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            vertexAttribCount = 2;
+            layoutDesc.push_back({GLSL_a_patchVertexData,
+                                  0,
+                                  DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                  PATCH_VERTEX_DATA_SLOT,
+                                  D3D11_APPEND_ALIGNED_ELEMENT,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
+            layoutDesc.push_back({GLSL_a_mirroredVertexData,
+                                  0,
+                                  DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                  PATCH_VERTEX_DATA_SLOT,
+                                  D3D11_APPEND_ALIGNED_ELEMENT,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
             break;
         case DrawType::interiorTriangulation:
-        case DrawType::atlasBlit:
-            layoutDesc[0] = {GLSL_a_triangleVertex,
-                             0,
-                             DXGI_FORMAT_R32G32B32_FLOAT,
-                             TRIANGLE_VERTEX_DATA_SLOT,
-                             0,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            vertexAttribCount = 1;
+        case DrawType::featherAtlasBlit:
+            layoutDesc.push_back({GLSL_a_triangleVertex,
+                                  0,
+                                  DXGI_FORMAT_R32G32B32_FLOAT,
+                                  TRIANGLE_VERTEX_DATA_SLOT,
+                                  0,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
             break;
         case DrawType::imageRect:
-            layoutDesc[0] = {GLSL_a_imageRectVertex,
-                             0,
-                             DXGI_FORMAT_R32G32B32A32_FLOAT,
-                             IMAGE_RECT_VERTEX_DATA_SLOT,
-                             0,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            vertexAttribCount = 1;
+            layoutDesc.push_back({GLSL_a_imageRectVertex,
+                                  0,
+                                  DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                  IMAGE_RECT_VERTEX_DATA_SLOT,
+                                  0,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
+            addInstanceElements<ImageRectInstance>(layoutDesc);
             break;
         case DrawType::imageMesh:
-            layoutDesc[0] = {GLSL_a_position,
-                             0,
-                             DXGI_FORMAT_R32G32_FLOAT,
-                             IMAGE_MESH_VERTEX_DATA_SLOT,
-                             D3D11_APPEND_ALIGNED_ELEMENT,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            layoutDesc[1] = {GLSL_a_texCoord,
-                             0,
-                             DXGI_FORMAT_R32G32_FLOAT,
-                             IMAGE_MESH_UV_DATA_SLOT,
-                             D3D11_APPEND_ALIGNED_ELEMENT,
-                             D3D11_INPUT_PER_VERTEX_DATA,
-                             0};
-            vertexAttribCount = 2;
+            layoutDesc.push_back({GLSL_a_position,
+                                  0,
+                                  DXGI_FORMAT_R32G32_FLOAT,
+                                  IMAGE_MESH_VERTEX_DATA_SLOT,
+                                  D3D11_APPEND_ALIGNED_ELEMENT,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
+            layoutDesc.push_back({GLSL_a_texCoord,
+                                  0,
+                                  DXGI_FORMAT_R32G32_FLOAT,
+                                  IMAGE_MESH_UV_DATA_SLOT,
+                                  D3D11_APPEND_ALIGNED_ELEMENT,
+                                  D3D11_INPUT_PER_VERTEX_DATA,
+                                  0});
+            addInstanceElements<ImageMeshInstance>(layoutDesc);
             break;
         case DrawType::renderPassResolve:
-            vertexAttribCount = 0;
             break;
-        case DrawType::msaaStrokes:
-        case DrawType::msaaMidpointFanBorrowedCoverage:
-        case DrawType::msaaMidpointFans:
-        case DrawType::msaaMidpointFanStencilReset:
-        case DrawType::msaaMidpointFanPathsStencil:
-        case DrawType::msaaMidpointFanPathsCover:
-        case DrawType::msaaOuterCubics:
-        case DrawType::msaaStencilClipReset:
+        case DrawType::stencilMidpointFanBorrowedCoverage:
+        case DrawType::stencilDynamicMidpointFans:
+        case DrawType::stencilDynamicOuterCubics:
+        case DrawType::stencilMidpointFans:
+        case DrawType::stencilMidpointFanReset:
+        case DrawType::stencilMidpointFanWinding:
+        case DrawType::stencilMidpointFanCover:
+        case DrawType::stencilOuterCubicBorrowedCoverage:
+        case DrawType::stencilOuterCubicReset:
+        case DrawType::stencilOuterCubicWinding:
+        case DrawType::stencilOuterCubicCover:
+        case DrawType::stencilOuterCubics:
+        case DrawType::clipReset:
         case DrawType::renderPassInitialize:
+        case DrawType::depthStrokes:
+        case DrawType::depthAAStrokes:
+        case DrawType::depthAAOuterHairline:
             RIVE_UNREACHABLE();
     }
 
     auto result = std::make_unique<D3D11DrawVertexShader>();
 
-    VERIFY_OK(device()->CreateInputLayout(layoutDesc,
-                                          vertexAttribCount,
+    VERIFY_OK(device()->CreateInputLayout(layoutDesc.data(),
+                                          layoutDesc.size(),
                                           blob->GetBufferPointer(),
                                           blob->GetBufferSize(),
                                           &result->layout));
@@ -410,7 +480,12 @@ std::unique_ptr<RenderContext> RenderContextD3DImpl::MakeContext(
     const D3DContextOptions& contextOptions)
 {
 #if defined(RIVE_MICROPROFILE)
-    MicroProfileGpuInitD3D11(gpu.Get());
+    // MicroProfile keeps process-global GPU state and asserts on re-init, so
+    // bind it to the first device we see (e.g. with desktop_multi_window,
+    // multiple plugin instances each create their own RenderContext).
+    static std::once_flag s_microProfileInit;
+    std::call_once(s_microProfileInit,
+                   [&] { MicroProfileGpuInitD3D11(gpu.Get()); });
 #endif
     D3DCapabilities d3dCapabilities;
     D3D11_FEATURE_DATA_D3D11_OPTIONS2 d3d11Options2;
@@ -509,6 +584,11 @@ RenderContextD3DImpl::RenderContextD3DImpl(
     m_platformFeatures.supportsAtomicMode = true;
     m_platformFeatures.maxTextureSize = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 
+    m_platformFeatures.supportsClipScissor = true;
+
+    // BC1–BC7 are required at D3D feature level 11.0+.
+    m_platformFeatures.supportsTextureCompressionBC = true;
+
     // Create a default raster state for path and offscreen draws.
     D3D11_RASTERIZER_DESC rasterDesc;
     rasterDesc.FillMode = D3D11_FILL_SOLID;
@@ -525,7 +605,8 @@ RenderContextD3DImpl::RenderContextD3DImpl(
               // Details on default state here:
     // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_rasterizer_desc
 
-    rasterDesc.ScissorEnable = FALSE;
+    // Always enable scissor - we'll set it to the full display when it's unused
+    rasterDesc.ScissorEnable = TRUE;
     rasterDesc.MultisampleEnable = FALSE;
     rasterDesc.AntialiasedLineEnable = FALSE;
     VERIFY_OK(m_gpu->CreateRasterizerState(
@@ -534,19 +615,17 @@ RenderContextD3DImpl::RenderContextD3DImpl(
 
     // ...And with scissor and no culling for the atlas fill.
     rasterDesc.CullMode = D3D11_CULL_NONE;
-    rasterDesc.ScissorEnable = TRUE;
     VERIFY_OK(m_gpu->CreateRasterizerState(
         &rasterDesc,
-        m_atlasFillRasterState.ReleaseAndGetAddressOf()));
+        m_featherAtlasFillRasterState.ReleaseAndGetAddressOf()));
 
     // ...And with culling back on for the atlas stroke.
     rasterDesc.CullMode = D3D11_CULL_BACK;
     VERIFY_OK(m_gpu->CreateRasterizerState(
         &rasterDesc,
-        m_atlasStrokeRasterState.ReleaseAndGetAddressOf()));
+        m_featherAtlasStrokeRasterState.ReleaseAndGetAddressOf()));
 
     // ...And with wireframe for debugging.
-    rasterDesc.ScissorEnable = FALSE;
     rasterDesc.FillMode = D3D11_FILL_WIREFRAME;
     VERIFY_OK(m_gpu->CreateRasterizerState(
         &rasterDesc,
@@ -565,20 +644,21 @@ RenderContextD3DImpl::RenderContextD3DImpl(
         &rasterDesc,
         m_doubleSidedRasterState[1].ReleaseAndGetAddressOf()));
 
-    // Create the feather texture.
-    D3D11_TEXTURE1D_DESC featherTextureDesc{};
-    featherTextureDesc.Format = DXGI_FORMAT_R16_FLOAT;
-    featherTextureDesc.Width = gpu::GAUSSIAN_TABLE_SIZE;
-    featherTextureDesc.MipLevels = 1;
-    featherTextureDesc.ArraySize = FEATHER_TEXTURE_1D_ARRAY_LENGTH;
-    featherTextureDesc.Usage = D3D11_USAGE_DEFAULT;
-    featherTextureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    featherTextureDesc.CPUAccessFlags = 0;
-    featherTextureDesc.MiscFlags = 0;
-    VERIFY_OK(
-        m_gpu->CreateTexture1D(&featherTextureDesc,
-                               NULL,
-                               m_featherTexture.ReleaseAndGetAddressOf()));
+    // Create the gaussian integral texture.
+    D3D11_TEXTURE1D_DESC gaussianIntegralTextureDesc{};
+    gaussianIntegralTextureDesc.Format = DXGI_FORMAT_R16_FLOAT;
+    gaussianIntegralTextureDesc.Width = gpu::GAUSSIAN_TABLE_SIZE;
+    gaussianIntegralTextureDesc.MipLevels = 1;
+    gaussianIntegralTextureDesc.ArraySize =
+        GAUSSIAN_INTEGRAL_TEXTURE_1D_ARRAY_LENGTH;
+    gaussianIntegralTextureDesc.Usage = D3D11_USAGE_DEFAULT;
+    gaussianIntegralTextureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    gaussianIntegralTextureDesc.CPUAccessFlags = 0;
+    gaussianIntegralTextureDesc.MiscFlags = 0;
+    VERIFY_OK(m_gpu->CreateTexture1D(
+        &gaussianIntegralTextureDesc,
+        NULL,
+        m_gaussianIntegralTexture.ReleaseAndGetAddressOf()));
 
     D3D11_BOX box;
     box.left = 0;
@@ -587,22 +667,22 @@ RenderContextD3DImpl::RenderContextD3DImpl(
     box.bottom = 1;
     box.front = 0;
     box.back = 1;
-    m_gpuContext->UpdateSubresource(m_featherTexture.Get(),
+    m_gpuContext->UpdateSubresource(m_gaussianIntegralTexture.Get(),
                                     FEATHER_FUNCTION_ARRAY_INDEX,
                                     &box,
                                     gpu::g_gaussianIntegralTableF16,
                                     sizeof(gpu::g_gaussianIntegralTableF16),
                                     sizeof(gpu::g_gaussianIntegralTableF16));
-    m_gpuContext->UpdateSubresource(m_featherTexture.Get(),
+    m_gpuContext->UpdateSubresource(m_gaussianIntegralTexture.Get(),
                                     FEATHER_INVERSE_FUNCTION_ARRAY_INDEX,
                                     &box,
                                     gpu::g_inverseGaussianIntegralTableF16,
                                     sizeof(gpu::g_gaussianIntegralTableF16),
                                     0);
     VERIFY_OK(m_gpu->CreateShaderResourceView(
-        m_featherTexture.Get(),
+        m_gaussianIntegralTexture.Get(),
         NULL,
-        m_featherTextureSRV.ReleaseAndGetAddressOf()));
+        m_gaussianIntegralTextureSRV.ReleaseAndGetAddressOf()));
 
     // Compile the tessellation shaders.
     {
@@ -614,14 +694,15 @@ RenderContextD3DImpl::RenderContextD3DImpl(
 
     // Set up the path patch rendering buffers.
     PatchVertex patchVertices[kPatchVertexBufferCount];
-    uint16_t patchIndices[kPatchIndexBufferCount];
-    GeneratePatchBufferData(patchVertices, patchIndices);
+    std::vector<uint16_t> patchIndices(kPatchIndexBufferCount);
+    GeneratePatchBufferData(patchVertices, patchIndices.data());
     m_patchVertexBuffer = makeSimpleImmutableBuffer(sizeof(patchVertices),
                                                     D3D11_BIND_VERTEX_BUFFER,
                                                     patchVertices);
-    m_patchIndexBuffer = makeSimpleImmutableBuffer(sizeof(patchIndices),
-                                                   D3D11_BIND_INDEX_BUFFER,
-                                                   patchIndices);
+    m_patchIndexBuffer =
+        makeSimpleImmutableBuffer(patchIndices.size() * sizeof(uint16_t),
+                                  D3D11_BIND_INDEX_BUFFER,
+                                  patchIndices.data());
 
     // Set up the imageRect rendering buffers. (gpu::InterlockMode::atomics
     // only.)
@@ -652,29 +733,7 @@ RenderContextD3DImpl::RenderContextD3DImpl(
         VERIFY_OK(m_gpu->CreateBuffer(&desc,
                                       nullptr,
                                       m_drawUniforms.ReleaseAndGetAddressOf()));
-
-        desc.ByteWidth = sizeof(gpu::ImageDrawUniforms);
-        desc.StructureByteStride = sizeof(gpu::ImageDrawUniforms);
-        VERIFY_OK(
-            m_gpu->CreateBuffer(&desc,
-                                nullptr,
-                                m_imageDrawUniforms.ReleaseAndGetAddressOf()));
     }
-
-    // Create a linear sampler for the gradient & feather textures.
-    D3D11_SAMPLER_DESC linearSamplerDesc;
-    linearSamplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    linearSamplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    linearSamplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-    linearSamplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    linearSamplerDesc.MipLODBias = 0.0f;
-    linearSamplerDesc.MaxAnisotropy = 1;
-    linearSamplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
-    linearSamplerDesc.MinLOD = 0;
-    linearSamplerDesc.MaxLOD = 0;
-    VERIFY_OK(
-        m_gpu->CreateSamplerState(&linearSamplerDesc,
-                                  m_linearSampler.ReleaseAndGetAddressOf()));
 
     // Create a mipmap sampler for each sampler permutation option.
     for (int samplerKey = 0;
@@ -701,9 +760,10 @@ RenderContextD3DImpl::RenderContextD3DImpl(
             m_samplerStates[samplerKey].ReleaseAndGetAddressOf()));
     }
 
-    m_gpuContext->VSSetSamplers(FEATHER_TEXTURE_IDX,
-                                1,
-                                m_linearSampler.GetAddressOf());
+    m_gpuContext->VSSetSamplers(
+        GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+        1,
+        m_samplerStates[BilinearClampImageSamplerKey].GetAddressOf());
 
     D3D11_BLEND_DESC srcOverDesc{};
     srcOverDesc.RenderTarget[0].BlendEnable = TRUE;
@@ -802,7 +862,8 @@ public:
         m_desc.BindFlags = type() == RenderBufferType::vertex
                                ? D3D11_BIND_VERTEX_BUFFER
                                : D3D11_BIND_INDEX_BUFFER;
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             m_desc.Usage = D3D11_USAGE_IMMUTABLE;
             m_desc.CPUAccessFlags = 0;
@@ -823,7 +884,8 @@ public:
 protected:
     void* onMap() override
     {
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             assert(m_mappedMemoryForImmutableBuffer);
             return m_mappedMemoryForImmutableBuffer.get();
@@ -842,7 +904,8 @@ protected:
 
     void onUnmap() override
     {
-        if (flags() & RenderBufferFlags::mappedOnceAtInitialization)
+        if (enums::is_flag_set(flags(),
+                               RenderBufferFlags::mappedOnceAtInitialization))
         {
             assert(!m_buffer);
             D3D11_SUBRESOURCE_DATA bufferDataDesc{};
@@ -882,16 +945,46 @@ rcp<RenderBuffer> RenderContextD3DImpl::makeRenderBuffer(
 class TextureD3DImpl : public Texture
 {
 public:
+    // viewFormat = DXGI_FORMAT_UNKNOWN → infer (TYPELESS storage gets
+    // mapped to its UNORM variant; other formats use desc.Format as-is).
+    // Pass an explicit format to override (e.g. Unity sRGB RTs).
     TextureD3DImpl(RenderContextD3DImpl* renderContextImpl,
                    ComPtr<ID3D11Texture2D> image,
                    UINT width,
-                   UINT height) :
+                   UINT height,
+                   DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN) :
         Texture(width, height), m_texture(image)
     {
-        // Create a view.
+        D3D11_TEXTURE2D_DESC desc;
+        m_texture->GetDesc(&desc);
+        if (viewFormat == DXGI_FORMAT_UNKNOWN)
+        {
+            switch (desc.Format)
+            {
+                case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+                    viewFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    break;
+                case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+                    viewFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    break;
+                case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+                    viewFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    break;
+                default:
+                    viewFormat = desc.Format;
+                    break;
+            }
+        }
+        const D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {
+            .Format = viewFormat,
+            .ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+            .Texture2D = {.MostDetailedMip = 0, .MipLevels = desc.MipLevels},
+        };
+        const D3D11_SHADER_RESOURCE_VIEW_DESC* srvDescPtr =
+            (viewFormat == desc.Format) ? nullptr : &srvDesc;
         VERIFY_OK(renderContextImpl->gpu()->CreateShaderResourceView(
             m_texture.Get(),
-            NULL,
+            srvDescPtr,
             m_srv.ReleaseAndGetAddressOf()));
     }
 
@@ -899,44 +992,123 @@ public:
                    UINT width,
                    UINT height,
                    UINT mipLevelCount,
-                   const uint8_t imageDataRGBAPremul[]) :
+                   GPUTextureFormat format,
+                   const uint8_t imageDataRGBAPremul[],
+                   bool generateRemainingMips) :
         Texture(width, height)
     {
-        m_texture = renderContextImpl->makeSimple2DTexture(
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            width,
-            height,
-            mipLevelCount,
-            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET,
-            D3D11_RESOURCE_MISC_GENERATE_MIPS);
+        if (format == GPUTextureFormat::bc7)
+        {
+            m_texture = renderContextImpl->makeSimple2DTexture(
+                DXGI_FORMAT_BC7_UNORM,
+                width,
+                height,
+                mipLevelCount,
+                D3D11_BIND_SHADER_RESOURCE);
 
-        // Specify the top-level image in the mipmap chain.
-        D3D11_BOX box;
-        box.left = 0;
-        box.right = width;
-        box.top = 0;
-        box.bottom = height;
-        box.front = 0;
-        box.back = 1;
-        renderContextImpl->gpuContext()->UpdateSubresource(m_texture.Get(),
-                                                           0,
-                                                           &box,
-                                                           imageDataRGBAPremul,
-                                                           width * 4,
-                                                           0);
+            // Specify the top-level image in the mipmap chain.
+            int W = width;
+            int H = height;
+
+            const uint8_t* pData = imageDataRGBAPremul;
+            for (UINT i = 0; i < mipLevelCount; i++)
+            {
+                D3D11_BOX box;
+                box.left = 0;
+                box.right = math::round_up_to_multiple_of<4>(W);
+                box.top = 0;
+                box.bottom = math::round_up_to_multiple_of<4>(H);
+                box.front = 0;
+                box.back = 1;
+
+                int BX = (W + 3) / 4;
+                int BY = (H + 3) / 4;
+
+                renderContextImpl->gpuContext()->UpdateSubresource(
+                    m_texture.Get(),
+                    i,
+                    &box,
+                    pData,
+                    BX * 16,
+                    0);
+
+                pData += (BX * BY * 16);
+
+                W = W / 2;
+                H = H / 2;
+            }
+        }
+        else if (format == GPUTextureFormat::rgba32)
+        {
+            // GENERATE_MIPS flag + RTV binding are only needed when the
+            // GPU is going to fill in the chain. For the KTX2-supplied
+            // chain (caller-provided mips) it's pure overhead.
+            const UINT miscFlags =
+                generateRemainingMips ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0u;
+            const UINT bindFlags =
+                generateRemainingMips
+                    ? (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET)
+                    : D3D11_BIND_SHADER_RESOURCE;
+            m_texture = renderContextImpl->makeSimple2DTexture(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                width,
+                height,
+                mipLevelCount,
+                bindFlags,
+                miscFlags);
+
+            const uint8_t* src = imageDataRGBAPremul;
+            const UINT levelsToUpload =
+                generateRemainingMips ? 1u : mipLevelCount;
+            UINT W = width;
+            UINT H = height;
+            for (UINT i = 0; i < levelsToUpload; ++i)
+            {
+                D3D11_BOX box;
+                box.left = 0;
+                box.right = W;
+                box.top = 0;
+                box.bottom = H;
+                box.front = 0;
+                box.back = 1;
+                renderContextImpl->gpuContext()->UpdateSubresource(
+                    m_texture.Get(),
+                    i,
+                    &box,
+                    src,
+                    W * 4,
+                    0);
+                src += static_cast<size_t>(W) * H * 4;
+                W = std::max<UINT>(1u, W >> 1);
+                H = std::max<UINT>(1u, H >> 1);
+            }
+        }
+        else
+        {
+            assert(!"unsupported format");
+        }
 
         // Create a view and generate mipmaps.
         VERIFY_OK(renderContextImpl->gpu()->CreateShaderResourceView(
             m_texture.Get(),
             NULL,
             m_srv.ReleaseAndGetAddressOf()));
-        renderContextImpl->gpuContext()->GenerateMips(m_srv.Get());
+
+        if (format == GPUTextureFormat::rgba32 && generateRemainingMips &&
+            mipLevelCount > 1)
+        {
+            renderContextImpl->gpuContext()->GenerateMips(m_srv.Get());
+        }
     }
 
     ID3D11ShaderResourceView* srv() const { return m_srv.Get(); }
     ID3D11ShaderResourceView* const* srvAddressOf() const
     {
         return m_srv.GetAddressOf();
+    }
+    void* nativeHandle() const override
+    {
+        return static_cast<void*>(m_texture.Get());
     }
 
 private:
@@ -948,22 +1120,61 @@ rcp<Texture> RenderContextD3DImpl::makeImageTexture(
     uint32_t width,
     uint32_t height,
     uint32_t mipLevelCount,
-    const uint8_t imageDataRGBAPremul[])
+    GPUTextureFormat format,
+    const uint8_t imageDataRGBAPremul[],
+    uint8_t /*blockWidth*/,
+    uint8_t /*blockHeight*/,
+    bool /*srgb*/,
+    bool generateRemainingMips)
 {
     return make_rcp<TextureD3DImpl>(this,
                                     width,
                                     height,
                                     mipLevelCount,
-                                    imageDataRGBAPremul);
+                                    format,
+                                    imageDataRGBAPremul,
+                                    generateRemainingMips);
 }
 
 rcp<Texture> RenderContextD3DImpl::adoptImageTexture(
     ComPtr<ID3D11Texture2D> image,
     uint32_t width,
-    uint32_t height)
+    uint32_t height,
+    DXGI_FORMAT viewFormat)
 {
-    return make_rcp<TextureD3DImpl>(this, image, width, height);
+    return make_rcp<TextureD3DImpl>(this, image, width, height, viewFormat);
 }
+
+#ifdef RIVE_CANVAS
+void RenderContextD3DImpl::ensureCanvasBacking(gpu::RenderCanvas* canvas)
+{
+    if (canvas->isBacked())
+    {
+        return;
+    }
+
+    uint32_t width = canvas->width(), height = canvas->height();
+    auto texture = makeSimple2DTexture(DXGI_FORMAT_R8G8B8A8_UNORM,
+                                       width,
+                                       height,
+                                       1,
+                                       D3D11_BIND_UNORDERED_ACCESS |
+                                           D3D11_BIND_RENDER_TARGET |
+                                           D3D11_BIND_SHADER_RESOURCE);
+
+    auto renderTarget = makeRenderTarget(width, height);
+    renderTarget->setTargetTexture(texture);
+
+    canvas->setBacking(adoptImageTexture(texture, width, height),
+                       std::move(renderTarget));
+}
+
+std::unique_ptr<rive::ore::Context> RenderContextD3DImpl::makeOreContext()
+{
+    return rive::ore::ContextD3D11::Make(m_gpu.Get(), m_gpuContext.Get());
+}
+
+#endif
 
 class BufferRingD3D : public BufferRing
 {
@@ -1343,31 +1554,32 @@ void RenderContextD3DImpl::resizeTessellationTexture(uint32_t width,
     }
 }
 
-void RenderContextD3DImpl::resizeAtlasTexture(uint32_t width, uint32_t height)
+void RenderContextD3DImpl::resizeFeatherAtlasTexture(uint32_t width,
+                                                     uint32_t height)
 {
 
     if (width == 0 || height == 0)
     {
-        m_atlasTexture = nullptr;
-        m_atlasTextureSRV = nullptr;
-        m_atlasTextureRTV = nullptr;
+        m_featherAtlasTexture = nullptr;
+        m_featherAtlasTextureSRV = nullptr;
+        m_featherAtlasTextureRTV = nullptr;
     }
     else
     {
-        m_atlasTexture = makeSimple2DTexture(DXGI_FORMAT_R16_FLOAT,
-                                             width,
-                                             height,
-                                             1,
-                                             D3D11_BIND_RENDER_TARGET |
-                                                 D3D11_BIND_SHADER_RESOURCE);
+        m_featherAtlasTexture = makeSimple2DTexture(
+            DXGI_FORMAT_R16_FLOAT,
+            width,
+            height,
+            1,
+            D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
         VERIFY_OK(m_gpu->CreateShaderResourceView(
-            m_atlasTexture.Get(),
+            m_featherAtlasTexture.Get(),
             NULL,
-            m_atlasTextureSRV.ReleaseAndGetAddressOf()));
+            m_featherAtlasTextureSRV.ReleaseAndGetAddressOf()));
         VERIFY_OK(m_gpu->CreateRenderTargetView(
-            m_atlasTexture.Get(),
+            m_featherAtlasTexture.Get(),
             NULL,
-            m_atlasTextureRTV.ReleaseAndGetAddressOf()));
+            m_featherAtlasTextureRTV.ReleaseAndGetAddressOf()));
     }
 }
 
@@ -1421,7 +1633,7 @@ static void blit_sub_rect(ID3D11DeviceContext* gpuContext,
                                       &updateBox);
 }
 
-static D3D11_RECT make_scissor(const TAABB<uint16_t> scissor)
+static D3D11_RECT make_scissor(const AABBu16 scissor)
 {
     D3D11_RECT rect;
     rect.left = scissor.left;
@@ -1433,6 +1645,7 @@ static D3D11_RECT make_scissor(const TAABB<uint16_t> scissor)
 
 void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
 {
+    RIVE_PROF_GPUNAME_L(0, "RiveFlush");
     assert(desc.interlockMode != gpu::InterlockMode::clockwiseAtomic);
     auto renderTarget = static_cast<RenderTargetD3D*>(desc.renderTarget);
 
@@ -1449,12 +1662,9 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
         0);
 
     ID3D11Buffer* uniformBuffers[] = {m_flushUniforms.Get(),
-                                      m_drawUniforms.Get(),
-                                      m_imageDrawUniforms.Get()};
+                                      m_drawUniforms.Get()};
     static_assert(PATH_BASE_INSTANCE_UNIFORM_BUFFER_IDX ==
                   FLUSH_UNIFORM_BUFFER_IDX + 1);
-    static_assert(IMAGE_DRAW_UNIFORM_BUFFER_IDX ==
-                  PATH_BASE_INSTANCE_UNIFORM_BUFFER_IDX + 1);
     m_gpuContext->VSSetConstantBuffers(FLUSH_UNIFORM_BUFFER_IDX,
                                        std::size(uniformBuffers),
                                        uniformBuffers);
@@ -1507,26 +1717,29 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                                            storageBufferBufferSRVs + 1);
     }
 
-    // All programs use the same feather texture.
-    m_gpuContext->VSSetShaderResources(FEATHER_TEXTURE_IDX,
-                                       1,
-                                       m_featherTextureSRV.GetAddressOf());
-    m_gpuContext->PSSetShaderResources(FEATHER_TEXTURE_IDX,
-                                       1,
-                                       m_featherTextureSRV.GetAddressOf());
+    // All programs use the same gaussian integral texture.
+    m_gpuContext->VSSetShaderResources(
+        GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+        1,
+        m_gaussianIntegralTextureSRV.GetAddressOf());
+    m_gpuContext->PSSetShaderResources(
+        GAUSSIAN_INTEGRAL_TEXTURE_IDX,
+        1,
+        m_gaussianIntegralTextureSRV.GetAddressOf());
 
-    // All programs use the same samplers.
+    // The gradient, gaussian, and feather atlas samplers are the same for all
+    // programs.
     ID3D11SamplerState* samplers[4] = {
-        m_linearSampler.Get(),
-        m_linearSampler.Get(),
-        m_linearSampler.Get(),
-        // 0 is the default which is MIN_MAG_MIP_LINEAR
-        m_samplerStates[ImageSampler::LINEAR_CLAMP_SAMPLER_KEY].Get(),
+        m_samplerStates[BilinearRepeatImageSamplerKey].Get(), // gradient
+        m_samplerStates[BilinearClampImageSamplerKey].Get(),  // gaussian
+        m_samplerStates[BilinearClampImageSamplerKey].Get(),  // feather atlas
+        m_samplerStates[BilinearClampImageSamplerKey].Get(),  // default image
     };
 
-    static_assert(FEATHER_TEXTURE_IDX == GRAD_TEXTURE_IDX + 1);
-    static_assert(ATLAS_TEXTURE_IDX == FEATHER_TEXTURE_IDX + 1);
-    static_assert(IMAGE_TEXTURE_IDX == ATLAS_TEXTURE_IDX + 1);
+    static_assert(GAUSSIAN_INTEGRAL_TEXTURE_IDX == GRAD_TEXTURE_IDX + 1);
+    static_assert(FEATHER_ATLAS_TEXTURE_IDX ==
+                  GAUSSIAN_INTEGRAL_TEXTURE_IDX + 1);
+    static_assert(IMAGE_TEXTURE_IDX == FEATHER_ATLAS_TEXTURE_IDX + 1);
     m_gpuContext->PSSetSamplers(GRAD_TEXTURE_IDX, 4, samplers);
     m_gpuContext->VSSetSamplers(GRAD_TEXTURE_IDX, 4, samplers);
 
@@ -1576,7 +1789,7 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
     // Tessellate all curves into vertices in the tessellation texture.
     if (desc.tessVertexSpanCount > 0)
     {
-        RIVE_PROF_GPUNAME("Tessellate Curves");
+        RIVE_PROF_GPUNAME_L(1, "Tessellate Curves");
 
         ID3D11Buffer* tessSpanBuffer =
             flush_buffer(m_gpuContext.Get(), tessSpanBufferRing());
@@ -1657,43 +1870,49 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                                        1,
                                        m_gradTextureSRV.GetAddressOf());
 
-    // Render the atlas if we have any offscreen feathers.
-    if ((desc.atlasFillBatchCount | desc.atlasStrokeBatchCount) != 0)
+    // Render the feather atlas if we have any offscreen feathers.
+    if ((desc.featherAtlasFillBatchCount | desc.featherAtlasStrokeBatchCount) !=
+        0)
     {
-        RIVE_PROF_GPUNAME("atlasRender");
+        RIVE_PROF_GPUNAME_L(1, "featherAtlasRender");
 
         float clearZero[4]{};
-        m_gpuContext->ClearRenderTargetView(m_atlasTextureRTV.Get(), clearZero);
+        m_gpuContext->ClearRenderTargetView(m_featherAtlasTextureRTV.Get(),
+                                            clearZero);
 
-        m_pipelineManager.setAtlasVertexState();
+        m_pipelineManager.setFeatherAtlasVertexState();
         m_gpuContext->IASetPrimitiveTopology(
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         m_gpuContext->IASetIndexBuffer(m_patchIndexBuffer.Get(),
                                        DXGI_FORMAT_R16_UINT,
                                        0);
 
-        D3D11_VIEWPORT viewport = {0,
-                                   0,
-                                   static_cast<float>(desc.atlasContentWidth),
-                                   static_cast<float>(desc.atlasContentHeight),
-                                   0,
-                                   1};
+        D3D11_VIEWPORT viewport = {
+            0,
+            0,
+            static_cast<float>(desc.featherAtlasContentWidth),
+            static_cast<float>(desc.featherAtlasContentHeight),
+            0,
+            1,
+        };
         m_gpuContext->RSSetViewports(1, &viewport);
 
-        m_gpuContext->OMSetRenderTargets(1,
-                                         m_atlasTextureRTV.GetAddressOf(),
-                                         NULL);
+        m_gpuContext->OMSetRenderTargets(
+            1,
+            m_featherAtlasTextureRTV.GetAddressOf(),
+            NULL);
 
-        if (desc.atlasFillBatchCount != 0)
+        if (desc.featherAtlasFillBatchCount != 0)
         {
-            m_gpuContext->RSSetState(m_atlasFillRasterState.Get());
-            m_pipelineManager.setAtlasFillState();
+            m_gpuContext->RSSetState(m_featherAtlasFillRasterState.Get());
+            m_pipelineManager.setFeatherAtlasFillState();
             m_gpuContext->OMSetBlendState(m_plusBlendState.Get(),
                                           NULL,
                                           0xffffffff);
-            for (size_t i = 0; i < desc.atlasFillBatchCount; ++i)
+            for (size_t i = 0; i < desc.featherAtlasFillBatchCount; ++i)
             {
-                const gpu::AtlasDrawBatch& fillBatch = desc.atlasFillBatches[i];
+                const gpu::AtlasDrawBatch& fillBatch =
+                    desc.featherAtlasFillBatches[i];
                 D3D11_RECT scissor = make_scissor(fillBatch.scissor);
                 m_gpuContext->RSSetScissorRects(1, &scissor);
                 DrawUniforms drawUniforms(fillBatch.basePatch);
@@ -1712,17 +1931,17 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
             }
         }
 
-        if (desc.atlasStrokeBatchCount != 0)
+        if (desc.featherAtlasStrokeBatchCount != 0)
         {
-            m_gpuContext->RSSetState(m_atlasStrokeRasterState.Get());
-            m_pipelineManager.setAtlasStrokeState();
+            m_gpuContext->RSSetState(m_featherAtlasStrokeRasterState.Get());
+            m_pipelineManager.setFeatherAtlasStrokeState();
             m_gpuContext->OMSetBlendState(m_maxBlendState.Get(),
                                           NULL,
                                           0xffffffff);
-            for (size_t i = 0; i < desc.atlasStrokeBatchCount; ++i)
+            for (size_t i = 0; i < desc.featherAtlasStrokeBatchCount; ++i)
             {
                 const gpu::AtlasDrawBatch& strokeBatch =
-                    desc.atlasStrokeBatches[i];
+                    desc.featherAtlasStrokeBatches[i];
                 D3D11_RECT scissor = make_scissor(strokeBatch.scissor);
                 m_gpuContext->RSSetScissorRects(1, &scissor);
                 DrawUniforms drawUniforms(strokeBatch.basePatch);
@@ -1746,7 +1965,7 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
 
     // Setup and clear the PLS textures.
     {
-        RIVE_PROF_GPUNAME("clearPLSTextures");
+        RIVE_PROF_GPUNAME_L(1, "clearPLSTextures");
         switch (desc.colorLoadAction)
         {
 
@@ -1793,7 +2012,8 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
             case gpu::LoadAction::dontCare:
                 break;
         }
-        if (desc.combinedShaderFeatures & gpu::ShaderFeatures::ENABLE_CLIPPING)
+        if (enums::is_flag_set(desc.combinedShaderFeatures,
+                               gpu::ShaderFeatures::ENABLE_CLIPPING))
         {
             constexpr static UINT kZero[4]{};
             m_gpuContext->ClearUnorderedAccessViewUint(renderTarget->clipUAV(),
@@ -1807,7 +2027,7 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
         }
     }
 
-    RIVE_PROF_GPUNAME("DrawList");
+    RIVE_PROF_GPUNAME_L(1, "DrawList");
 
     // Execute the DrawList.
     ID3D11RenderTargetView* targetRTV =
@@ -1853,25 +2073,66 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
 
     // Set this last, when the atlas texture is no longer bound as a render
     // target.
-    m_gpuContext->PSSetShaderResources(ATLAS_TEXTURE_IDX,
+    m_gpuContext->PSSetShaderResources(FEATHER_ATLAS_TEXTURE_IDX,
                                        1,
-                                       m_atlasTextureSRV.GetAddressOf());
-
-    m_gpuContext->PSSetConstantBuffers(IMAGE_DRAW_UNIFORM_BUFFER_IDX,
-                                       1,
-                                       m_imageDrawUniforms.GetAddressOf());
-
-    const char* const imageDrawUniformData =
-        heap_buffer_contents(imageDrawUniformBufferRing());
+                                       m_featherAtlasTextureSRV.GetAddressOf());
 
     bool renderPassHasCoalescedResolveAndTransfer =
         desc.interlockMode == gpu::InterlockMode::atomics &&
         !desc.fixedFunctionColorOutput &&
         !renderTarget->targetTextureSupportsUAV();
 
+    const auto fullUpdateScissorRect =
+        desc.renderTargetUpdateBounds.lossless_numeric_cast<uint16_t>();
+
+    // Start the current scissor rect out inside-out to guarantee that the first
+    //  rectangle we get doesn't match it.
+    auto currentScissorRect = AABBu16{0xffff, 0xffff, 0, 0};
+
+    auto boundVertexInstanceType = BoundVertexInstanceType::none;
+
     for (const DrawBatch& batch : *desc.drawList)
     {
         DrawType drawType = batch.drawType;
+
+        if (drawType == DrawType::imageRect &&
+            boundVertexInstanceType != BoundVertexInstanceType::imageRect)
+        {
+            assert(imageRectInstanceBufferRing() != nullptr);
+
+            // Bind the image-rect-attribute records as a per-instance vertex
+            // buffer once; each image rect selects its record via the draw
+            // call's base instance (batch.baseElement).
+            ID3D11Buffer* imageRectInstanceBuffer =
+                flush_buffer(m_gpuContext.Get(), imageRectInstanceBufferRing());
+            UINT instanceStride = sizeof(gpu::ImageRectInstance);
+            UINT instanceOffset = 0;
+            m_gpuContext->IASetVertexBuffers(IMAGE_DRAW_INSTANCE_DATA_SLOT,
+                                             1,
+                                             &imageRectInstanceBuffer,
+                                             &instanceStride,
+                                             &instanceOffset);
+            boundVertexInstanceType = BoundVertexInstanceType::imageRect;
+        }
+        else if (drawType == DrawType::imageMesh &&
+                 boundVertexInstanceType != BoundVertexInstanceType::imageMesh)
+        {
+            assert(imageMeshInstanceBufferRing() != nullptr);
+
+            // Bind the image-mesh-attribute records as a per-instance vertex
+            // buffer once; each image mesh selects its record via the draw
+            // call's base instance (batch.baseElement).
+            ID3D11Buffer* imageMeshInstanceBuffer =
+                flush_buffer(m_gpuContext.Get(), imageMeshInstanceBufferRing());
+            UINT instanceStride = sizeof(gpu::ImageMeshInstance);
+            UINT instanceOffset = 0;
+            m_gpuContext->IASetVertexBuffers(IMAGE_DRAW_INSTANCE_DATA_SLOT,
+                                             1,
+                                             &imageMeshInstanceBuffer,
+                                             &instanceStride,
+                                             &instanceOffset);
+            boundVertexInstanceType = BoundVertexInstanceType::imageMesh;
+        }
 
         auto shaderFeatures = desc.interlockMode == gpu::InterlockMode::atomics
                                   ? desc.combinedShaderFeatures
@@ -1901,6 +2162,18 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
             continue;
         }
 
+        auto desiredScissorRect = batch.scissorRect.has_value()
+                                      ? fullUpdateScissorRect.intersectOrEmpty(
+                                            batch.scissorRect.value())
+                                      : fullUpdateScissorRect;
+
+        if (desiredScissorRect != currentScissorRect)
+        {
+            currentScissorRect = desiredScissorRect;
+            D3D11_RECT scissor = make_scissor(currentScissorRect);
+            m_gpuContext->RSSetScissorRects(1, &scissor);
+        }
+
         if (auto imageTextureD3D =
                 static_cast<const TextureD3DImpl*>(batch.imageTexture))
         {
@@ -1916,7 +2189,7 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                    ImageSampler::MAX_SAMPLER_PERMUTATIONS);
             ID3D11SamplerState* samplers[1] = {
                 m_samplerStates[batch.imageSampler.asKey()].Get()};
-            m_gpuContext->PSSetSamplers(IMAGE_SAMPLER_IDX, 1, samplers);
+            m_gpuContext->PSSetSamplers(IMAGE_TEXTURE_IDX, 1, samplers);
         }
 
         switch (drawType)
@@ -1939,30 +2212,31 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                                                 &drawUniforms,
                                                 0,
                                                 0);
-                RIVE_PROF_GPUNAME("Patches");
-                m_gpuContext->DrawIndexedInstanced(PatchIndexCount(drawType),
+                RIVE_PROF_GPUNAME_L(2, "Patches");
+                m_gpuContext->DrawIndexedInstanced(batch.indexCountPerInstance,
                                                    batch.elementCount,
-                                                   PatchBaseIndex(drawType),
+                                                   batch.baseIndex,
                                                    0,
                                                    batch.baseElement);
                 break;
             }
             case DrawType::interiorTriangulation:
-            case DrawType::atlasBlit:
+            case DrawType::featherAtlasBlit:
             {
                 m_gpuContext->IASetPrimitiveTopology(
                     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 m_gpuContext->RSSetState(
                     m_backCulledRasterState[desc.wireframe].Get());
-                RIVE_PROF_GPUNAME(drawType == DrawType::atlasBlit
-                                      ? "atlasBlit"
-                                      : "interiorTriangulation");
+                RIVE_PROF_GPUNAME_L(2,
+                                    drawType == DrawType::featherAtlasBlit
+                                        ? "featherAtlasBlit"
+                                        : "interiorTriangulation");
                 m_gpuContext->Draw(batch.elementCount, batch.baseElement);
                 break;
             }
             case DrawType::imageRect:
             {
-                RIVE_PROF_GPUNAME("imageRect");
+                RIVE_PROF_GPUNAME_L(2, "imageRect");
 
                 m_gpuContext->IASetPrimitiveTopology(
                     D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1971,21 +2245,16 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                                                0);
                 m_gpuContext->RSSetState(
                     m_doubleSidedRasterState[desc.wireframe].Get());
-                m_gpuContext->UpdateSubresource(m_imageDrawUniforms.Get(),
-                                                0,
-                                                NULL,
-                                                imageDrawUniformData +
-                                                    batch.imageDrawDataOffset,
-                                                0,
-                                                0);
-                m_gpuContext->DrawIndexed(std::size(gpu::kImageRectIndices),
-                                          0,
-                                          0);
+                m_gpuContext->DrawIndexedInstanced(batch.indexCountPerInstance,
+                                                   batch.elementCount,
+                                                   batch.baseIndex,
+                                                   0,
+                                                   batch.baseElement);
                 break;
             }
             case DrawType::imageMesh:
             {
-                RIVE_PROF_GPUNAME("imageMesh");
+                RIVE_PROF_GPUNAME_L(2, "imageMesh");
                 LITE_RTTI_CAST_OR_BREAK(vertexBuffer,
                                         RenderBufferD3DImpl*,
                                         batch.vertexBuffer);
@@ -2013,21 +2282,16 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                                                0);
                 m_gpuContext->RSSetState(
                     m_doubleSidedRasterState[desc.wireframe].Get());
-                m_gpuContext->UpdateSubresource(m_imageDrawUniforms.Get(),
-                                                0,
-                                                NULL,
-                                                imageDrawUniformData +
-                                                    batch.imageDrawDataOffset,
-                                                0,
-                                                0);
-                m_gpuContext->DrawIndexed(batch.elementCount,
-                                          batch.baseElement,
-                                          0);
+                m_gpuContext->DrawIndexedInstanced(batch.indexCountPerInstance,
+                                                   batch.elementCount,
+                                                   batch.baseIndex,
+                                                   0,
+                                                   batch.baseElement);
                 break;
             }
             case DrawType::renderPassResolve:
             {
-                RIVE_PROF_GPUNAME("renderPassResolve");
+                RIVE_PROF_GPUNAME_L(1, "renderPassResolve");
 
                 assert(desc.interlockMode == gpu::InterlockMode::atomics);
                 m_gpuContext->IASetPrimitiveTopology(
@@ -2069,15 +2333,23 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
                 m_gpuContext->Draw(4, 0);
             }
             break;
-            case DrawType::msaaStrokes:
-            case DrawType::msaaMidpointFanBorrowedCoverage:
-            case DrawType::msaaMidpointFans:
-            case DrawType::msaaMidpointFanStencilReset:
-            case DrawType::msaaMidpointFanPathsStencil:
-            case DrawType::msaaMidpointFanPathsCover:
-            case DrawType::msaaOuterCubics:
-            case DrawType::msaaStencilClipReset:
+            case DrawType::stencilMidpointFanBorrowedCoverage:
+            case DrawType::stencilDynamicMidpointFans:
+            case DrawType::stencilDynamicOuterCubics:
+            case DrawType::stencilMidpointFans:
+            case DrawType::stencilMidpointFanReset:
+            case DrawType::stencilMidpointFanWinding:
+            case DrawType::stencilMidpointFanCover:
+            case DrawType::stencilOuterCubicBorrowedCoverage:
+            case DrawType::stencilOuterCubicReset:
+            case DrawType::stencilOuterCubicWinding:
+            case DrawType::stencilOuterCubicCover:
+            case DrawType::stencilOuterCubics:
+            case DrawType::clipReset:
             case DrawType::renderPassInitialize:
+            case DrawType::depthStrokes:
+            case DrawType::depthAAStrokes:
+            case DrawType::depthAAOuterHairline:
                 RIVE_UNREACHABLE();
         }
     }
@@ -2085,7 +2357,7 @@ void RenderContextD3DImpl::flush(const FlushDescriptor& desc)
     if (desc.interlockMode == gpu::InterlockMode::rasterOrdering &&
         !renderTarget->targetTextureSupportsUAV())
     {
-        RIVE_PROF_GPUNAME("blit_sub_rect");
+        RIVE_PROF_GPUNAME_L(1, "blit_sub_rect");
 
         // We rendered to an offscreen UAV and did not resolve to the
         // renderTarget. Copy back to the main target.

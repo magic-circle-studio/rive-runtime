@@ -12,24 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 625;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case ListFollowPathConstraintBase::typeKey:
-            case FollowPathConstraintBase::typeKey:
-            case TransformSpaceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t distanceEndPropertyKey = 888;
@@ -47,8 +29,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distanceEndPropertyKey, &m_DistanceEnd, &value);
         m_DistanceEnd = value;
-        distanceEndChanged();
+        RIVE_EDITOR_CHANGED(distanceEndChanged());
+        notifyPropertyChanged(distanceEndPropertyKey);
     }
 
     inline float distanceOffset() const { return m_DistanceOffset; }
@@ -58,8 +42,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distanceOffsetPropertyKey,
+                             &m_DistanceOffset,
+                             &value);
         m_DistanceOffset = value;
-        distanceOffsetChanged();
+        RIVE_EDITOR_CHANGED(distanceOffsetChanged());
+        notifyPropertyChanged(distanceOffsetPropertyKey);
     }
 
     Core* clone() const override;
@@ -87,6 +75,9 @@ public:
 protected:
     virtual void distanceEndChanged() {}
     virtual void distanceOffsetChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/list_follow_path_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

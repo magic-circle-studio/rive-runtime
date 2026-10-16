@@ -10,13 +10,17 @@ class ListenerViewModelChange : public ListenerViewModelChangeBase
 public:
     ~ListenerViewModelChange();
     void perform(StateMachineInstance* stateMachineInstance,
-                 Vec2D position,
-                 Vec2D previousPosition,
-                 int pointerId) const override;
+                 const ListenerInvocation& invocation) const override;
     StatusCode import(ImportStack& importStack) override;
 
 private:
-    BindableProperty* m_bindableProperty;
+    // Writes the value selected by inputValue() from [invocation] into
+    // [bindableInstance]. Returns false when the invocation does not carry
+    // that value or the bindable's type does not match it.
+    bool applyInputValue(BindableProperty* bindableInstance,
+                         const ListenerInvocation& invocation) const;
+
+    BindableProperty* m_bindableProperty = nullptr;
 };
 } // namespace rive
 

@@ -7,9 +7,15 @@
 #include "rive_file_reader.hpp"
 #include "catch.hpp"
 #include "rive/animation/state_machine_instance.hpp"
+#include "rive/artboard_component_list.hpp"
+#include "rive/nested_artboard.hpp"
+#include "rive/viewmodel/viewmodel_instance_artboard.hpp"
 #include "rive/lua/scripting_vm.hpp"
+#ifdef WITH_RIVE_SCRIPTING_LUAU
 #include "rive/lua/rive_lua_libs.hpp"
+#endif
 #include <string>
+#include <vector>
 
 using namespace rive;
 
@@ -188,6 +194,35 @@ TEST_CASE("audio sounds from different artboards stop accordingly", "[audio]")
     REQUIRE(engine->playingSoundCount() == 0);
 }
 
+// An artboard with no engine of its own still starts its sounds on the
+// runtime engine, because AudioEvent::play falls back to it. Teardown has to
+// resolve the engine the same way, or those sounds keep playing into whatever
+// the process renders next. Artboard::audioEngine only pushes down the tree at
+// the moment it is called, so artboards instantiated later -- list items from
+// ArtboardComponentList::createArtboard -- still reach teardown with none.
+TEST_CASE("audio sounds stop when the artboard has no engine assigned",
+          "[audio]")
+{
+    rcp<AudioEngine> engine = AudioEngine::MakeAndStore(2, 44100);
+    REQUIRE(AudioEngine::RuntimeEngine(false) == engine);
+
+    auto file = ReadRiveFile("assets/sound.riv");
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+    // Deliberately no artboard->audioEngine(engine) here.
+
+    auto audioEvent = artboard->find<AudioEvent>()[0];
+    REQUIRE(audioEvent->asset() != nullptr);
+    REQUIRE(audioEvent->asset()->hasAudioSource());
+
+    audioEvent->play();
+    audioEvent->play();
+    REQUIRE(engine->playingSoundCount() == 2);
+
+    artboard = nullptr;
+    REQUIRE(engine->playingSoundCount() == 0);
+}
+
 TEST_CASE("Artboard has audio", "[audio]")
 {
     rcp<AudioEngine> engine = AudioEngine::Make(2, 44100);
@@ -233,6 +268,84 @@ TEST_CASE("Artboard does not have audio", "[audio]")
     REQUIRE(artboard->hasAudio() == false);
 }
 
+// List items are created after the engine is set, when the list's view model
+// fills in, so they have to pick it up from their host.
+TEST_CASE("List items use their host's audio engine", "[audio]")
+{
+    rcp<AudioEngine> engine = AudioEngine::Make(2, 44100);
+
+    auto file = ReadRiveFile("assets/component_list_1.riv");
+    auto artboard = file->artboard("Main")->instance();
+    REQUIRE(artboard != nullptr);
+    artboard->audioEngine(engine);
+
+    auto list = artboard->find<ArtboardComponentList>("List");
+    REQUIRE(list != nullptr);
+    REQUIRE(list->artboardCount() == 0);
+
+    auto viewModelInstance =
+        file->createDefaultViewModelInstance(artboard.get());
+    REQUIRE(viewModelInstance != nullptr);
+    artboard->bindViewModelInstance(viewModelInstance);
+    artboard->advance(0.0f);
+
+    REQUIRE(list->artboardCount() > 0);
+    for (int i = 0; i < (int)list->artboardCount(); i++)
+    {
+        auto item = list->artboardInstance(i);
+        REQUIRE(item != nullptr);
+        CHECK(item->audioEngine() == engine);
+    }
+}
+
+// Same for a nested artboard swapped in by data binding after the engine is
+// set.
+TEST_CASE("Swapped nested artboards use their host's audio engine", "[audio]")
+{
+    rcp<AudioEngine> engine = AudioEngine::Make(2, 44100);
+
+    auto file = ReadRiveFile("assets/data_binding_artboards_test.riv");
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+    artboard->audioEngine(engine);
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    int viewModelId = artboard.get()->viewModelId();
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+
+    auto nestedArtboards = artboard->find<NestedArtboard>();
+    std::vector<ArtboardInstance*> before;
+    for (auto nested : nestedArtboards)
+    {
+        before.push_back(nested->artboardInstance());
+    }
+
+    auto vmiArtboard =
+        vmi->propertyValue("ab")->as<ViewModelInstanceArtboard>();
+    vmiArtboard->asset(file->bindableArtboardNamed("ch1"));
+    stateMachine->advanceAndApply(0.1f);
+
+    bool swapped = false;
+    for (size_t i = 0; i < nestedArtboards.size(); i++)
+    {
+        auto instance = nestedArtboards[i]->artboardInstance();
+        if (instance == nullptr)
+        {
+            continue;
+        }
+        swapped = swapped || instance != before[i];
+        CHECK(instance->audioEngine() == engine);
+    }
+    REQUIRE(swapped);
+}
+
+// Scripted audio drives a Luau VM; the wasm backend covers audio through
+// the differential harness instead.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
 TEST_CASE("Scripted audio plays", "[audio]")
 {
     rcp<AudioEngine> engine = AudioEngine::MakeAndStore(2, 44100);
@@ -271,5 +384,50 @@ TEST_CASE("Scripted audio plays", "[audio]")
 
     REQUIRE(sound->volume() == 0.1f);
 }
+#endif
+
+TEST_CASE("audio source duration from file", "[audio]")
+{
+    auto file = loadFile("assets/audio/what.wav");
+    auto span = Span<uint8_t>(file);
+    rcp<AudioSource> audioSource = rcp<AudioSource>(new AudioSource(span));
+    REQUIRE(audioSource->channels() == 2);
+    REQUIRE(audioSource->sampleRate() == 44100);
+
+    float duration = audioSource->duration();
+    // 9688 frames at 44100 Hz
+    REQUIRE(duration == Approx(9688.0f / 44100.0f));
+
+    // Verify caching: second call returns same value without re-decoding.
+    REQUIRE(audioSource->duration() == duration);
+}
+
+TEST_CASE("audio source duration from buffered samples", "[audio]")
+{
+    const uint32_t numChannels = 2;
+    const uint32_t sampleRate = 48000;
+    const uint32_t numFrames = 48000; // 1 second worth of frames
+    std::vector<float> samples(numFrames * numChannels, 0.0f);
+    auto span = Span<float>(samples.data(), samples.size());
+    rcp<AudioSource> audioSource =
+        rcp<AudioSource>(new AudioSource(span, numChannels, sampleRate));
+    REQUIRE(audioSource->isBuffered());
+    REQUIRE(audioSource->duration() == Approx(1.0f));
+}
+
+#ifndef MA_NO_MP3
+TEST_CASE("audio source duration mp3", "[audio]")
+{
+    auto file = loadFile("assets/audio/song.mp3");
+    auto span = Span<uint8_t>(file);
+    rcp<AudioSource> audioSource = rcp<AudioSource>(new AudioSource(span));
+
+    float duration = audioSource->duration();
+    // Duration should be positive for a valid mp3.
+    REQUIRE(duration > 0.0f);
+    // Cached value should match.
+    REQUIRE(audioSource->duration() == duration);
+}
+#endif
 
 // TODO check if sound->stop calls completed callback!!!

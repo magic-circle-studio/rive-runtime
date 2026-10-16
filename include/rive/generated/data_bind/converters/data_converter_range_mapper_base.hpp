@@ -1,7 +1,9 @@
 #ifndef _RIVE_DATA_CONVERTER_RANGE_MAPPER_BASE_HPP_
 #define _RIVE_DATA_CONVERTER_RANGE_MAPPER_BASE_HPP_
 #include "rive/core/field_types/core_double_type.hpp"
+#include "rive/core/field_types/core_id_type.hpp"
 #include "rive/core/field_types/core_uint_type.hpp"
+#include "rive/core/id.hpp"
 #include "rive/data_bind/converters/data_converter.hpp"
 namespace rive
 {
@@ -12,20 +14,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 519;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DataConverterRangeMapperBase::typeKey:
-            case DataConverterBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -39,7 +27,7 @@ public:
 
 protected:
     uint32_t m_InterpolationType = 1;
-    uint32_t m_InterpolatorId = -1;
+    Id m_InterpolatorId = kEmptyId;
     uint32_t m_Flags = 0;
     float m_MinInput = 1.0f;
     float m_MaxInput = 1.0f;
@@ -54,19 +42,25 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(interpolationTypePropertyKey,
+                             &m_InterpolationType,
+                             &value);
         m_InterpolationType = value;
-        interpolationTypeChanged();
+        notifyPropertyChanged(interpolationTypePropertyKey);
     }
 
-    inline uint32_t interpolatorId() const { return m_InterpolatorId; }
-    void interpolatorId(uint32_t value)
+    inline Id interpolatorId() const { return m_InterpolatorId; }
+    void interpolatorId(Id value)
     {
         if (m_InterpolatorId == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(interpolatorIdPropertyKey,
+                             &m_InterpolatorId,
+                             &value);
         m_InterpolatorId = value;
-        interpolatorIdChanged();
+        notifyPropertyChanged(interpolatorIdPropertyKey);
     }
 
     inline uint32_t flags() const { return m_Flags; }
@@ -76,8 +70,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(flagsPropertyKey, &m_Flags, &value);
         m_Flags = value;
-        flagsChanged();
+        RIVE_EDITOR_CHANGED(flagsChanged());
+        notifyPropertyChanged(flagsPropertyKey);
     }
 
     inline float minInput() const { return m_MinInput; }
@@ -87,8 +83,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minInputPropertyKey, &m_MinInput, &value);
         m_MinInput = value;
-        minInputChanged();
+        RIVE_EDITOR_CHANGED(minInputChanged());
+        notifyPropertyChanged(minInputPropertyKey);
     }
 
     inline float maxInput() const { return m_MaxInput; }
@@ -98,8 +96,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxInputPropertyKey, &m_MaxInput, &value);
         m_MaxInput = value;
-        maxInputChanged();
+        RIVE_EDITOR_CHANGED(maxInputChanged());
+        notifyPropertyChanged(maxInputPropertyKey);
     }
 
     inline float minOutput() const { return m_MinOutput; }
@@ -109,8 +109,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minOutputPropertyKey, &m_MinOutput, &value);
         m_MinOutput = value;
-        minOutputChanged();
+        RIVE_EDITOR_CHANGED(minOutputChanged());
+        notifyPropertyChanged(minOutputPropertyKey);
     }
 
     inline float maxOutput() const { return m_MaxOutput; }
@@ -120,8 +122,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxOutputPropertyKey, &m_MaxOutput, &value);
         m_MaxOutput = value;
-        maxOutputChanged();
+        RIVE_EDITOR_CHANGED(maxOutputChanged());
+        notifyPropertyChanged(maxOutputPropertyKey);
     }
 
     Core* clone() const override;
@@ -145,7 +149,7 @@ public:
                 m_InterpolationType = CoreUintType::deserialize(reader);
                 return true;
             case interpolatorIdPropertyKey:
-                m_InterpolatorId = CoreUintType::deserialize(reader);
+                m_InterpolatorId = CoreIdType::runtimeDeserialize(reader);
                 return true;
             case flagsPropertyKey:
                 m_Flags = CoreUintType::deserialize(reader);
@@ -167,13 +171,14 @@ public:
     }
 
 protected:
-    virtual void interpolationTypeChanged() {}
-    virtual void interpolatorIdChanged() {}
     virtual void flagsChanged() {}
     virtual void minInputChanged() {}
     virtual void maxInputChanged() {}
     virtual void minOutputChanged() {}
     virtual void maxOutputChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/converters/data_converter_range_mapper_ext.inl"
+#endif
 };
 } // namespace rive
 

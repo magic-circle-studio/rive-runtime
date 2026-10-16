@@ -1,6 +1,8 @@
 /*
  * Copyright 2025 Rive
  */
+#pragma once
+
 #include "rive/renderer/async_pipeline_manager.hpp"
 #include "rive/renderer/d3d/d3d.hpp"
 #include "rive/renderer/gpu.hpp"
@@ -106,11 +108,12 @@ private:
     virtual std::unique_ptr<PipelineType> createPipeline(
         PipelineCreateType createType,
         uint32_t key,
-        const PipelineProps& props) override final
+        const PipelineProps& props,
+        const PlatformFeatures& platformFeatures) override final
     {
         if (createType == PipelineCreateType::async)
         {
-            this->queueBackgroundJob(key, props);
+            this->queueBackgroundJob(key, props, platformFeatures);
             return nullptr;
         }
 

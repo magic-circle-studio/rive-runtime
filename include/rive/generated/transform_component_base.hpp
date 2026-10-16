@@ -2,6 +2,9 @@
 #define _RIVE_TRANSFORM_COMPONENT_BASE_HPP_
 #include "rive/core/field_types/core_double_type.hpp"
 #include "rive/world_transform_component.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class TransformComponentBase : public WorldTransformComponent
@@ -11,22 +14,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 38;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -47,8 +34,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(rotationPropertyKey, &m_Rotation, &value);
         m_Rotation = value;
-        rotationChanged();
+        RIVE_EDITOR_CHANGED(rotationChanged());
+        notifyPropertyChanged(rotationPropertyKey);
     }
 
     inline float scaleX() const { return m_ScaleX; }
@@ -58,8 +47,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(scaleXPropertyKey, &m_ScaleX, &value);
         m_ScaleX = value;
-        scaleXChanged();
+        RIVE_EDITOR_CHANGED(scaleXChanged());
+        notifyPropertyChanged(scaleXPropertyKey);
     }
 
     inline float scaleY() const { return m_ScaleY; }
@@ -69,8 +60,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(scaleYPropertyKey, &m_ScaleY, &value);
         m_ScaleY = value;
-        scaleYChanged();
+        RIVE_EDITOR_CHANGED(scaleYChanged());
+        notifyPropertyChanged(scaleYPropertyKey);
     }
 
     void copy(const TransformComponentBase& object)
@@ -78,6 +71,7 @@ public:
         m_Rotation = object.m_Rotation;
         m_ScaleX = object.m_ScaleX;
         m_ScaleY = object.m_ScaleY;
+        RIVE_EDITOR_COPY(object);
         WorldTransformComponent::copy(object);
     }
 
@@ -95,6 +89,7 @@ public:
                 m_ScaleY = CoreDoubleType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return WorldTransformComponent::deserialize(propertyKey, reader);
     }
 
@@ -102,6 +97,9 @@ protected:
     virtual void rotationChanged() {}
     virtual void scaleXChanged() {}
     virtual void scaleYChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/transform_component_ext.inl"
+#endif
 };
 } // namespace rive
 

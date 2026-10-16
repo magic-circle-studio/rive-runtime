@@ -13,24 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 12;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case PathBase::typeKey:
-            case NodeBase::typeKey:
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t pathFlagsPropertyKey = 128;
@@ -48,8 +30,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(pathFlagsPropertyKey, &m_PathFlags, &value);
         m_PathFlags = value;
-        pathFlagsChanged();
+        notifyPropertyChanged(pathFlagsPropertyKey);
     }
 
     inline bool isHole() const { return m_IsHole; }
@@ -59,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(isHolePropertyKey, &m_IsHole, &value);
         m_IsHole = value;
-        isHoleChanged();
+        RIVE_EDITOR_CHANGED(isHoleChanged());
+        notifyPropertyChanged(isHolePropertyKey);
     }
 
     void copy(const PathBase& object)
@@ -85,8 +70,10 @@ public:
     }
 
 protected:
-    virtual void pathFlagsChanged() {}
     virtual void isHoleChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/path_ext.inl"
+#endif
 };
 } // namespace rive
 

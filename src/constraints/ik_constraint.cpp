@@ -1,6 +1,5 @@
 #include "rive/constraints/ik_constraint.hpp"
 #include "rive/bones/bone.hpp"
-#include "rive/artboard.hpp"
 #include "rive/math/math_types.hpp"
 #include <algorithm>
 
@@ -15,9 +14,9 @@ void IKConstraint::buildDependencies()
     // IK Constraint needs to depend on the target so that world transform
     // changes can propagate to the bones (and they can be reset before IK
     // runs).
-    if (m_Target != nullptr)
+    if (auto* t = target())
     {
-        m_Target->addDependent(this);
+        t->addDependent(this);
     }
 }
 
@@ -52,32 +51,23 @@ StatusCode IKConstraint::onAddedClean(CoreContext* context)
         link.angle = 0.0f;
     }
 
-    // Make sure all of the first level children of each bone depend on the
-    // tip (constrainedComponent).
+    // Make sure all of the first level children of each bone (other than the
+    // chain bones themselves) depend on the tip (constrainedComponent). The
+    // chain is built by walking up parents, so the only chain bone that can
+    // appear among an ancestor's direct children is the next bone down the
+    // chain — bones[i - 1].
     auto tip = parent()->as<Bone>();
-
-    auto artboard = static_cast<Artboard*>(context);
-
-    // Find all children of this bone (we don't directly build up
-    // hierarchy at runtime, so we have to traverse everything and check
-    // parents).
-    for (auto core : artboard->objects())
+    for (int i = 1; i < numBones; i++)
     {
-        if (core == nullptr || !core->is<TransformComponent>())
+        Bone* ancestor = bones[i];
+        Bone* chainChild = bones[i - 1];
+        for (Component* child : ancestor->children())
         {
-            continue;
-        }
-        auto transformComponent = core->as<TransformComponent>();
-
-        for (int i = 1; i < numBones; i++)
-        {
-            auto childBone = bones[i];
-            if (transformComponent->parent() == childBone &&
-                std::find(bones.begin(), bones.end(), transformComponent) ==
-                    bones.end())
+            if (!child->is<TransformComponent>() || child == chainChild)
             {
-                tip->addDependent(transformComponent);
+                continue;
             }
+            tip->addDependent(child->as<TransformComponent>());
         }
     }
     return Super::onAddedClean(context);
@@ -183,9 +173,7 @@ void IKConstraint::solve2(BoneChainLink* fk1,
     constrainRotation(*firstChild, r2);
     if (firstChild != fk2)
     {
-        Bone* bone = fk2->bone;
-        bone->mutableWorldTransform() =
-            getParentWorld(*bone) * bone->transform();
+        fk2->bone->composeWorldTransform();
     }
 
     // Simple storage, need this for interpolation.
@@ -195,10 +183,24 @@ void IKConstraint::solve2(BoneChainLink* fk1,
 
 void IKConstraint::invertDirectionChanged() { markConstraintDirty(); }
 
+// True while the bone's world is still ours composed under its current parent,
+// so the angle on it is ours and not a rebuilt pose. Comparing worlds instead
+// would read a moved parent as someone else's work.
+bool IKConstraint::BoneChainLink::holdsOurSolve() const
+{
+    return solved &&
+           getParentWorld(*bone) * solvedLocal == bone->worldTransform();
+}
+
+void IKConstraint::BoneChainLink::recordSolve()
+{
+    solvedLocal = bone->transform();
+    solved = true;
+}
+
 void IKConstraint::constrainRotation(BoneChainLink& fk, float rotation)
 {
     Bone* bone = fk.bone;
-    const Mat2D& parentWorld = getParentWorld(*bone);
     Mat2D& transform = bone->mutableTransform();
     TransformComponents& c = fk.transformComponents;
 
@@ -223,28 +225,45 @@ void IKConstraint::constrainRotation(BoneChainLink& fk, float rotation)
         transform[3] = transform[1] * skew + transform[3];
     }
 
-    bone->mutableWorldTransform() = parentWorld * transform;
+    bone->composeWorldTransform();
 }
 
 void IKConstraint::constrain(TransformComponent* component)
 {
-    if (m_Target == nullptr || m_Target->isCollapsed())
+    auto* tgt = target();
+    if (tgt == nullptr || tgt->isCollapsed())
     {
         return;
     }
 
-    Vec2D worldTargetTranslation = m_Target->worldTranslation();
+    Vec2D worldTargetTranslation = tgt->worldTranslation();
 
-    // Decompose the chain.
+    // The pose to blend from: whatever ran before us leaves its work here.
     for (BoneChainLink& item : m_FkChain)
     {
-        auto bone = item.bone;
-        const Mat2D& parentWorld = getParentWorld(*bone);
-        item.parentWorldInverse = parentWorld.invertOrIdentity();
+        item.parentWorldInverse = getParentWorld(*item.bone).invertOrIdentity();
+        item.transformComponents =
+            (item.parentWorldInverse * item.bone->worldTransform()).decompose();
+        item.ours = item.holdsOurSolve();
+        if (item.ours)
+        {
+            // Our own angle. Blending from it creeps toward the full solution.
+            item.transformComponents.rotation(item.baseRotation);
+        }
+        item.baseRotation = item.transformComponents.rotation();
+    }
 
-        Mat2D& boneTransform = bone->mutableTransform();
-        boneTransform = item.parentWorldInverse * bone->worldTransform();
-        item.transformComponents = boneTransform.decompose();
+    // Longer chains solve from the pose they stand in, so put ours back first.
+    bool rebuilt = false;
+    for (BoneChainLink& item : m_FkChain)
+    {
+        rebuilt = rebuilt || item.ours;
+        if (rebuilt)
+        {
+            item.parentWorldInverse =
+                getParentWorld(*item.bone).invertOrIdentity();
+            constrainRotation(item, item.transformComponents.rotation());
+        }
     }
 
     int count = (int)m_FkChain.size();
@@ -296,5 +315,11 @@ void IKConstraint::constrain(TransformComponent* component)
             float angle = fromAngle + diff * strength();
             constrainRotation(fk, angle);
         }
+    }
+
+    // Lets the next solve tell our own output from a rebuilt pose.
+    for (BoneChainLink& item : m_FkChain)
+    {
+        item.recordSolve();
     }
 }

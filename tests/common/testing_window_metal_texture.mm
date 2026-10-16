@@ -22,11 +22,17 @@ public:
         // Turn on synchronous shader compilations to ensure deterministic
         // rendering and to make sure we test every unique shader.
         metalOptions.shaderCompilationMode =
-            ShaderCompilationMode::alwaysSynchronous;
+            backendParams.shaderCompilationMode;
         metalOptions.disableFramebufferReads = backendParams.atomic;
         m_renderContext =
             RenderContextMetalImpl::MakeContext(m_gpu, metalOptions);
-        printf("==== MTLDevice: %s ====\n", m_gpu.name.UTF8String);
+        m_renderContext->static_impl_cast<RenderContextMetalImpl>()
+            ->setCommandQueue(m_queue);
+        printf("==== MTLDevice: %s (%s) ====\n",
+               m_gpu.name.UTF8String,
+               // MTLDebugDevice when API validation is on, the real driver
+               // class when it isn't.
+               NSStringFromClass([m_gpu class]).UTF8String);
     }
 
     rive::Factory* factory() override { return m_renderContext.get(); }
@@ -47,6 +53,7 @@ public:
                               : rive::gpu::LoadAction::preserveRenderTarget,
             .clearColor = options.clearColor,
             .disableRasterOrdering = options.disableRasterOrdering,
+            .triangulationThresholds = options.triangulationThresholds,
             .wireframe = options.wireframe,
             .fillsDisabled = options.fillsDisabled,
             .strokesDisabled = options.strokesDisabled,
@@ -54,32 +61,25 @@ public:
             .synthesizedFailureType = options.synthesizedFailureType,
         };
         m_renderContext->beginFrame(frameDescriptor);
-        m_flushCommandBuffer = [m_queue commandBuffer];
+        // Ore replays into the target before the first flush.
+        ensureRenderTarget();
         return std::make_unique<RiveRenderer>(m_renderContext.get());
     }
 
+    rive::gpu::RenderTarget* renderTarget() const override
+    {
+        return m_renderTarget.get();
+    }
+
+    OreTarget oreTarget() const override { return {true, true}; }
+
     void flushPLSContext(RenderTarget* offscreenRenderTarget) final
     {
-        if (!m_renderTarget || m_renderTarget->height() != m_height ||
-            m_renderTarget->width() != m_width)
+        // A deferred replay flushes canvases before beginFrame, so the buffer
+        // may not exist yet.
+        if (m_flushCommandBuffer == nil)
         {
-            m_renderTarget =
-                m_renderContext->static_impl_cast<RenderContextMetalImpl>()
-                    ->makeRenderTarget(
-                        MTLPixelFormatBGRA8Unorm, m_width, m_height);
-            MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
-            desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
-            desc.width = m_width;
-            desc.height = m_height;
-            desc.usage = MTLTextureUsageRenderTarget;
-            desc.textureType = MTLTextureType2D;
-            desc.mipmapLevelCount = 1;
-            desc.storageMode = MTLStorageModePrivate;
-            m_renderTarget->setTargetTexture(
-                [m_gpu newTextureWithDescriptor:desc]);
-            m_pixelReadBuff =
-                [m_gpu newBufferWithLength:m_height * m_width * 4
-                                   options:MTLResourceStorageModeShared];
+            m_flushCommandBuffer = [m_queue commandBuffer];
         }
         m_renderContext->flush({
             .renderTarget = offscreenRenderTarget != nullptr
@@ -87,6 +87,12 @@ public:
                                 : m_renderTarget.get(),
             .externalCommandBuffer = (__bridge void*)m_flushCommandBuffer,
         });
+        // Commit the command buffer now so the buffer ring lock is released
+        // immediately (via the completed handler). Allocate a fresh one for
+        // any subsequent work in endFrame(). Without this, multiple canvas
+        // flushes before endFrame() would deadlock on the buffer ring.
+        [m_flushCommandBuffer commit];
+        m_flushCommandBuffer = [m_queue commandBuffer];
     }
 
     void endFrame(std::vector<uint8_t>* pixelData) override
@@ -144,7 +150,63 @@ public:
         m_flushCommandBuffer = nil;
     }
 
+#if defined(__APPLE__) && !defined(RIVE_UNREAL)
+    // Returns the Metal command queue as void* to avoid <Metal/Metal.h> in
+    // this cross-platform header (same pattern as externalCommandBuffer).
+    void* metalQueue() const override { return (__bridge void*)m_queue; }
+#endif
+
+    void* getCurrentCommandBuffer() const override
+    {
+        return (__bridge void*)m_queue;
+    }
+
+    void* getOreContext() const override
+    {
+        return m_renderContext->getOreContext();
+    }
+
+    void beginOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+
+        oreContext->beginFrame({});
+    }
+    void endOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+
+        oreContext->endFrame();
+    }
+
 private:
+    void ensureRenderTarget()
+    {
+        if (!m_renderTarget || m_renderTarget->height() != m_height ||
+            m_renderTarget->width() != m_width)
+        {
+            m_renderTarget =
+                m_renderContext->static_impl_cast<RenderContextMetalImpl>()
+                    ->makeRenderTarget(
+                        MTLPixelFormatBGRA8Unorm, m_width, m_height);
+            MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+            desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            desc.width = m_width;
+            desc.height = m_height;
+            desc.usage = MTLTextureUsageRenderTarget;
+            desc.textureType = MTLTextureType2D;
+            desc.mipmapLevelCount = 1;
+            desc.storageMode = MTLStorageModePrivate;
+            m_renderTarget->setTargetTexture(
+                [m_gpu newTextureWithDescriptor:desc]);
+            m_pixelReadBuff =
+                [m_gpu newBufferWithLength:m_height * m_width * 4
+                                   options:MTLResourceStorageModeShared];
+        }
+    }
+
     id<MTLDevice> m_gpu = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> m_queue = [m_gpu newCommandQueue];
     std::unique_ptr<RenderContext> m_renderContext;

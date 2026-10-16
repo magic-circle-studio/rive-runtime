@@ -6,6 +6,9 @@
 #include "rive/core/field_types/core_string_type.hpp"
 #include "rive/core/field_types/core_uint_type.hpp"
 #include "rive/span.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class FileAssetBase : public Asset
@@ -15,20 +18,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 103;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case FileAssetBase::typeKey:
-            case AssetBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -48,8 +37,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(assetIdPropertyKey, &m_AssetId, &value);
         m_AssetId = value;
-        assetIdChanged();
+        RIVE_EDITOR_CHANGED(assetIdChanged());
+        notifyPropertyChanged(assetIdPropertyKey);
     }
 
     virtual void decodeCdnUuid(Span<const uint8_t> value) = 0;
@@ -62,8 +53,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_STRING_CHANGING(cdnBaseUrlPropertyKey, m_CdnBaseUrl, value);
         m_CdnBaseUrl = value;
-        cdnBaseUrlChanged();
+        notifyPropertyChanged(cdnBaseUrlPropertyKey);
     }
 
     void copy(const FileAssetBase& object)
@@ -71,6 +63,7 @@ public:
         m_AssetId = object.m_AssetId;
         copyCdnUuid(object);
         m_CdnBaseUrl = object.m_CdnBaseUrl;
+        RIVE_EDITOR_COPY(object);
         Asset::copy(object);
     }
 
@@ -88,13 +81,15 @@ public:
                 m_CdnBaseUrl = CoreStringType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return Asset::deserialize(propertyKey, reader);
     }
 
 protected:
     virtual void assetIdChanged() {}
-    virtual void cdnUuidChanged() {}
-    virtual void cdnBaseUrlChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/assets/file_asset_ext.inl"
+#endif
 };
 } // namespace rive
 

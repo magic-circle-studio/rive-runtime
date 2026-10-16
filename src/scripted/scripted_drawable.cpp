@@ -1,31 +1,40 @@
-#ifdef WITH_RIVE_SCRIPTING
-#include "rive/lua/rive_lua_libs.hpp"
-#endif
+#include "rive/animation/listener_invocation.hpp"
+#include "rive/artboard.hpp"
 #include "rive/component_dirt.hpp"
 #include "rive/assets/script_asset.hpp"
 #include "rive/scripted/scripted_drawable.hpp"
+#include "rive/scripted/scripted_layout.hpp"
 
 using namespace rive;
 
 #ifdef WITH_RIVE_SCRIPTING
-bool ScriptedDrawable::scriptInit(ScriptingVM* vm)
+
+void ScriptedDrawable::didHydrateScriptInputs()
 {
-    ScriptedObject::scriptInit(vm);
+    m_isAdvanceActive = true;
     addDirt(ComponentDirt::Paint);
-    return true;
+}
+
+void ScriptedDrawable::didReinit()
+{
+    // A paused editor never ticks scripts, so advance and update driven
+    // content, like gpu canvas fills, would stay blank until play; force one
+    // zero step and an update to re-record it.
+    m_isAdvanceActive = true;
+    m_forceAdvance = true;
+    addDirt(ComponentDirt::Paint | ComponentDirt::ScriptUpdate);
 }
 
 void ScriptedDrawable::draw(Renderer* renderer)
 {
-    if (!draws() || m_vm == nullptr)
+    if (!draws() || m_vm == nullptr || !m_vm->valid())
     {
         return;
     }
 
-    lua_State* L = state();
     float opacity = renderOpacity();
     bool needsOpacitySave = (opacity != 1.0f);
-    if (m_needsSaveOperation || needsOpacitySave)
+    if (needsSaveOperation() || needsOpacitySave)
     {
         renderer->save();
     }
@@ -36,27 +45,9 @@ void ScriptedDrawable::draw(Renderer* renderer)
     }
 
     renderer->transform(worldTransform());
-    // Stack: []
-    auto scriptedRenderer = lua_newrive<ScriptedRenderer>(L, renderer);
-    // Stack: [scriptedRenderer]
-    rive_lua_pushRef(L, m_self);
-    // Stack: [scriptedRenderer, self]
-    lua_getfield(L, -1, "draw");
-    // Stack: [scriptedRenderer, self, "draw"]
-    lua_pushvalue(L, -2);
-    // Stack: [scriptedRenderer, self, "draw", self]
-    lua_pushvalue(L, -4);
-    // Stack: [scriptedRenderer, self, "draw", self, scriptedRenderer]
-    if (static_cast<lua_Status>(rive_lua_pcall(L, 2, 0)) != LUA_OK)
-    {
-        // Stack: [scriptedRenderer, self, status]
-        rive_lua_pop(L, 1);
-    }
-    scriptedRenderer->end();
-    // Stack: [scriptedRenderer, self]
-    rive_lua_pop(L, 2);
+    m_vm->callDraw(this, m_self, renderer);
 
-    if (m_needsSaveOperation || needsOpacitySave)
+    if (needsSaveOperation() || needsOpacitySave)
     {
         renderer->restore();
     }
@@ -73,16 +64,46 @@ std::vector<HitComponent*> ScriptedDrawable::hitComponents(
     return std::vector<HitComponent*>{hitComponent};
 }
 
+bool ScriptedDrawable::gamepadDispatch(const ListenerInvocation& inv)
+{
+    if (m_vm == nullptr || !m_vm->valid())
+    {
+        return false;
+    }
+    const char* method = nullptr;
+    switch (inv.kind())
+    {
+        case ListenerInvocationKind::gamepadConnected:
+            method = "gamepadConnected";
+            break;
+        case ListenerInvocationKind::gamepadEvent:
+            method = "gamepadEvent";
+            break;
+        case ListenerInvocationKind::gamepadDisconnected:
+            method = "gamepadDisconnected";
+            break;
+        default:
+            return false;
+    }
+    if (!m_vm->callGamepadEvent(this, m_self, method, inv))
+    {
+        return false;
+    }
+    wakeAdvance();
+    return true;
+}
+
 HitResult HitScriptedDrawable::processEvent(Vec2D position,
                                             ListenerType hitType,
                                             bool canHit,
                                             float timeStamp,
-                                            int pointerId)
+                                            int pointerId,
+                                            PointerButton button)
 {
     HitResult hitResult = HitResult::none;
     auto scriptAsset = m_drawable->scriptAsset();
-    auto state = m_drawable->state();
-    if (state == nullptr || scriptAsset == nullptr ||
+    auto backend = m_drawable->backend();
+    if (backend == nullptr || !backend->valid() || scriptAsset == nullptr ||
         !handlesEvent(canHit, hitType))
     {
         return HitResult::none;
@@ -93,28 +114,108 @@ HitResult HitScriptedDrawable::processEvent(Vec2D position,
     {
         return hitResult;
     }
-    rive_lua_pushRef(state, m_drawable->self());
     auto mName = methodName(canHit, hitType);
-    if (static_cast<lua_Type>(lua_getfield(state, -1, mName.c_str())) !=
-        LUA_TFUNCTION)
+    if (backend->callPointerEvent(m_drawable,
+                                  m_drawable->self(),
+                                  mName.c_str(),
+                                  pointerId,
+                                  localPos,
+                                  canHit ? hitType : ListenerType::exit,
+                                  timeStamp,
+                                  &hitResult))
     {
-        fprintf(stderr, "expected %s to be a function\n", mName.c_str());
-        rive_lua_pop(state, 1);
+        m_drawable->wakeAdvance();
     }
-    else
-    {
-        lua_pushvalue(state, -2);
-        auto pointerEvent =
-            lua_newrive<ScriptedPointerEvent>(state, pointerId, localPos);
-        if (static_cast<lua_Status>(rive_lua_pcall(state, 2, 0)) != LUA_OK)
-        {
-            fprintf(stderr, "%s failed\n", mName.c_str());
-            rive_lua_pop(state, 1);
-        }
-        hitResult = pointerEvent->m_hitResult;
-    }
-    rive_lua_pop(state, 1);
     return hitResult;
+}
+
+HitResult HitScriptedDrawable::processScroll(Vec2D position,
+                                             const ScrollEvent& event,
+                                             float timeStamp,
+                                             int pointerId)
+{
+    HitResult hitResult = HitResult::none;
+    auto backend = m_drawable->backend();
+    Mat2D toLocal;
+    if (backend == nullptr || !backend->valid() ||
+        m_drawable->scriptAsset() == nullptr || m_drawable->isCollapsed() ||
+        !m_drawable->worldTransform().invert(&toLocal))
+    {
+        m_drawable->scrollLatched(false);
+        return hitResult;
+    }
+    Vec2D localPos = toLocal * position;
+    ScrollEvent local = event;
+    local.delta = toLocal * (position + event.delta) - localPos;
+    if (backend->callScrollEvent(m_drawable,
+                                 m_drawable->self(),
+                                 pointerId,
+                                 localPos,
+                                 local,
+                                 timeStamp,
+                                 &hitResult))
+    {
+        m_drawable->wakeAdvance();
+    }
+    // A claim latches the gesture, which then stays until it ends; a wheel
+    // detent never latches.
+    bool latchable = event.phase == ScrollPhase::begin ||
+                     event.phase == ScrollPhase::momentum ||
+                     (event.phase == ScrollPhase::update && event.precise);
+    m_drawable->scrollLatched(latchable && (hitResult != HitResult::none ||
+                                            m_drawable->scrollLatched()));
+    return hitResult;
+}
+
+HitResult HitScriptedDrawable::processGamepadInvocation(
+    const ListenerInvocation&,
+    ScriptedDrawable*)
+{
+    // Gamepad dispatch to ScriptedDrawables runs through
+    // StateMachineInstance::broadcastGamepadToScriptedDrawables's walk over
+    // m_gamepadScriptedDrawables — that list includes gamepad-only scripts
+    // (which never enter m_hitComponents because hitComponents() is gated on
+    // listensToPointerEvents()). Returning none here avoids double-dispatch
+    // for drawables that handle both pointer and gamepad.
+    return HitResult::none;
+}
+
+bool ScriptedDrawable::keyInput(Key key,
+                                KeyModifiers modifiers,
+                                bool isPressed,
+                                bool isRepeat)
+{
+    if (!wantsKeyboardInput())
+    {
+        return false;
+    }
+    if (m_vm == nullptr || !m_vm->valid())
+    {
+        return false;
+    }
+    bool shouldStopPropagation = m_vm->callKeyboardEvent(this,
+                                                         self(),
+                                                         key,
+                                                         modifiers,
+                                                         isPressed,
+                                                         isRepeat);
+    wakeAdvance();
+    return shouldStopPropagation;
+}
+
+bool ScriptedDrawable::textInput(const std::string& text)
+{
+    if (!wantsTextInput())
+    {
+        return false;
+    }
+    if (m_vm == nullptr || !m_vm->valid())
+    {
+        return false;
+    }
+    bool shouldStopPropagation = m_vm->callTextEvent(this, self(), text);
+    wakeAdvance();
+    return shouldStopPropagation;
 }
 
 bool ScriptedDrawable::willDraw()
@@ -135,7 +236,24 @@ HitResult HitScriptedDrawable::processEvent(Vec2D position,
                                             ListenerType hitType,
                                             bool canHit,
                                             float timeStamp,
-                                            int pointerId)
+                                            int pointerId,
+                                            PointerButton button)
+{
+    return HitResult::none;
+}
+
+HitResult HitScriptedDrawable::processGamepadInvocation(
+    const ListenerInvocation& invocation,
+    ScriptedDrawable* alreadyDispatched)
+{
+    // TODO: implement
+    return HitResult::none;
+}
+
+HitResult HitScriptedDrawable::processScroll(Vec2D position,
+                                             const ScrollEvent& event,
+                                             float timeStamp,
+                                             int pointerId)
 {
     return HitResult::none;
 }
@@ -154,6 +272,12 @@ void ScriptedDrawable::update(ComponentDirt value)
     }
 }
 
+void ScriptedDrawable::wakeAdvance()
+{
+    m_isAdvanceActive = true;
+    addScriptedDirt(ComponentDirt::Paint);
+}
+
 Core* ScriptedDrawable::hitTest(HitInfo*, const Mat2D&) { return nullptr; }
 
 StatusCode ScriptedDrawable::onAddedDirty(CoreContext* context)
@@ -170,16 +294,27 @@ StatusCode ScriptedDrawable::onAddedDirty(CoreContext* context)
 bool ScriptedDrawable::advanceComponent(float elapsedSeconds,
                                         AdvanceFlags flags)
 {
-    if (elapsedSeconds == 0)
+    bool forced = m_forceAdvance;
+    m_forceAdvance = false;
+    if (elapsedSeconds == 0 && !forced)
     {
         return false;
     }
-    if (!m_isAdvanceActive)
+    // A gesture that reports no end of its own releases the latch by going
+    // quiet, as a ScrollConstraint's does.
+    if (m_scrollLatched &&
+        enums::is_flag_set(flags, AdvanceFlags::AdvanceNested) &&
+        enums::is_flag_set(flags, AdvanceFlags::NewFrame))
     {
-        return false;
+        m_scrollIdleSeconds += elapsedSeconds;
+        m_scrollLatched = m_scrollIdleSeconds < scrollIdleSeconds;
+    }
+    if (!m_isAdvanceActive || isCollapsed())
+    {
+        return m_scrollLatched;
     }
     m_isAdvanceActive = false;
-    if ((flags & AdvanceFlags::AdvanceNested) == 0)
+    if (!enums::is_flag_set(flags, AdvanceFlags::AdvanceNested))
     {
         elapsedSeconds = 0;
     }
@@ -189,7 +324,7 @@ bool ScriptedDrawable::advanceComponent(float elapsedSeconds,
         m_isAdvanceActive = true;
         addScriptedDirt(ComponentDirt::Paint);
     }
-    return advanced;
+    return advanced || m_scrollLatched;
 }
 
 bool ScriptedDrawable::addScriptedDirt(ComponentDirt value, bool recurse)
@@ -230,7 +365,58 @@ Core* ScriptedDrawable::clone() const
 
 void ScriptedDrawable::markNeedsUpdate()
 {
+    if (inUpdatePhase())
+    {
+        return;
+    }
     addScriptedDirt(ComponentDirt::ScriptUpdate);
+}
+
+bool HitScriptedDrawable::hitTestBounded(Vec2D position) const
+{
+    if (!m_drawable->is<ScriptedLayout>())
+    {
+        // A scripted node has no box of its own; everywhere, like hitTest.
+        return true;
+    }
+    Vec2D size;
+    if (!m_drawable->as<ScriptedLayout>()->layoutSize(size))
+    {
+        return false;
+    }
+    Vec2D local;
+    if (!m_drawable->worldToLocal(position, &local))
+    {
+        return false;
+    }
+    return local.x >= 0.0f && local.y >= 0.0f && local.x <= size.x &&
+           local.y <= size.y;
+}
+
+bool HitScriptedDrawable::hasScrollTarget(Vec2D position)
+{
+    if (!m_drawable->wantsPointerScroll() || m_drawable->isCollapsed())
+    {
+        return false;
+    }
+    if (m_drawable->is<ScriptedLayout>())
+    {
+        return hitTestBounded(position);
+    }
+    // A node has no box, so its artboard bounds it; hosts would otherwise
+    // lose every wheel event to it.
+    auto artboard = m_drawable->artboard();
+    return artboard != nullptr && artboard->bounds().contains(position);
+}
+
+bool HitScriptedDrawable::scrollGestureActive()
+{
+    // Like a collapsed ScrollConstraint, a collapsed script ends its gesture.
+    if (m_drawable->isCollapsed())
+    {
+        m_drawable->scrollLatched(false);
+    }
+    return m_drawable->scrollLatched();
 }
 
 bool ScriptedDrawable::worldToLocal(Vec2D world, Vec2D* local)

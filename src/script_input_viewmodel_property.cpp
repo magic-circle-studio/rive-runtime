@@ -45,6 +45,44 @@ void ScriptInputViewModelProperty::initScriptedValue()
 
 bool ScriptInputViewModelProperty::validateForScriptInit()
 {
+    // Binding validation happens in hydrateScriptInput(); cold init does not
+    // require a resolved view-model property.
+    m_viewModelInstanceValue = nullptr;
+    return true;
+}
+
+bool ScriptInputViewModelProperty::validateForColdScriptInit()
+{
+    m_viewModelInstanceValue = nullptr;
+    return true;
+}
+
+bool ScriptInputViewModelProperty::validateHydrationPrerequisites()
+{
+    auto scriptedObj = scriptedObject();
+    if (scriptedObj == nullptr)
+    {
+        return false;
+    }
+    auto dataContext = scriptedObj->dataContext();
+    if (dataContext == nullptr)
+    {
+        return false;
+    }
+    if (m_dataBindPath == nullptr)
+    {
+        return false;
+    }
+    auto instanceValue = dataContext->getViewModelProperty(m_dataBindPath);
+    if (instanceValue == nullptr)
+    {
+        return false;
+    }
+    return instanceValue->viewModelProperty() != nullptr;
+}
+
+bool ScriptInputViewModelProperty::hydrateScriptInput()
+{
     m_viewModelInstanceValue = nullptr;
     auto scriptedObj = scriptedObject();
     if (scriptedObj == nullptr)
@@ -71,14 +109,14 @@ bool ScriptInputViewModelProperty::validateForScriptInit()
         return false;
     }
     m_viewModelInstanceValue = instanceValue;
+    initScriptedValue();
     return true;
 }
 
 StatusCode ScriptInputViewModelProperty::import(ImportStack& importStack)
 {
     importDataBindPath(importStack);
-    auto importer =
-        importStack.latest<ScriptedObjectImporter>(ScriptedDrawable::typeKey);
+    auto importer = ScriptInput::ownerImporter(importStack, this);
     if (importer == nullptr)
     {
         return StatusCode::MissingObject;
@@ -88,8 +126,9 @@ StatusCode ScriptInputViewModelProperty::import(ImportStack& importStack)
     auto obj = scriptedObject();
     if (obj && obj->component() != nullptr)
     {
-        // If the ScriptedObject is a Component, we need the ArtboardImporter
-        // to add it as a Component, otherwise, return Ok
+        // If the ScriptedObject is a Component, this input is an artboard
+        // child (File::readObjects gave it a slot, see takesArtboardSlot), so
+        // import it as a Component, otherwise, return Ok
         return Super::import(importStack);
     }
     return StatusCode::Ok;

@@ -2,34 +2,46 @@
  * Copyright 2025 Rive
  */
 
-// glsl cross-compiling requires the clang/gcc vector extension.
-#ifndef _MSC_VER
-
 #include "common/rand.hpp"
 #include <catch.hpp>
 
+// <array> is included in "cpp.glsl" so include it here first so that it
+// doesn't try to put all of its functions into the glsl_cross namespace
+#include <array>
+
+// common.glsl writes GLSL constructors and reads the flush uniforms.
+#define RIVE_GLSL_CROSS_WANT_CONSTRUCTORS
+// Included out here, not in the namespace below: common.glsl defines its own
+// make_half() and friends, which shadow these rather than collide with them.
+#include "cpp.glsl"
+
 namespace glsl_cross
 {
-#include "cpp.glsl"
-#include "generated/shaders/constants.minified.glsl"
-#if 0
-// "common.glsl" is currently too complicated to compile for C++. If we really
-// need it we can make it work, but for now it works to just declare our own
-// version of unmultiply_rgb.
-#include "generated/shaders/common.minified.glsl"
-#else
-static half3 unmultiply_rgb(half4 premul)
-{
-    // We *could* return preciesly 1 when premul.rgb == premul.a, but we can
-    // also be approximate here. The blend modes that depend on this exact level
-    // of precision (colordodge and colorburn) account for it with dstPremul.
-    return premul.rgb * (premul.a != .0 ? 1. / premul.a : .0);
-}
+#ifdef _MSC_VER
+#pragma warning(push)
+// The shader code writes float constants without the "f" suffix, so disable
+// this warning since there ends up being a lot of it:
+//  truncation from 'double' to 'glsl_cross::half'
+#pragma warning(disable : 4305)
 #endif
+
+RIVE_GLSL_CROSS_CONSTRUCTORS
+
 #define FRAGMENT
 #define ENABLE_ADVANCED_BLEND true
 #define ENABLE_HSL_BLEND_MODES true
+// The GLSL-flavored casts in common.glsl are the ones that compile as C++.
+#define GLSL
+
+#include "generated/shaders/constants.minified.glsl"
+// unmultiply_rgb(), min_component() and max_component() come from here rather
+// than from hand-written copies, so a change to them can't pass this test.
+#include "generated/shaders/common.minified.glsl"
 #include "generated/shaders/advanced_blend.minified.glsl"
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 constexpr static float INF = std::numeric_limits<float>::infinity();
 
@@ -257,17 +269,17 @@ TEST_CASE("glsl_colorburn", "[advanced_blend]")
 
         // 0, if Cd < 1 and Cs <= 0
         CHECK(simd::all(
-            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1, -1),
+            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1f, -1),
                                                  make_half3(1 - 1e-6f),
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
         CHECK(simd::all(
             advanced_blend_coeffs_with_dst_alpha(make_half3(-10, -100, -INF),
-                                                 make_half3(1 - 1e-6),
+                                                 make_half3(1 - 1e-6f),
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
         CHECK(simd::all(
-            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1, -1),
+            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1f, -1),
                                                  make_half3(0),
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
@@ -277,7 +289,7 @@ TEST_CASE("glsl_colorburn", "[advanced_blend]")
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
         CHECK(simd::all(
-            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1, -1),
+            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1f, -1),
                                                  make_half3(-1e-6f),
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
@@ -287,7 +299,7 @@ TEST_CASE("glsl_colorburn", "[advanced_blend]")
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
         CHECK(simd::all(
-            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1, -1),
+            advanced_blend_coeffs_with_dst_alpha(make_half3(0, -1e-1f, -1),
                                                  make_half3(-INF),
                                                  dstAlpha,
                                                  BLEND_MODE_COLORBURN) == 0));
@@ -325,6 +337,175 @@ TEST_CASE("glsl_colorburn", "[advanced_blend]")
         }
     }
 }
-} // namespace glsl_cross
 
-#endif // _MSC_VER
+namespace blend_spec_functions
+{
+using vec3 = simd::gvec<float, 3>;
+
+using simd::dot;
+
+// Functions copied (nearly) unmodified (except for formatting) from
+// https://registry.khronos.org/OpenGL/extensions/NV/NV_blend_equation_advanced.txt
+
+float minv3(vec3 c) { return min(min(c.r, c.g), c.b); }
+float maxv3(vec3 c) { return max(max(c.r, c.g), c.b); }
+float lumv3(vec3 c) { return dot(c, vec3{0.30f, 0.59f, 0.11f}); }
+float satv3(vec3 c) { return maxv3(c) - minv3(c); }
+
+// If any color components are outside [0,1], adjust the color to
+// get the components in range.
+vec3 ClipColor(vec3 color)
+{
+    float lum = lumv3(color);
+    float mincol = minv3(color);
+    float maxcol = maxv3(color);
+
+    if (mincol < 0.0)
+    {
+        color = lum + ((color - lum) * lum) / (lum - mincol);
+    }
+    if (maxcol > 1.0)
+    {
+        color = lum + ((color - lum) * (1 - lum)) / (maxcol - lum);
+    }
+    return color;
+}
+
+// Take the base RGB color <cbase> and override its luminosity
+// with that of the RGB color <clum>.
+vec3 SetLum(vec3 cbase, vec3 clum)
+{
+    float lbase = lumv3(cbase);
+    float llum = lumv3(clum);
+    float ldiff = llum - lbase;
+    vec3 color = cbase + vec3(ldiff);
+    return ClipColor(color);
+}
+
+// Take the base RGB color <cbase> and override its saturation with
+// that of the RGB color <csat>.  The override the luminosity of the
+// result with that of the RGB color <clum>.
+vec3 SetLumSat(vec3 cbase, vec3 csat, vec3 clum)
+{
+    float minbase = minv3(cbase);
+    float sbase = satv3(cbase);
+    float ssat = satv3(csat);
+    vec3 color;
+    if (sbase > 0)
+    {
+        // Equivalent (modulo rounding errors) to setting the
+        // smallest (R,G,B) component to 0, the largest to <ssat>,
+        // and interpolating the "middle" component based on its
+        // original value relative to the smallest/largest.
+        color = (cbase - minbase) * ssat / sbase;
+    }
+    else
+    {
+        color = vec3(0.0);
+    }
+    return SetLum(color, clum);
+}
+} // namespace blend_spec_functions
+
+// Helper to compare the outputs of 2 functions over a reasonable selection of
+// color values.
+template <typename Func1, typename Func2>
+void test_color_pairs(Func1&& func1, Func2&& func2)
+{
+    constexpr auto COLOR_STEP_COUNT = 6;
+    for (int riX = 0; riX < COLOR_STEP_COUNT; riX++)
+    {
+        for (int giX = 0; giX < COLOR_STEP_COUNT; giX++)
+        {
+            for (int biX = 0; biX < COLOR_STEP_COUNT; biX++)
+            {
+                for (int riY = 0; riY < COLOR_STEP_COUNT; riY++)
+                {
+                    for (int giY = 0; giY < COLOR_STEP_COUNT; giY++)
+                    {
+                        for (int biY = 0; biY < COLOR_STEP_COUNT; biY++)
+                        {
+                            simd::gvec<float, 3> x = {
+                                float(riX) / float(COLOR_STEP_COUNT - 1),
+                                float(giX) / float(COLOR_STEP_COUNT - 1),
+                                float(biX) / float(COLOR_STEP_COUNT - 1),
+                            };
+                            simd::gvec<float, 3> y = {
+                                float(riY) / float(COLOR_STEP_COUNT - 1),
+                                float(giY) / float(COLOR_STEP_COUNT - 1),
+                                float(biY) / float(COLOR_STEP_COUNT - 1),
+                            };
+
+                            // Snap the colors to 8-bit values
+                            x = simd::floor(x * 255.0f) / 255.0f;
+                            y = simd::floor(x * 255.0f) / 255.0f;
+
+                            auto r1 = func1(x, y);
+                            auto r2 = func2(x, y);
+
+                            auto d = r1 - r2;
+                            float maxDiff =
+                                max(std::abs(blend_spec_functions::minv3(d)),
+                                    blend_spec_functions::maxv3(d));
+
+                            CHECK(maxDiff <= 1e-4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("glsl_color_blend", "[advanced_blend]")
+{
+    test_color_pairs(
+        [](auto a, auto b) { return blend_spec_functions::SetLum(a, b); },
+        [](auto a, auto b) {
+            return glsl_cross::advanced_blend_coeffs_with_dst_alpha(
+                a,
+                b,
+                1.0f,
+                BLEND_MODE_COLOR);
+        });
+}
+
+TEST_CASE("glsl_luminosity_blend", "[advanced_blend]")
+{
+    test_color_pairs(
+        [](auto a, auto b) { return blend_spec_functions::SetLum(b, a); },
+        [](auto a, auto b) {
+            return glsl_cross::advanced_blend_coeffs_with_dst_alpha(
+                a,
+                b,
+                1.0f,
+                BLEND_MODE_LUMINOSITY);
+        });
+}
+
+TEST_CASE("glsl_saturation_blend", "[advanced_blend]")
+{
+    test_color_pairs(
+        [](auto a, auto b) { return blend_spec_functions::SetLumSat(b, a, b); },
+        [](auto a, auto b) {
+            return glsl_cross::advanced_blend_coeffs_with_dst_alpha(
+                a,
+                b,
+                1.0f,
+                BLEND_MODE_SATURATION);
+        });
+}
+
+TEST_CASE("glsl_hue_blend", "[advanced_blend]")
+{
+    test_color_pairs(
+        [](auto a, auto b) { return blend_spec_functions::SetLumSat(a, b, b); },
+        [](auto a, auto b) {
+            return glsl_cross::advanced_blend_coeffs_with_dst_alpha(
+                a,
+                b,
+                1.0f,
+                BLEND_MODE_HUE);
+        });
+}
+} // namespace glsl_cross

@@ -13,26 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 51;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case PolygonBase::typeKey:
-            case ParametricPathBase::typeKey:
-            case PathBase::typeKey:
-            case NodeBase::typeKey:
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t pointsPropertyKey = 125;
@@ -50,8 +30,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(pointsPropertyKey, &m_Points, &value);
         m_Points = value;
-        pointsChanged();
+        RIVE_EDITOR_CHANGED(pointsChanged());
+        notifyPropertyChanged(pointsPropertyKey);
     }
 
     inline float cornerRadius() const { return m_CornerRadius; }
@@ -61,8 +43,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(cornerRadiusPropertyKey, &m_CornerRadius, &value);
         m_CornerRadius = value;
-        cornerRadiusChanged();
+        RIVE_EDITOR_CHANGED(cornerRadiusChanged());
+        notifyPropertyChanged(cornerRadiusPropertyKey);
     }
 
     Core* clone() const override;
@@ -90,6 +74,9 @@ public:
 protected:
     virtual void pointsChanged() {}
     virtual void cornerRadiusChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/polygon_ext.inl"
+#endif
 };
 } // namespace rive
 

@@ -2,19 +2,23 @@
 #ifndef _RIVE_LUA_LIBS_HPP_
 #define _RIVE_LUA_LIBS_HPP_
 #include "lua.h"
+#include "rive/text_engine.hpp"
 #include "lualib.h"
 #include "rive/animation/linear_animation_instance.hpp"
 #include "rive/assets/file_asset.hpp"
 #include "rive/assets/script_asset.hpp"
 #include "rive/lua/lua_state.hpp"
 #include "rive/math/raw_path.hpp"
+#include "rive/factory.hpp"
 #include "rive/renderer.hpp"
 #include "rive/math/vec2d.hpp"
+#include "rive/math/mat4.hpp"
 #include "rive/math/contour_measure.hpp"
 #include "rive/math/path_measure.hpp"
 #include "rive/shapes/paint/image_sampler.hpp"
 #include "rive/shapes/paint/shape_paint.hpp"
 #include "rive/viewmodel/data_enum.hpp"
+#include "rive/viewmodel/viewmodel_instance_asset_image.hpp"
 #include "rive/viewmodel/viewmodel_instance_boolean.hpp"
 #include "rive/viewmodel/viewmodel_instance_color.hpp"
 #include "rive/viewmodel/viewmodel_instance_enum.hpp"
@@ -32,6 +36,7 @@
 #include "rive/data_bind/data_values/data_value_number.hpp"
 #include "rive/data_bind/data_values/data_value_string.hpp"
 #include "rive/viewmodel/viewmodel.hpp"
+#include "rive/animation/listener_invocation.hpp"
 #include "rive/hit_result.hpp"
 #include "rive/lua/scripting_vm.hpp"
 #include "rive/refcnt.hpp"
@@ -43,6 +48,9 @@
 #ifdef WITH_RIVE_TOOLS
 #include "rive/core/binary_writer.hpp"
 #include "rive/core/vector_binary_stream.hpp"
+#endif
+#ifdef WITH_RIVE_SCRIPTNET
+#include "rive/scriptnet/http.hpp"
 #endif
 
 #include <chrono>
@@ -61,12 +69,17 @@ namespace rive
 {
 class Artboard;
 class ArtboardInstance;
+class NestedArtboard;
 class Factory;
 class File;
 class ModuleDetails;
 class ScriptedObject;
 class StateMachineInstance;
 class TransformComponent;
+namespace cmd
+{
+class DeferredCanvasHost;
+}
 enum class LuaAtoms : int16_t
 {
     // Vector
@@ -116,6 +129,7 @@ enum class LuaAtoms : int16_t
     blendMode,
     feather,
     gradient,
+    gradientTransform,
     color,
 
     stroke,
@@ -126,6 +140,7 @@ enum class LuaAtoms : int16_t
     butt,
     square,
     srcOver,
+    additive,
     screen,
     overlay,
     darken,
@@ -146,6 +161,7 @@ enum class LuaAtoms : int16_t
     drawPath,
     drawImage,
     drawImageMesh,
+    drawImageMeshInstanced,
     clipPath,
     save,
     restore,
@@ -165,6 +181,10 @@ enum class LuaAtoms : int16_t
     getList,
     getViewModel,
     getEnum,
+    getIndex,
+    getImage,
+    getFont,
+    getBlob,
     values,
     addListener,
     removeListener,
@@ -174,9 +194,11 @@ enum class LuaAtoms : int16_t
     shift,
     pop,
     swap,
+    clear,
 
     // Artboards
     draw,
+    modulateOpacity,
     advance,
     frameOrigin,
     data,
@@ -227,6 +249,8 @@ enum class LuaAtoms : int16_t
     markNeedsUpdate,
     viewModel,
     rootViewModel,
+    globalViewModel,
+    globalViewModelNames,
     image,
     blob,
     size,
@@ -253,6 +277,234 @@ enum class LuaAtoms : int16_t
     setTime,
     setTimeFrames,
     setTimePercentage,
+
+    // PointerEvent (append to avoid shifting existing atom ids)
+    previousPosition,
+    timeStamp,
+
+    // ScriptedInvocation / listener payloads (append only)
+    isPointerEvent,
+    isKeyboardEvent,
+    isTextInput,
+    isFocus,
+    isReportedEvent,
+    isViewModelChange,
+    isNone,
+    isGamepadConnected,
+    isGamepadEvent,
+    isGamepadDisconnected,
+    asPointerEvent,
+    asKeyboardEvent,
+    asTextInput,
+    asFocus,
+    asReportedEvent,
+    asViewModelChange,
+    asGamepadConnected,
+    asGamepadEvent,
+    asGamepadDisconnected,
+    gamepadEvent,
+    gamepadConnected,
+    gamepadDisconnected,
+    asNone,
+    key,
+    alt,
+    control,
+    meta,
+    text,
+    phase,
+    delaySeconds,
+    deviceId,
+    buttonMask,
+    remove,
+    removeAt,
+    removeAllOf,
+
+    // GPU bindings
+    write,
+    upload,
+    view,
+    setPipeline,
+    setVertexBuffer,
+    setIndexBuffer,
+    setBindGroup,
+    setViewport,
+    setScissorRect,
+    setStencilReference,
+    setBlendColor,
+    drawIndexed,
+    finish,
+    beginRenderPass,
+    beginFrame,
+    endFrame,
+    colorView,
+    depthView,
+    resize,
+    set,
+    canvas,
+    gpuCanvas,
+    features,
+    shader,
+    format,
+    gpuTarget,
+    sampleCount,
+
+    // Promise
+    andThen,
+    catch_,
+    finally_,
+    cancel,
+    onCancel,
+    getStatus,
+
+    // Image decode
+    decodeImage,
+
+    // Mat4
+    transpose,
+    transformPoint,
+    transformVec4,
+    writeToBuffer,
+    invertAffine,
+
+    // Vector
+    writeVec4,
+
+    // Gamepad
+    axes,
+    gamepadMapping,
+    mapping,
+    isStandardMapping,
+    buttons,
+    buttonPressed,
+    buttonValue,
+    axis,
+    west,
+    south,
+    north,
+    east,
+    leftShoulder,
+    rightShoulder,
+    gamepadBack,
+    gamepadForward,
+    leftStickButton,
+    rightStickButton,
+    dpadUp,
+    dpadDown,
+    dpadLeft,
+    dpadRight,
+    leftStick,
+    rightStick,
+    start,
+    leftTrigger,
+    rightTrigger,
+    leftTriggerPressed,
+    rightTriggerPressed,
+    changeKind,
+    changeIndex,
+    changeValue,
+    hasStandardButtonIntent,
+    hasStandardAxisIntent,
+    intentButton,
+    intentAxis,
+
+    // Drawable
+    modulateColor,
+    setColorModulation,
+    propertyKey,
+    drawModulated,
+    number,
+    boolean,
+    string,
+    properties,
+
+    // Text
+    append,
+    line,
+    lines,
+    hitTest,
+    caret,
+    selectionRects,
+    glyph,
+    glyphs,
+    path,
+    glyphPath,
+    withOptions,
+    hasGlyph,
+    axisValue,
+    lineHeight,
+    decode,
+    font,
+    ascent,
+    descent,
+    capHeight,
+    xHeight,
+    weight,
+    isItalic,
+    sizing,
+    overflow,
+    align,
+    wrap,
+    wordBreak,
+    origin,
+    direction,
+    maxWidth,
+    maxHeight,
+    paragraphSpacing,
+    lineCount,
+    glyphCount,
+    baseline,
+    bottom,
+    top,
+    textIndex,
+    firstIndex,
+    lastIndex,
+    x,
+    y,
+    isEmpty,
+    index,
+    ltr,
+    rtl,
+    autoDetect,
+    left,
+    right,
+    center,
+    end,
+    autoWidth,
+    autoHeight,
+    fixed,
+    visible,
+    hidden,
+    clipped,
+    ellipsis,
+    noWrap,
+    breakWord,
+    normal,
+    breakAll,
+    letterSpacing,
+    foregroundColor,
+    min,
+    max,
+    defaultValue,
+
+    // Fetch Response
+    status,
+    statusText,
+    ok,
+    url,
+    headers,
+    arrayBuffer,
+    header,
+
+    // Decoded Rive files
+    decodeFile,
+    artboardNames,
+    bindableArtboard,
+    getArtboard,
+
+    // Scroll input
+    delta,
+    precise,
+    pointerScroll,
 };
 
 struct ScriptedMat2D
@@ -274,6 +526,21 @@ struct ScriptedMat2D
 
 static_assert(std::is_trivially_destructible<ScriptedMat2D>::value,
               "ScriptedMat2D must be trivially destructible");
+
+struct ScriptedMat4
+{
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 62;
+    static constexpr const char* luaName = "Mat4";
+    static constexpr bool hasMetatable = true;
+
+    ScriptedMat4() {}
+    ScriptedMat4(const Mat4& mat) : value(mat) {}
+
+    rive::Mat4 value;
+};
+
+static_assert(std::is_trivially_destructible<ScriptedMat4>::value,
+              "ScriptedMat4 must be trivially destructible");
 
 class ScriptedPathCommand
 {
@@ -324,6 +591,27 @@ public:
     static constexpr bool hasMetatable = true;
 };
 
+// Path and PathData carry separate tags but the same geometry, and scripts
+// legitimately return either, so both are accepted. Anything else is
+// nullptr, which callers handle as "no geometry" rather than dereference.
+inline ScriptedPathData* lua_topathdata(lua_State* L, int idx)
+{
+    void* data = lua_touserdata(L, idx);
+    if (data == nullptr)
+    {
+        return nullptr;
+    }
+    switch (lua_userdatatag(L, idx))
+    {
+        case ScriptedPath::luaTag:
+            return static_cast<ScriptedPath*>(data);
+        case ScriptedPathData::luaTag:
+            return static_cast<ScriptedPathData*>(data);
+        default:
+            return nullptr;
+    }
+}
+
 class ScriptedGradient
 {
 public:
@@ -358,10 +646,69 @@ public:
     void update(Factory* factory);
 };
 
+class ScriptedImageMeshInstances
+{
+public:
+    ScriptedImageMeshInstances(Factory* factory, size_t count) :
+        instances(factory->makeImageMeshInstances(count)), m_staged(count)
+    {}
+
+    // set() and resize() change a staged copy of the instance data, and
+    // commit() hands it to the renderer in one edit. Every edit hands over the
+    // whole array (the deferred and serializing renderers copy it), so this
+    // happens once per draw rather than once per set() or resize().
+    size_t count() const { return m_staged.size(); }
+    // The staged instance at `index`, for writing.
+    ImageMeshInstanceData& stage(size_t index)
+    {
+        m_dirty = true;
+        return m_staged[index];
+    }
+    // Sets the staged count, keeping existing instances.
+    void resize(size_t count);
+    // Hands staged changes to the renderer. Called before the instances are
+    // drawn.
+    void commit();
+
+    rcp<ImageMeshInstances> instances;
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 70;
+    static constexpr const char* luaName = "MeshInstances";
+    static constexpr bool hasMetatable = true;
+
+private:
+    std::vector<ImageMeshInstanceData> m_staged;
+    bool m_dirty = false;
+};
+
+#if defined(RIVE_CANVAS) && defined(RIVE_ORE)
+namespace ore
+{
+class TextureView;
+}
+namespace gpu
+{
+class RenderCanvas;
+}
+#endif
+
 class ScriptedImage
 {
 public:
     rcp<RenderImage> image;
+#if defined(RIVE_CANVAS) && defined(RIVE_ORE)
+    rcp<ore::TextureView> cachedOreView; // Cached for Image:view() to avoid
+                                         // leaking D3D12 CPU descriptors.
+    // Set when this image is a canvas's backing, so Image:view() imports
+    // through the backend's canvas sampling wrap rather than the raw texture.
+    rcp<gpu::RenderCanvas> sourceCanvas;
+#endif
+    // Out-of-line destructor — when ore is enabled, defined in lua_gpu.cpp
+    // where ore::TextureView is complete. Otherwise defined in lua_image.cpp.
+    ~ScriptedImage();
+    // Out-of-line factory — avoids instantiating rcp<TextureView>::~rcp() in
+    // TUs that don't include the full ore headers (placement new requires a
+    // visible destructor for exception cleanup).
+    static ScriptedImage* luaNew(lua_State* L);
     static constexpr uint8_t luaTag = LUA_T_COUNT + 6;
     static constexpr const char* luaName = "Image";
     static constexpr bool hasMetatable = true;
@@ -420,6 +767,372 @@ private:
 };
 #endif
 
+#ifdef RIVE_CANVAS
+namespace gpu
+{
+class RenderCanvas;
+class RenderContext;
+} // namespace gpu
+
+// Forward-declare RiveRenderer so canvas handles can store a raw pointer to the
+// active frame renderer without pulling in the full rive_renderer.hpp header.
+class RiveRenderer;
+
+#ifdef RIVE_ORE
+namespace ore
+{
+class Buffer;
+class Texture;
+class TextureView;
+class Sampler;
+class BindGroup;
+class BindGroupLayout;
+class ShaderModule;
+class Pipeline;
+class DeferredBindGroups;
+class RenderPass;
+class Context;
+} // namespace ore
+
+class ScriptedGPUBuffer
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 41;
+    static constexpr const char* luaName = "GPUBuffer";
+    static constexpr bool hasMetatable = true;
+    rcp<ore::Buffer> buffer;
+    // Set when constructed with `immutable=true`. The Lua wrapper rejects
+    // `:write` calls on immutable buffers — matching `BufferDesc::immutable`'s
+    // documented contract ("no update() calls allowed after creation").
+    bool immutable = false;
+};
+
+class ScriptedGPUTexture
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 42;
+    static constexpr const char* luaName = "GPUTexture";
+    static constexpr bool hasMetatable = true;
+    rcp<ore::Texture> texture;
+};
+
+class ScriptedGPUSampler
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 43;
+    static constexpr const char* luaName = "GPUSampler";
+    static constexpr bool hasMetatable = false;
+    rcp<ore::Sampler> sampler;
+};
+
+// One @vertex/@fragment entry point resolved from an RSTB v4 container. For
+// whole-module targets (WGSL/MSL/SPIR-V) every record of a shader shares one
+// ShaderModule; for per-entry targets (GLSL/HLSL) each record owns its module.
+struct ScriptedShaderEntry
+{
+    uint8_t stage = 0;    // 0=vertex 1=fragment 2=compute
+    std::string logical;  // WGSL entry name a script matches against
+    std::string physical; // name handed to the driver (PipelineDesc entry)
+    rcp<ore::ShaderModule> module;
+};
+
+class ScriptedShader
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 44;
+    static constexpr const char* luaName = "Shader";
+    static constexpr bool hasMetatable = false;
+
+    // Entry points in naga declaration order; the first of each stage is the
+    // WebGPU "no entryPoint" default.
+    std::vector<ScriptedShaderEntry> entries;
+
+    bool hasModule() const { return !entries.empty(); }
+
+    // First entry of a stage, or null.
+    const ScriptedShaderEntry* firstOfStage(uint8_t stage) const
+    {
+        for (const auto& e : entries)
+        {
+            if (e.stage == stage)
+                return &e;
+        }
+        return nullptr;
+    }
+
+    // Resolve a stage's entry by optional WGSL name; null/empty selects the
+    // first entry of that stage (WebGPU default). Returns null if a named
+    // entry is not found.
+    const ScriptedShaderEntry* resolveEntry(uint8_t stage,
+                                            const char* logical) const
+    {
+        if (logical == nullptr || logical[0] == '\0')
+            return firstOfStage(stage);
+        for (const auto& e : entries)
+        {
+            if (e.stage == stage && e.logical == logical)
+                return &e;
+        }
+        return nullptr;
+    }
+
+    // Back-compat: first vertex / first fragment module (binding-map reads,
+    // texture-sampler pair propagation). Fragment falls back to the combined
+    // (vertex) module when there is no separate fragment entry.
+    ore::ShaderModule* vertexMod() const
+    {
+        const auto* e = firstOfStage(0);
+        return e ? e->module.get() : nullptr;
+    }
+    ore::ShaderModule* fragmentMod() const
+    {
+        const auto* f = firstOfStage(1);
+        if (f)
+            return f->module.get();
+        const auto* v = firstOfStage(0);
+        return v ? v->module.get() : nullptr;
+    }
+};
+
+class ScriptedGPUPipeline
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 45;
+    static constexpr const char* luaName = "GPUPipeline";
+    static constexpr bool hasMetatable = true;
+    rcp<ore::Pipeline> pipeline;
+    uint32_t sampleCount = 1;
+
+    // Deep-copied vertex layout data so Pipeline's PipelineDesc pointers
+    // remain valid for the lifetime of this object. Stored as raw bytes to
+    // avoid pulling ore_types.hpp into this header.
+    std::vector<uint8_t> ownedVertexLayoutData;
+
+    // Auto-derived layouts (one per @group(N) in the shader) when the user
+    // omits `bindGroupLayouts`. Exposed via `pipeline:getBindGroupLayout(N)`.
+    // Empty when explicit layouts were supplied.
+    std::vector<rcp<ore::BindGroupLayout>> autoBindGroupLayouts;
+};
+
+class ScriptedGPUBindGroup
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 52;
+    static constexpr const char* luaName = "GPUBindGroup";
+    static constexpr bool hasMetatable = false;
+    ~ScriptedGPUBindGroup(); // Defers destruction via
+                             // Context::deferBindGroupDestroy.
+    rcp<ore::BindGroup> bindGroup;
+};
+
+class ScriptedGPUBindGroupLayout
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 60;
+    static constexpr const char* luaName = "GPUBindGroupLayout";
+    static constexpr bool hasMetatable = false;
+    rcp<ore::BindGroupLayout> layout;
+};
+
+class ScriptedGPURenderPass
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 46;
+    static constexpr const char* luaName = "GPURenderPass";
+    static constexpr bool hasMetatable = true;
+    // Out of line, the unique_ptrs need their complete types.
+    ScriptedGPURenderPass();
+    ~ScriptedGPURenderPass();
+    std::unique_ptr<ore::RenderPass> pass;
+    // setBindGroup calls made before the first setPipeline.
+    std::unique_ptr<ore::DeferredBindGroups> deferredBindGroups;
+    bool m_finished = false;
+    bool m_pipelineSet = false;
+    uint32_t sampleCount = 1; // for pipeline sampleCount validation
+    std::string label;
+    uint32_t drawCallCount = 0;
+};
+
+class ScriptedGPUTextureView
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 51;
+    static constexpr const char* luaName = "GPUTextureView";
+    static constexpr bool hasMetatable = true;
+    rcp<ore::TextureView> view;
+    // When created from Image:view(), retains the RenderImage so the
+    // underlying gpu::Texture stays alive even if the Image is GC'd.
+    rcp<RenderImage> retainedImage;
+};
+
+class ScriptedGPUCanvas
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 47;
+    static constexpr const char* luaName = "GPUCanvas";
+    static constexpr bool hasMetatable = true;
+    ~ScriptedGPUCanvas();
+    rcp<gpu::RenderCanvas> canvas;
+    // 1× presentation target. Same role as a WebGPU surface texture:
+    // single-sampled, format determined by the platform. MSAA color +
+    // depth are user-allocated and passed in via the RenderPassDesc.
+    rcp<ore::TextureView> oreColorView;
+    lua_State* m_L = nullptr;
+    int m_imageRef = LUA_NOREF;
+    gpu::RenderContext* renderCtx = nullptr; // needed for resize()
+    // Size a resize() asked for while no device existed. Web attaches one per
+    // render texture after layout has already run, and a generator resizes
+    // once, so the request is held here and honoured on the first access after
+    // a device appears. Zero once satisfied.
+    uint32_t pendingWidth = 0;
+    uint32_t pendingHeight = 0;
+};
+
+// Rive's render target, read live from the Ore context on every access.
+class ScriptedGPUTarget
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 73;
+    static constexpr const char* luaName = "GPUTarget";
+    static constexpr bool hasMetatable = true;
+};
+
+#endif // RIVE_ORE
+
+enum class CanvasState
+{
+    Idle,
+    Rendering
+};
+
+class ScriptedCanvas
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 50;
+    static constexpr const char* luaName = "Canvas";
+    static constexpr bool hasMetatable = true;
+    ~ScriptedCanvas();
+    rcp<gpu::RenderCanvas> canvas;
+    lua_State* m_L = nullptr;
+    int m_imageRef = LUA_NOREF;
+    gpu::RenderContext* renderCtx = nullptr;
+    // See ScriptedGPUCanvas::pendingWidth.
+    uint32_t pendingWidth = 0;
+    uint32_t pendingHeight = 0;
+    CanvasState m_state = CanvasState::Idle;
+    // Allocated on beginFrame(), deleted on endFrame(). Wraps renderCtx.
+    // Null in deferred mode, content records into the stream instead.
+    RiveRenderer* m_riveRenderer = nullptr;
+    // Set on beginFrame() when a deferred host is recording, endFrame()
+    // routes through it instead of the real flush. Null means immediate.
+    cmd::DeferredCanvasHost* m_deferredHost = nullptr;
+    // Lua registry ref to the ScriptedRenderer pushed by beginFrame(),
+    // kept alive until endFrame() so the Lua renderer stays valid.
+    int m_rendererRef = LUA_NOREF;
+    // Registry ref while the frame is open so post-error cleanup can close
+    // it and GC cannot collect it mid-frame.
+    int m_openFrameRef = LUA_NOREF;
+};
+#endif // RIVE_CANVAS
+
+// ── Promise ────────────────────────────────────────────────────────────────
+
+enum class PromiseState : uint8_t
+{
+    Pending,
+    Fulfilled,
+    Rejected,
+    Cancelled
+};
+
+class ScriptedPromise
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 53;
+    static constexpr const char* luaName = "Promise";
+    static constexpr bool hasMetatable = true;
+
+    ScriptedPromise(lua_State* mainThread) : m_state(mainThread) {}
+    ~ScriptedPromise();
+
+    void resolve(lua_State* L, int valueIdx);
+    // Overload with selfRef: a registry ref to this promise's userdata,
+    // needed for Promise/A+ adoption of pending inner promises.
+    void resolve(lua_State* L, int valueIdx, int selfRef);
+    void reject(lua_State* L, int errorIdx);
+    void cancel(lua_State* L);
+
+    bool isFulfilled() const
+    {
+        return m_promiseState == PromiseState::Fulfilled;
+    }
+    bool isRejected() const { return m_promiseState == PromiseState::Rejected; }
+    bool isCancelled() const
+    {
+        return m_promiseState == PromiseState::Cancelled;
+    }
+    bool isPending() const { return m_promiseState == PromiseState::Pending; }
+    int resultRef() const { return m_resultRef; }
+
+    lua_State* m_state;
+    PromiseState m_promiseState = PromiseState::Pending;
+    int m_resultRef = LUA_NOREF;
+
+    struct ThenCallback
+    {
+        int successRef = LUA_NOREF;
+        int failureRef = LUA_NOREF;
+        int chainedPromiseRef = LUA_NOREF; // registry ref keeps it alive
+        int cancelRef =
+            LUA_NOREF; // cleanup callback fired on cancel (async/await)
+    };
+    struct FinallyCallback
+    {
+        int callbackRef = LUA_NOREF;
+        int chainedPromiseRef = LUA_NOREF; // registry ref keeps it alive
+    };
+
+    std::vector<ThenCallback> m_thenCallbacks;
+    std::vector<FinallyCallback> m_finallyCallbacks;
+
+    // Parent promise (the promise this was chained FROM via
+    // andThen/catch/finally).
+    int m_parentRef = LUA_NOREF;
+
+    // Consumer promises (chained FROM this one). Separate refs from
+    // ThenCallback.chainedPromiseRef for independent cancel propagation.
+    std::vector<int> m_consumerRefs;
+
+    // Cancellation hook: a Lua function called when cancel() fires.
+    // Used by decodeImage to cancel in-flight work, and by Promise.all
+    // to cancel chained promises.
+    int m_onCancelRef = LUA_NOREF;
+};
+
+int luaopen_rive_promise(lua_State* L);
+
+#ifdef WITH_RIVE_SCRIPTNET
+// ── fetch() Response ───────────────────────────────────────────────────────
+
+/// What a script's fetch() promise resolves with. Owns the whole response;
+/// text() and arrayBuffer() copy the body out on demand.
+class ScriptedHttpResponse
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 74;
+    static constexpr const char* luaName = "Response";
+    static constexpr bool hasMetatable = true;
+
+    ScriptedHttpResponse(scriptnet::HttpResponse&& value) :
+        response(std::move(value))
+    {}
+
+    scriptnet::HttpResponse response;
+};
+#endif
+
+// ── ImageSampler ───────────────────────────────────────────────────────────
+
 class ScriptedImageSampler
 {
 public:
@@ -463,6 +1176,11 @@ public:
 
     virtual void gradient(rcp<RenderShader> value) { m_gradient = value; }
 
+    virtual void gradientTransform(const Mat2D& value)
+    {
+        m_gradientTransform = value;
+    }
+
     void pushStyle(lua_State* L);
     void pushJoin(lua_State* L);
     void pushCap(lua_State* L);
@@ -470,11 +1188,17 @@ public:
     void pushBlendMode(lua_State* L);
     void pushFeather(lua_State* L);
     void pushGradient(lua_State* L);
+    void pushGradientTransform(lua_State* L);
     void pushColor(lua_State* L);
+
+    float thickness() const { return m_thickness; }
+    float feather() const { return m_feather; }
+    ColorInt color() const { return m_color; }
 
 protected:
     RenderPaintStyle m_style = RenderPaintStyle::fill;
     rcp<RenderShader> m_gradient;
+    Mat2D m_gradientTransform = Mat2D();
     float m_thickness = 1;
     StrokeJoin m_join = StrokeJoin::miter;
     StrokeCap m_cap = StrokeCap::butt;
@@ -534,12 +1258,19 @@ public:
     {
         ScriptedPaintData::blendMode(value);
         renderPaint->blendMode(value);
+        renderPaint->additiveness(additivenessFor(value, 255));
     }
 
     void gradient(rcp<RenderShader> value) override
     {
         ScriptedPaintData::gradient(value);
         renderPaint->shader(value);
+    }
+
+    void gradientTransform(const Mat2D& value) override
+    {
+        ScriptedPaintData::gradientTransform(value);
+        renderPaint->shaderTransform(value);
     }
 };
 
@@ -556,6 +1287,8 @@ public:
     void restore(lua_State* L);
     void transform(lua_State* L, const Mat2D& mat2d);
     void clipPath(lua_State* L, ScriptedPathData* path);
+    void modulateOpacity(lua_State* L, float opacity);
+    void modulateColor(lua_State* L, ColorInt color, bool replace);
     Renderer* validate(lua_State* L);
 
     static constexpr uint8_t luaTag = LUA_T_COUNT + 9;
@@ -566,24 +1299,76 @@ private:
     // Not owned by the ScriptedRenderer, only valid when passed in.
     Renderer* m_renderer = nullptr;
     uint32_t m_saveCount = 0;
+
+public:
+    uint32_t saveCount() const { return m_saveCount; }
+    // Closes the saves a script that errored left open.
+    void restoreTo(uint32_t saveCount)
+    {
+        for (; m_saveCount > saveCount; m_saveCount--)
+        {
+            m_renderer->restore();
+        }
+    }
+};
+
+// A handle to one child of a ScriptedTransition — a mounted artboard, either an
+// authored NestedArtboard's instance or one instanced from a bound view-model
+// list — handed to the transition script's draw() so it can composite the
+// outgoing (from) and incoming (to) children. Non-owning; invalidated after the
+// hosting draw() returns so a stashed handle can never outlive the frame.
+class TransitionChild
+{
+public:
+    TransitionChild(Artboard* artboard, const Mat2D& worldTransform) :
+        m_artboard(artboard), m_worldTransform(worldTransform)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 68;
+    static constexpr const char* luaName = "TransitionChild";
+    static constexpr bool hasMetatable = true;
+
+    // Draw this child's artboard content at the renderer's current transform,
+    // placed by the child's world transform. No-op once invalidated.
+    void draw(Renderer* renderer);
+    float width() const;
+    float height() const;
+    void invalidate() { m_artboard = nullptr; }
+
+private:
+    Artboard* m_artboard = nullptr;
+    Mat2D m_worldTransform;
 };
 
 class ScriptReffedArtboard : public RefCnt<ScriptReffedArtboard>
 {
 public:
-    ScriptReffedArtboard(rcp<File> file,
+    ScriptReffedArtboard(File* file,
                          std::unique_ptr<ArtboardInstance>&& artboardInstance,
                          rcp<ViewModelInstance> viewModelInstance,
-                         rcp<DataContext> parentDataContext);
+                         rcp<DataContext> parentDataContext
+#ifdef WITH_RIVE_TOOLS
+                         ,
+                         rcp<File> filePin = nullptr
+#endif
+    );
 
     ~ScriptReffedArtboard();
-    rive::rcp<rive::File> file();
+    rive::File* file();
     Artboard* artboard();
     StateMachineInstance* stateMachine();
     rcp<ViewModelInstance> viewModelInstance() { return m_viewModelInstance; }
+#ifdef WITH_RIVE_TOOLS
+    rcp<File> filePin() { return m_filePin; }
+#endif
 
 private:
-    rcp<File> m_file;
+    File* m_file;
+#ifdef WITH_RIVE_TOOLS
+    // Pins a host file the script does not own. Never set for the script's
+    // own file: that would cycle File -> VM -> userdata -> File and leak.
+    rcp<File> m_filePin;
+#endif
     std::unique_ptr<ArtboardInstance> m_artboard;
     std::unique_ptr<StateMachineInstance> m_stateMachine;
     rcp<ViewModelInstance> m_viewModelInstance;
@@ -593,10 +1378,15 @@ class ScriptedArtboard
 {
 public:
     ScriptedArtboard(lua_State* L,
-                     rcp<File> file,
+                     File* file,
                      std::unique_ptr<ArtboardInstance>&& artboardInstance,
                      rcp<ViewModelInstance> viewModelInstance,
-                     rcp<DataContext> dataContext);
+                     rcp<DataContext> dataContext
+#ifdef WITH_RIVE_TOOLS
+                     ,
+                     rcp<File> filePin = nullptr
+#endif
+    );
     ~ScriptedArtboard();
 
     static constexpr uint8_t luaTag = LUA_T_COUNT + 10;
@@ -651,10 +1441,15 @@ private:
     std::unique_ptr<LinearAnimationInstance> m_animation;
 };
 
+// Each listener keeps a registry ref to the property userdata (self) so Luau
+// cannot collect ScriptedProperty while callbacks are registered. Released in
+// clearListeners / removeListener alongside function and optional userdata
+// refs.
 struct ScriptedListener
 {
     int function;
     int userdata;
+    int propertySelfRef;
 };
 
 class ScriptedProperty : public ViewModelInstanceValueDelegate
@@ -662,22 +1457,44 @@ class ScriptedProperty : public ViewModelInstanceValueDelegate
 public:
     ScriptedProperty(lua_State* L, rcp<ViewModelInstanceValue> value);
     virtual ~ScriptedProperty();
-    int addListener();
-    int removeListener();
+    int addListener(lua_State* L);
+    int removeListener(lua_State* L);
     void clearListeners();
+    virtual void dispose();
 
     void valueChanged() override;
 
     const lua_State* state() const { return m_state; }
 
     ViewModelInstanceValue* instanceValue() { return m_instanceValue.get(); }
+    bool disposed() const { return m_disposed; }
+    ScriptedObject* owner() const { return m_owner; }
+#ifdef WITH_RIVE_TOOLS
+    uint32_t orphanOwnerTag() const { return m_orphanOwnerTag; }
+#endif
 
 private:
     std::vector<ScriptedListener> m_listeners;
+    ScriptedObject* m_owner = nullptr;
+#ifdef WITH_RIVE_TOOLS
+    ScriptingContext* m_orphanContext = nullptr;
+    uint32_t m_orphanOwnerTag = 0;
+#endif
+    bool m_disposed = false;
 
 protected:
     lua_State* m_state;
     rcp<ViewModelInstanceValue> m_instanceValue;
+    // The instance that owns m_instanceValue. The instance owns its values but
+    // they only point back raw, so without this a script holding a property
+    // outlives the view model it came from: the value survives, its owner does
+    // not, and writes land in an orphan. Holding it keeps the whole view model
+    // alive for as long as any script is using one of its properties, which is
+    // what lets a reference swap elsewhere leave this wrapper working. Scripts
+    // opt into the new reference by resolving it again.
+    rcp<ViewModelInstance> m_owningInstance;
+    int m_cachedValueRef = 0;
+    void clearCachedValueRef();
 };
 
 class ScriptedViewModel
@@ -690,7 +1507,8 @@ public:
     static constexpr uint8_t luaTag = LUA_T_COUNT + 11;
     static constexpr const char* luaName = "ViewModel";
     static constexpr bool hasMetatable = true;
-    int pushValue(const char* name, int coreType = 0);
+    int pushValue(lua_State* L, const char* name, int coreType = 0);
+    int pushIndex(lua_State* L);
     int instance(lua_State* L);
 
     const lua_State* state() const { return m_state; }
@@ -698,6 +1516,11 @@ public:
     {
         return m_viewModelInstance;
     }
+    rcp<ViewModelInstance> mutableViewModelInstance()
+    {
+        return m_viewModelInstance;
+    }
+    rcp<ViewModel> viewModel() const { return m_viewModel; }
 
 private:
     lua_State* m_state;
@@ -706,7 +1529,8 @@ private:
     std::unordered_map<std::string, int> m_propertyRefs;
 };
 
-class ScriptedPropertyViewModel : public ScriptedProperty
+class ScriptedPropertyViewModel : public ScriptedProperty,
+                                  public ViewModelValueDependent
 {
 public:
     ScriptedPropertyViewModel(lua_State* L,
@@ -716,7 +1540,12 @@ public:
     static constexpr uint8_t luaTag = LUA_T_COUNT + 12;
     static constexpr const char* luaName = "PropertyViewModel";
     static constexpr bool hasMetatable = true;
-    int pushValue();
+    int pushValue(lua_State* L);
+    void setValue(ScriptedViewModel*);
+    void dispose() override;
+    void relinkDataBind() override;
+    void addDirt(ComponentDirt value, bool recurse) override {}
+    void clearRef();
 
 private:
     rcp<ViewModel> m_viewModel;
@@ -731,7 +1560,7 @@ public:
     static constexpr const char* luaName = "Property<number>";
     static constexpr bool hasMetatable = true;
 
-    int pushValue();
+    int pushValue(lua_State* L);
     void setValue(float value);
 };
 
@@ -753,8 +1582,8 @@ public:
     static constexpr const char* luaName = "PropertyList";
     static constexpr bool hasMetatable = true;
 
-    int pushLength();
-    int pushValue(int index);
+    int pushLength(lua_State* L);
+    int pushValue(lua_State* L, int index);
     void valueChanged() override;
     void append(ViewModelInstance*);
 
@@ -771,7 +1600,7 @@ public:
     static constexpr const char* luaName = "PropertyColor";
     static constexpr bool hasMetatable = true;
 
-    int pushValue();
+    int pushValue(lua_State* L);
     void setValue(unsigned value);
 };
 
@@ -783,7 +1612,7 @@ public:
     static constexpr const char* luaName = "PropertyString";
     static constexpr bool hasMetatable = true;
 
-    int pushValue();
+    int pushValue(lua_State* L);
     void setValue(const std::string& value);
 };
 
@@ -795,7 +1624,7 @@ public:
     static constexpr const char* luaName = "Property<bool>";
     static constexpr bool hasMetatable = true;
 
-    int pushValue();
+    int pushValue(lua_State* L);
     void setValue(bool value);
 };
 
@@ -803,14 +1632,14 @@ class ScriptedEnumValues
 {
 public:
     ScriptedEnumValues(lua_State* L, DataEnum* value) :
-        m_state(L), m_dataEnum(value)
+        m_state(lua_mainthread(L)), m_dataEnum(value)
     {}
     static constexpr uint8_t luaTag = LUA_T_COUNT + 34;
     static constexpr const char* luaName = "EnumValues";
     static constexpr bool hasMetatable = true;
     void dataEnum(DataEnum* value) { m_dataEnum = value; }
-    int pushValue(int index);
-    int pushLength();
+    int pushValue(lua_State* L, int index);
+    int pushLength(lua_State* L);
 
     const lua_State* state() const { return m_state; }
 
@@ -827,16 +1656,62 @@ public:
     static constexpr const char* luaName = "Property<enum>";
     static constexpr bool hasMetatable = true;
 
-    int pushValue();
+    int pushValue(lua_State* L);
     void setValue(const std::string& value);
+};
+
+class ScriptedPropertyImage : public ScriptedProperty
+{
+public:
+    ScriptedPropertyImage(lua_State* L, rcp<ViewModelInstanceAssetImage> value);
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 49;
+    static constexpr const char* luaName = "Property<Image>";
+    static constexpr bool hasMetatable = true;
+
+    int pushValue(lua_State* L);
+    void setValue(ScriptedImage* scriptedImage);
+};
+
+class ScriptedFont
+{
+public:
+    rcp<Font> font;
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 65;
+    static constexpr const char* luaName = "Font";
+    static constexpr bool hasMetatable = true;
+};
+
+class ViewModelInstanceAssetFont;
+class ScriptedPropertyFont : public ScriptedProperty
+{
+public:
+    ScriptedPropertyFont(lua_State* L, rcp<ViewModelInstanceAssetFont> value);
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 66;
+    static constexpr const char* luaName = "Property<Font>";
+    static constexpr bool hasMetatable = true;
+
+    int pushValue(lua_State* L);
+    void setValue(ScriptedFont* scriptedFont);
+};
+
+class ViewModelInstanceAssetBlob;
+class BlobAsset;
+class ScriptedPropertyBlob : public ScriptedProperty
+{
+public:
+    ScriptedPropertyBlob(lua_State* L, rcp<ViewModelInstanceAssetBlob> value);
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 67;
+    static constexpr const char* luaName = "Property<Blob>";
+    static constexpr bool hasMetatable = true;
+
+    int pushValue(lua_State* L);
+    void setValue(BlobAsset* blob);
 };
 
 // Make
 // ScriptedPropertyViewModel
 //      - Nullable ViewModelInstanceValue (ViewModelInstanceViewModel)
 //      - Requires ViewModel to know which properties to expect
-// ScriptedPropertyArtboard
-//      - Nullable ViewModelInstanceValue (ViewModelInstanceArtboard)
 
 // Make renderer: return lua_newrive<ScriptedRenderer>(L, renderer);
 template <class T, class... Args>
@@ -868,6 +1743,11 @@ static T* lua_torive(lua_State* L, int idx, bool allowNil = false)
     return riveObject;
 }
 
+inline void lua_pushfont(lua_State* L, rcp<Font> font)
+{
+    lua_newrive<ScriptedFont>(L)->font = std::move(font);
+}
+
 template <typename T> static void lua_register_rive(lua_State* L)
 {
     if (T::hasMetatable)
@@ -890,6 +1770,40 @@ template <typename T> static void lua_register_rive(lua_State* L)
     }
 }
 
+// Registers T's metatable with the metamethods given, nullptr for none, and
+// seals it.
+template <typename T>
+static void lua_register_rive_type(lua_State* L,
+                                   lua_CFunction index,
+                                   lua_CFunction namecall,
+                                   lua_CFunction newindex = nullptr,
+                                   lua_CFunction iter = nullptr)
+{
+    lua_register_rive<T>(L);
+    if (index != nullptr)
+    {
+        lua_pushcfunction(L, index, nullptr);
+        lua_setfield(L, -2, "__index");
+    }
+    if (namecall != nullptr)
+    {
+        lua_pushcfunction(L, namecall, nullptr);
+        lua_setfield(L, -2, "__namecall");
+    }
+    if (newindex != nullptr)
+    {
+        lua_pushcfunction(L, newindex, nullptr);
+        lua_setfield(L, -2, "__newindex");
+    }
+    if (iter != nullptr)
+    {
+        lua_pushcfunction(L, iter, nullptr);
+        lua_setfield(L, -2, "__iter");
+    }
+    lua_setreadonly(L, -1, true);
+    lua_pop(L, 1);
+}
+
 inline const Vec2D* lua_checkvec2d(lua_State* L, int stack)
 {
     return (const Vec2D*)luaL_checkvector(L, stack);
@@ -900,29 +1814,100 @@ inline const Vec2D* lua_tovec2d(lua_State* L, int stack)
     return (const Vec2D*)lua_tovector(L, stack);
 }
 
+// lua_pushvector2 leaves z (the slot's extra field) stale, and length,
+// distance and normalized read all three components.
+inline void rive_lua_pushvector2(lua_State* L, float x, float y)
+{
+#if LUA_VECTOR_SIZE == 4
+    lua_pushvector(L, x, y, 0.0f, 0.0f);
+#else
+    lua_pushvector(L, x, y, 0.0f);
+#endif
+}
+
 inline void lua_pushvec2d(lua_State* L, Vec2D vec)
 {
-    return lua_pushvector2(L, vec.x, vec.y);
+    rive_lua_pushvector2(L, vec.x, vec.y);
 }
 
 int luaopen_rive(lua_State* L);
 int rive_luaErrorHandler(lua_State* L);
 int rive_lua_pcall(lua_State* state, int nargs, int nresults);
+int rive_lua_pcall_with_context(lua_State* state,
+                                ScriptedObject* scriptedObject,
+                                int nargs,
+                                int nresults);
 int rive_lua_pushRef(lua_State* state, int ref);
 void rive_lua_pop(lua_State* state, int count);
+/// LuaAtoms lookup for the state's useratom callback; lua_atoms.cpp, shared
+/// with the wasm script module build.
+int16_t rive_lua_findAtom(const char* chars, size_t length);
+
+#ifdef RIVE_ORE
+// Script calls nest, so the post-call cleanup reclaims only the canvas frames
+// and render passes begun past these tokens, never an enclosing call's.
+struct ScriptCallGpuScope
+{
+    uint64_t openCanvasFrameToken = 0;
+    uint64_t openRenderPassToken = 0;
+};
+// Both defined in src/lua/renderer/lua_gpu.cpp.
+ScriptCallGpuScope rive_lua_enterScriptCallGpuScope(lua_State* state);
+// Reports each leaked frame or pass as a Lua error.
+void rive_lua_exitScriptCallGpuScope(lua_State* state,
+                                     const ScriptCallGpuScope& scope);
+#endif
 
 class ScriptingContext
 {
 public:
     ScriptingContext(Factory* factory) : m_factory(factory) {}
-    virtual ~ScriptingContext() = default;
+    virtual ~ScriptingContext()
+    {
+        shutdownAsync();
+#ifdef WITH_RIVE_TOOLS
+        // Properties a host claimed with an owner tag survive the File-level
+        // sweep, so they can still be tracked here when the context dies.
+        // They hold a raw pointer back for untracking; cut it now.
+        disposeOrphanScriptedProperties(/*allTags=*/true);
+#endif
+    }
     Factory* factory() const { return m_factory; }
+    // A caller supplied VM is built before decode picks a factory, so File
+    // re-points it at the one the file imported through.
+    void adoptImportFactory(Factory* factory) { m_factory = factory; }
+    ScriptedObject* currentScriptedObject() const
+    {
+        return m_currentScriptedObject;
+    }
+    void currentScriptedObject(ScriptedObject* value)
+    {
+        m_currentScriptedObject = value;
+    }
 
     virtual void printError(lua_State* state) = 0;
     virtual void printBeginLine(lua_State* state) = 0;
     virtual void print(Span<const char> data) = 0;
+    // Separates two of print's arguments. The separator is presentation, so
+    // it belongs only to a sink that renders a line of text: a sink that
+    // records each argument as a discrete value would store it as a value of
+    // its own, and its reader supplies a separator of its own when it joins
+    // them back into a line.
+    virtual void printSeparator() { print(Span<const char>("\t", 1)); }
     virtual void printEndLine() = 0;
     virtual int pCall(lua_State* state, int nargs, int nresults) = 0;
+
+    // When true, the VM's owner sets up the Lua `Data` global itself (the
+    // editor builds it in Dart), so File should not call initializeLuaData.
+    virtual bool initializesDataGlobalExternally() const { return false; }
+
+    // A chunk's closure sits on top of moduleThread's stack, not yet run; a
+    // debugger takes its reference and plants breakpoints here.
+    virtual void onModuleLoaded(lua_State* moduleThread, const char* chunkname)
+    {}
+    // A chunk's top level failed; its frames are still on moduleThread with
+    // the error on top.
+    virtual void onModuleError(lua_State* moduleThread) {}
 
     // Add a module to be registered later via performRegistration()
     void addModule(ModuleDetails* moduleDetails);
@@ -932,6 +1917,174 @@ public:
     // Called when a module is required but not found during registration
     void recordMissingDependency(const std::string& requiringModule,
                                  const std::string& missingModule);
+
+    // Scoped :shader / :blob reference resolution. Bare names resolve in the
+    // calling chunk's scope first, then among host assets;
+    // lib:<label>/<path> matches any version of the label's library, whose
+    // mangled names self-describe as <label>[#id]@<version>/<path>.
+    class ScopedAssetReference
+    {
+    public:
+        ScopedAssetReference(lua_State* L, const char* reference);
+        // Rank a registered asset (full path) with its short name: 0 no
+        // match, 2 the caller's own library, 1 host or lib: match.
+        int match(const std::string& registeredName,
+                  const std::string& shortName) const;
+
+    private:
+        bool matchesLibrary(const std::string& registeredName) const;
+
+        std::string m_label;
+        std::string m_path;
+        std::string m_scopePrefix;
+        std::string m_bare;
+    };
+
+    // Ore GPU context for this VM, void* so callers cast to ore::Context*.
+    void* oreContext() const
+    {
+        // A recording construction factory owns the context this VM's GPU work
+        // has to record into, and it has one before any device exists.
+        if (m_factory != nullptr)
+        {
+            if (auto* recording = m_factory->ore())
+                return recording;
+        }
+        return m_renderContext ? m_renderContext->ore() : nullptr;
+    }
+
+    // Render factory — attached by the host once a GPU device exists, which may
+    // be after construction (or never, for headless VMs). Distinct from the
+    // construction factory(). A RenderContext is a Factory, so callers needing
+    // gpu APIs cast down to gpu::RenderContext*.
+    void setRenderContext(Factory* ctx) { m_renderContext = ctx; }
+    Factory* renderContext() const
+    {
+        if (m_renderContext != nullptr)
+            return m_renderContext;
+        // Nothing handed this VM a device. A recording factory may still have
+        // been given one after import, so ask instead of reporting the null we
+        // saw while the scripts were running.
+        return m_factory != nullptr ? m_factory->renderContext() : nullptr;
+    }
+
+    // True when renderContext() resolved through the recording factory rather
+    // than a device handed to this VM. That device belongs to whoever attached
+    // it, so canvas backings must be deferred to it instead of allocated here.
+    bool renderContextIsLateBound() const { return m_renderContext == nullptr; }
+
+    // When non-null, Canvas:beginFrame records into the deferred stream
+    // instead of issuing to the real RenderContext. The construction factory
+    // answers, so a VM routes by importing through a recording session.
+    cmd::DeferredCanvasHost* deferredCanvasHost() const
+    {
+        return m_factory != nullptr ? m_factory->deferredCanvasHost() : nullptr;
+    }
+
+    // WorkPool for async operations (image decode, etc.).
+    // Lazily created on first access. Shared across all contexts via a
+    // process-global singleton.
+    // Falls back to the main thread, since only async() bodies copy the
+    // context onto their coroutine.
+    static ScriptingContext* from(lua_State* L);
+
+    class WorkPool* workPool();
+    uint64_t ownerId() const { return m_ownerId; }
+    // The id async work is cancelled by in shutdownAsync(), assigned on first
+    // use.
+    uint64_t acquireOwnerId();
+
+    // Cancel all pending async tasks for this context. Must be called
+    // BEFORE lua_close() to prevent callbacks on a dead Lua state.
+    void shutdownAsync();
+
+    // Like shutdownAsync but also cancels WASM browser-native decodes
+    // that bypass WorkPool. Call from ~ScriptingVM with the main lua_State.
+    void shutdownAsyncForState(lua_State* mainThread);
+
+    // True while async work this context started (image decodes, fetches)
+    // has yet to be delivered, including WASM browser-native decodes started
+    // on mainThread. Other contexts' work doesn't count.
+    bool hasPendingAsyncWork(lua_State* mainThread) const;
+
+    // WebGL/WASM only: whether an ore frame is currently open for this VM.
+    // riveLuaPCall uses this to auto-open a mini-frame when Lua callbacks
+    // fire outside the normal render boundary (e.g. Coop stream events).
+    void setOreFrameOpen(bool open) { m_oreFrameOpen = open; }
+    bool oreFrameOpen() const { return m_oreFrameOpen; }
+
+    // Open canvas frames as registry refs so the post-pcall cleanup can
+    // close frames an errored script abandoned. Each registration takes a
+    // monotonic token rather than resting on its position: a nested call is
+    // free to end a frame it inherited and open one of its own, which leaves
+    // the list exactly as long as it found it, and a positional mark cannot
+    // tell those two frames apart -- it would credit the nested call's frame
+    // to the enclosing one and leak it with the deferred stream still open.
+    struct OpenCanvasFrame
+    {
+        uint64_t token;
+        int ref;
+    };
+    void registerOpenCanvasFrame(int ref)
+    {
+        m_openCanvasFrames.push_back({m_nextOpenCanvasFrameToken++, ref});
+    }
+    void unregisterOpenCanvasFrame(int ref)
+    {
+        for (size_t i = 0; i < m_openCanvasFrames.size(); i++)
+        {
+            if (m_openCanvasFrames[i].ref == ref)
+            {
+                m_openCanvasFrames.erase(m_openCanvasFrames.begin() + i);
+                return;
+            }
+        }
+    }
+    size_t openCanvasFrameCount() const { return m_openCanvasFrames.size(); }
+    // The token the next registration will take. A script call keeps it to
+    // reclaim exactly the frames opened after it began; tokens start at 1, so
+    // 0 means "everything still open".
+    uint64_t nextOpenCanvasFrameToken() const
+    {
+        return m_nextOpenCanvasFrameToken;
+    }
+    // Removes and returns the frames registered at or after `token`, leaving
+    // the ones an enclosing script call opened where they are.
+    std::vector<int> takeOpenCanvasFramesFrom(uint64_t token)
+    {
+        std::vector<int> taken;
+        size_t keep = 0;
+        for (size_t i = 0; i < m_openCanvasFrames.size(); i++)
+        {
+            if (m_openCanvasFrames[i].token >= token)
+            {
+                taken.push_back(m_openCanvasFrames[i].ref);
+            }
+            else
+            {
+                m_openCanvasFrames[keep++] = m_openCanvasFrames[i];
+            }
+        }
+        m_openCanvasFrames.resize(keep);
+        return taken;
+    }
+
+    // When set, context:gpuCanvas() always returns a deferred (texture-less)
+    // canvas regardless of requested size, never calling makeRenderCanvas.
+    // Used by the editor's headless method-detection VM, which has no GPU
+    // device / RenderContext. Default false: normal runtimes allocate.
+    void setGpuCanvasDeferOnly(bool value) { m_gpuCanvasDeferOnly = value; }
+    bool gpuCanvasDeferOnly() const { return m_gpuCanvasDeferOnly; }
+
+    // WebGL/WASM only: GL context handle saved at riveGPUBeginFrame so
+    // riveGPUEndFrame can restore the caller's context afterwards.
+    void setPrevGLContext(intptr_t h) { m_prevGLContext = h; }
+    intptr_t prevGLContext() const { return m_prevGLContext; }
+
+#ifdef __EMSCRIPTEN__
+    void setGLHandle(int h) { m_glHandle = h; }
+    int glHandle() const { return m_glHandle; }
+#endif
 
 private:
     bool tryRegisterModule(lua_State* state, ModuleDetails* moduleDetails);
@@ -943,7 +2096,19 @@ private:
     void onModuleRegistered(ModuleDetails* moduleDetails);
 
 private:
+    Factory* m_renderContext = nullptr;
+    uint64_t m_ownerId = 0;
+    bool m_oreFrameOpen = false;
+    bool m_gpuCanvasDeferOnly = false;
+    std::vector<OpenCanvasFrame> m_openCanvasFrames;
+    uint64_t m_nextOpenCanvasFrameToken = 1;
+    intptr_t m_prevGLContext = 0;
+#ifdef __EMSCRIPTEN__
+    int m_glHandle = 0;
+#endif
+
     Factory* m_factory;
+    ScriptedObject* m_currentScriptedObject = nullptr;
     std::vector<ModuleDetails*> m_modulesToRegister;
     std::unordered_map<std::string, ModuleDetails*> m_moduleLookup;
     std::unordered_set<ModuleDetails*> m_pendingModules;
@@ -954,6 +2119,12 @@ private:
     // the runtime file.
     std::unordered_map<uint32_t, int> m_assetGeneratorRefs;
     bool m_isPlaying = false;
+    std::vector<ScriptedProperty*> m_orphanScriptedProperties;
+    uint32_t m_orphanOwnerTag = 0;
+
+    // Per-VM RSTB blobs for WGSL shaders compiled during requestVM. Populated
+    // by the scripting workspace response phase; looked up by loadShader().
+    std::unordered_map<std::string, std::vector<uint8_t>> m_shaderRstbs;
 
 public:
     void setGeneratorRef(uint32_t assetId, int ref);
@@ -962,7 +2133,69 @@ public:
     bool hasGeneratorRef(uint32_t assetId) const;
     void isPlaying(bool value) { m_isPlaying = value; }
     bool isPlaying() const { return m_isPlaying; }
+    void trackOrphanScriptedProperty(ScriptedProperty* property);
+    void untrackOrphanScriptedProperty(ScriptedProperty* property);
+    /// Disposes orphan properties. By default only untagged ones: a non-zero
+    /// tag means a host (the editor's Dart scripted objects, a preview view)
+    /// claimed the property and disposes it on its own lifecycle, so a File
+    /// dropping its VM must not take it out from under a running script.
+    /// `allTags` is for real teardown, where nothing survives.
+    void disposeOrphanScriptedProperties(bool allTags = false);
+    // Hosts tag properties created while invoking script callbacks (a
+    // FileFormat view), then dispose that owner's orphans deterministically
+    // when the owner goes away instead of waiting on GC or a VM swap.
+    void orphanOwnerTag(uint32_t tag) { m_orphanOwnerTag = tag; }
+    uint32_t orphanOwnerTag() const { return m_orphanOwnerTag; }
+    void disposeOrphanScriptedProperties(uint32_t tag);
+    void registerShaderRstb(std::string name, std::vector<uint8_t> bytes);
+    const std::vector<uint8_t>* findShaderRstb(const std::string& name) const;
+    const std::vector<uint8_t>* findShaderRstb(
+        const ScopedAssetReference& reference) const;
+    // Transfers all RSTB blobs out of this context (used during VM adoption
+    // to preserve blobs across context replacement).
+    std::unordered_map<std::string, std::vector<uint8_t>> takeShaderRstbs()
+    {
+        return std::move(m_shaderRstbs);
+    }
 #endif
+};
+
+#ifdef RIVE_CANVAS
+// Allocates a script canvas backing, deferring when a session is recording
+// or the device was late bound, since either way the replay worker owns the
+// texture.
+rcp<gpu::RenderCanvas> allocScriptRenderCanvas(gpu::RenderContext* rc,
+                                               ScriptingContext* ctx,
+                                               uint32_t width,
+                                               uint32_t height);
+#endif
+
+class ScopedScriptedObjectContext
+{
+public:
+    ScopedScriptedObjectContext(ScriptingContext* context,
+                                ScriptedObject* scriptedObject) :
+        m_context(context),
+        m_previous(context == nullptr ? nullptr
+                                      : context->currentScriptedObject())
+    {
+        if (m_context != nullptr)
+        {
+            m_context->currentScriptedObject(scriptedObject);
+        }
+    }
+
+    ~ScopedScriptedObjectContext()
+    {
+        if (m_context != nullptr)
+        {
+            m_context->currentScriptedObject(m_previous);
+        }
+    }
+
+private:
+    ScriptingContext* m_context;
+    ScriptedObject* m_previous;
 };
 
 class ScriptedDataValue
@@ -1037,11 +2270,47 @@ public:
     bool isColor() override { return true; }
 };
 
+// ScriptedDataValue is an abstract base without a luaTag of its own, so it
+// can't go through lua_torive; match the tag against its concrete subclasses
+// instead. Anything that isn't one of them (nil, a raw Lua number, a table,
+// or some unrelated rive userdata) is nullptr, which callers must handle
+// rather than dereference. Script authors control the values this reads, so
+// a wrong type is expected input, not a programming error.
+inline ScriptedDataValue* lua_todatavalue(lua_State* L, int idx)
+{
+    void* data = lua_touserdata(L, idx);
+    if (data == nullptr)
+    {
+        return nullptr;
+    }
+    switch (lua_userdatatag(L, idx))
+    {
+        case ScriptedDataValueNumber::luaTag:
+            return static_cast<ScriptedDataValueNumber*>(data);
+        case ScriptedDataValueString::luaTag:
+            return static_cast<ScriptedDataValueString*>(data);
+        case ScriptedDataValueBoolean::luaTag:
+            return static_cast<ScriptedDataValueBoolean*>(data);
+        case ScriptedDataValueColor::luaTag:
+            return static_cast<ScriptedDataValueColor*>(data);
+        default:
+            return nullptr;
+    }
+}
+
 class ScriptedPointerEvent
 {
 public:
-    ScriptedPointerEvent(uint8_t id, Vec2D position) :
-        m_id(id), m_position(position)
+    ScriptedPointerEvent(uint8_t id,
+                         Vec2D position,
+                         Vec2D previousPosition = Vec2D(),
+                         int hitListenerType = 0,
+                         float timeStamp = 0.f) :
+        m_id(id),
+        m_position(position),
+        m_previousPosition(previousPosition),
+        m_hitListenerType(hitListenerType),
+        m_timeStamp(timeStamp)
     {}
 
     static constexpr uint8_t luaTag = LUA_T_COUNT + 24;
@@ -1050,6 +2319,30 @@ public:
 
     uint8_t m_id = 0;
     Vec2D m_position;
+    Vec2D m_previousPosition;
+    int m_hitListenerType = 0;
+    float m_timeStamp = 0.f;
+    HitResult m_hitResult = HitResult::none;
+};
+
+class ScriptedScrollEvent
+{
+public:
+    ScriptedScrollEvent(int id,
+                        Vec2D position,
+                        const ScrollEvent& event,
+                        float timeStamp) :
+        m_id(id), m_position(position), m_event(event), m_timeStamp(timeStamp)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 78;
+    static constexpr const char* luaName = "ScrollEvent";
+    static constexpr bool hasMetatable = true;
+
+    int m_id = 0;
+    Vec2D m_position;
+    ScrollEvent m_event;
+    float m_timeStamp = 0.f;
     HitResult m_hitResult = HitResult::none;
 };
 
@@ -1073,6 +2366,17 @@ private:
     rcp<ScriptReffedArtboard> m_artboard;
     TransformComponent* m_component = nullptr;
     const ShapePaint* m_shapePaint = nullptr;
+};
+
+// The drawable handed to an artboard:draw visitor, borrowed for that call.
+class VisitedDrawable
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 69;
+    static constexpr const char* luaName = "Drawable";
+    static constexpr bool hasMetatable = true;
+
+    Drawable* drawable = nullptr;
 };
 
 class ScriptedContourMeasure
@@ -1110,21 +2414,311 @@ private:
     PathMeasure m_measure;
 };
 
+/// Holds the single Lua wrapper a long-lived owner hands out for a given
+/// target, keyed by that target.
+///
+/// A wrapper anchors every child it creates in the Lua registry, and a
+/// registry entry is a GC root that only the owning wrapper's C++ destructor
+/// releases. Building a fresh wrapper per call therefore grows the registry
+/// without bound in a hot script: the discarded tree needs one GC cycle per
+/// level to unwind (each level's destructor has to run before the next level
+/// stops being rooted) while a new tree is built every frame. Allocation
+/// outruns teardown, and traversing the growing registry makes each GC cycle
+/// more expensive than the last.
+template <typename T> class ScriptedWrapperCache
+{
+public:
+    ScriptedWrapperCache() = default;
+    ScriptedWrapperCache(const ScriptedWrapperCache&) = delete;
+    ScriptedWrapperCache& operator=(const ScriptedWrapperCache&) = delete;
+    ~ScriptedWrapperCache() { release(); }
+
+    /// Pushes the cached wrapper and returns true when it was built for
+    /// `key`; the caller builds and stores a wrapper otherwise.
+    bool push(lua_State* L, const rcp<T>& key)
+    {
+        if (m_ref == 0 || m_key != key)
+        {
+            return false;
+        }
+        lua_rawgeti(L, LUA_REGISTRYINDEX, m_ref);
+        return true;
+    }
+
+    /// Anchors the wrapper at the top of the stack as the entry for `key`,
+    /// leaving it on the stack. Does not pop, matching lua_ref.
+    void store(lua_State* L, const rcp<T>& key)
+    {
+        release();
+        // The main thread, not L: an async body stores from a coroutine that
+        // can be collected long before this cache releases its ref.
+        m_state = lua_mainthread(L);
+        m_ref = lua_ref(L, -1);
+        m_key = key;
+    }
+
+    void release()
+    {
+        if (m_ref != 0 && m_state != nullptr)
+        {
+            lua_unref(m_state, m_ref);
+        }
+        m_ref = 0;
+        m_key = nullptr;
+    }
+
+private:
+    lua_State* m_state = nullptr;
+    int m_ref = 0;
+    rcp<T> m_key;
+};
+
+#ifdef WITH_RIVE_SCRIPTNET
+// ── Decoded Rive files (context:decodeFile) ────────────────────────────────
+
+class BindableArtboard;
+class ViewModelInstanceArtboard;
+
+/// A Rive file a script decoded from bytes. Its artboards reach the host only
+/// as BindableArtboards assigned to view model artboard properties.
+class ScriptedRiveFile
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 75;
+    static constexpr const char* luaName = "RiveFile";
+    static constexpr bool hasMetatable = true;
+
+    ScriptedRiveFile();
+    ~ScriptedRiveFile();
+
+    rcp<File> file;
+};
+
+/// An artboard of a decoded file, with an instance of the view model its
+/// binds read from that same file. Assigning it to a view model artboard
+/// property binds both.
+class ScriptedBindableArtboard
+{
+public:
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 76;
+    static constexpr const char* luaName = "BindableArtboard";
+    static constexpr bool hasMetatable = true;
+
+    // Filled in after the userdata exists, so a failed allocation cannot
+    // strand the references (Luau errors longjmp past destructors).
+    ScriptedBindableArtboard();
+    ~ScriptedBindableArtboard();
+
+    int pushData(lua_State* L);
+
+    rcp<BindableArtboard> artboard;
+    // Null when the artboard has no view model.
+    rcp<ViewModelInstance> viewModel;
+
+private:
+    ScriptedWrapperCache<ViewModelInstance> m_dataCache;
+};
+
+class ScriptedPropertyArtboard : public ScriptedProperty
+{
+public:
+    ScriptedPropertyArtboard(lua_State* L,
+                             rcp<ViewModelInstanceArtboard> value);
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 77;
+    static constexpr const char* luaName = "Property<BindableArtboard>";
+    static constexpr bool hasMetatable = true;
+
+    /// The bindable last assigned, or nil while the property names one of
+    /// the host file's own artboards (or none).
+    int pushValue(lua_State* L);
+    /// Assigns the BindableArtboard (or nil) at valueIdx.
+    void setValue(lua_State* L, int valueIdx);
+};
+#endif
+
 class ScriptedContext
 {
 public:
     ScriptedContext(ScriptedObject*);
     ScriptedObject* scriptedObject() { return m_scriptedObject; }
+    void clearScriptedObject();
+    int pushViewModel(lua_State*);
+    int pushRootViewModel(lua_State*);
+    int pushGlobalViewModel(lua_State*);
+    int pushGlobalViewModelNames(lua_State*);
+    int pushDataContext(lua_State*);
     static constexpr uint8_t luaTag = LUA_T_COUNT + 28;
     static constexpr const char* luaName = "Context";
     static constexpr bool hasMetatable = true;
-    void dispose() { m_disposed = true; }
-    bool disposed() { return m_disposed; }
+    bool missingRequestedData() { return m_missingRequestedData; }
 
 private:
     ScriptedObject* m_scriptedObject = nullptr;
-    bool m_disposed = false;
+    bool m_missingRequestedData = false;
+
+    // A script only ever sees one Context per scripted-object lifetime, so
+    // these caches make repeated calls (a pointer handler can run every frame)
+    // hand back the same wrapper rather than a fresh registry-rooted tree.
+    // Each re-keys itself when the data context rebinds to a new instance.
+    ScriptedWrapperCache<ViewModelInstance> m_viewModel;
+    ScriptedWrapperCache<ViewModelInstance> m_rootViewModel;
+    std::unordered_map<std::string, ScriptedWrapperCache<ViewModelInstance>>
+        m_globalViewModels;
+    ScriptedWrapperCache<DataContext> m_dataContext;
 };
+
+/// Wraps [`ListenerInvocation`] for `performAction` in scripted listener
+/// actions.
+class ScriptedInvocation
+{
+public:
+    explicit ScriptedInvocation(ListenerInvocation inv) :
+        m_invocation(std::move(inv))
+    {}
+
+    ListenerInvocation& invocation() { return m_invocation; }
+    const ListenerInvocation& invocation() const { return m_invocation; }
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 54;
+    static constexpr const char* luaName = "Invocation";
+    static constexpr bool hasMetatable = true;
+
+private:
+    ListenerInvocation m_invocation;
+};
+
+class ScriptedKeyboardInvocation
+{
+public:
+    ScriptedKeyboardInvocation(Key key,
+                               KeyModifiers modifiers,
+                               bool isPressed,
+                               bool isRepeat) :
+        m_key(key),
+        m_modifiers(modifiers),
+        m_isPressed(isPressed),
+        m_isRepeat(isRepeat)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 55;
+    static constexpr const char* luaName = "KeyboardInvocation";
+    static constexpr bool hasMetatable = true;
+
+    Key m_key;
+    KeyModifiers m_modifiers;
+    bool m_isPressed;
+    bool m_isRepeat;
+};
+
+class ScriptedTextInputInvocation
+{
+public:
+    explicit ScriptedTextInputInvocation(std::string text) :
+        m_text(std::move(text))
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 56;
+    static constexpr const char* luaName = "TextInputInvocation";
+    static constexpr bool hasMetatable = true;
+
+    const std::string& text() const { return m_text; }
+
+private:
+    std::string m_text;
+};
+
+class ScriptedFocusInvocation
+{
+public:
+    explicit ScriptedFocusInvocation(bool isFocus) : m_isFocus(isFocus) {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 57;
+    static constexpr const char* luaName = "FocusInvocation";
+    static constexpr bool hasMetatable = true;
+
+    bool m_isFocus;
+};
+
+class ScriptedReportedEventInvocation
+{
+public:
+    ScriptedReportedEventInvocation(Event* event, float delaySeconds) :
+        m_event(event), m_delaySeconds(delaySeconds)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 58;
+    static constexpr const char* luaName = "ReportedEventInvocation";
+    static constexpr bool hasMetatable = true;
+
+    /// Valid only for the duration of the listener callback; do not retain.
+    Event* m_event;
+    float m_delaySeconds;
+};
+
+class ScriptedViewModelChangeInvocation
+{
+public:
+    ScriptedViewModelChangeInvocation() = default;
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 59;
+    static constexpr const char* luaName = "ViewModelChangeInvocation";
+    static constexpr bool hasMetatable = true;
+};
+
+class ScriptedGamepadConnected
+{
+public:
+    explicit ScriptedGamepadConnected(const GamepadSnapshot& snapshot) :
+        m_snapshot(snapshot)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 48;
+    static constexpr const char* luaName = "GamepadConnected";
+    static constexpr bool hasMetatable = true;
+
+    GamepadSnapshot m_snapshot;
+};
+
+class ScriptedGamepadEvent
+{
+public:
+    explicit ScriptedGamepadEvent(const GamepadEventInvocation& v) : m_data(v)
+    {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 63;
+    static constexpr const char* luaName = "GamepadEvent";
+    static constexpr bool hasMetatable = true;
+
+    GamepadEventInvocation m_data;
+};
+
+class ScriptedGamepadDisconnected
+{
+public:
+    explicit ScriptedGamepadDisconnected(int deviceId) : m_deviceId(deviceId) {}
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 64;
+    static constexpr const char* luaName = "GamepadDisconnected";
+    static constexpr bool hasMetatable = true;
+
+    int m_deviceId;
+};
+
+class ScriptedNoneInvocation
+{
+public:
+    ScriptedNoneInvocation() = default;
+
+    static constexpr uint8_t luaTag = LUA_T_COUNT + 61;
+    static constexpr const char* luaName = "NoneInvocation";
+    static constexpr bool hasMetatable = true;
+};
+
+void rive_lua_register_listener_invocation_types(lua_State* L);
+void rive_lua_push_pointer_arg_for_perform(lua_State* L,
+                                           const ListenerInvocation& inv);
+void rive_lua_push_scripted_invocation(lua_State* L,
+                                       const ListenerInvocation& inv);
 
 static void interruptCPP(lua_State* L, int gc);
 
@@ -1164,10 +2758,10 @@ public:
 #ifdef WITH_RIVE_TOOLS
         BinaryWriter writer(&m_consoleBuffer);
         lua_Debug ar;
-        lua_getinfo(state, 1, "sl", &ar);
+        bool hasInfo = lua_getinfo(state, 1, "sl", &ar) != 0;
         writer.write((uint8_t)0);
-        writer.write(ar.source);
-        writer.writeVarUint((uint32_t)ar.currentline);
+        writer.write(hasInfo && ar.source != nullptr ? ar.source : "");
+        writer.writeVarUint((uint32_t)(hasInfo ? ar.currentline : 0));
 #endif
     }
 
@@ -1187,6 +2781,20 @@ public:
         {
             auto message = std::string(data.data(), data.size());
             printf("%s", message.c_str());
+        }
+    }
+
+    // print() above records a span whether or not anyone installed a
+    // callback -- scripting_workspace and the player both read the buffer
+    // without one -- so the separator never goes there. It belongs to the
+    // stdout half, which runs on the same condition print() uses.
+    void printSeparator() override
+    {
+#ifdef WITH_RIVE_TOOLS
+        if (m_consoleCallback == nullptr)
+#endif
+        {
+            printf("\t");
         }
     }
 
@@ -1214,7 +2822,15 @@ public:
     void printError(lua_State* state) override
     {
         const char* error = lua_tostring(state, -1);
-        fprintf(stderr, "%s", error);
+        fprintf(stderr, "%s\n", error);
+#ifdef WITH_RIVE_TOOLS
+        if (error)
+        {
+            printBeginLine(state);
+            print(Span<const char>(error, strlen(error)));
+            printEndLine();
+        }
+#endif
     }
 
     void startTimedExecution(lua_State* state)
@@ -1224,10 +2840,16 @@ public:
             return;
         }
         lua_Callbacks* cb = lua_callbacks(state);
+        if (m_timedDepth++ == 0)
+        {
+            m_outerInterrupt = cb->interrupt;
+        }
         cb->interrupt = interruptCPP;
         executionTime = std::chrono::steady_clock::now();
     }
 
+    // Restores rather than clears, so a host's own interrupt, like the test
+    // harness budget, outlives any timed call it makes.
     void endTimedExecution(lua_State* state)
     {
         if (m_timeoutMs == 0)
@@ -1235,7 +2857,7 @@ public:
             return;
         }
         lua_Callbacks* cb = lua_callbacks(state);
-        cb->interrupt = nullptr;
+        cb->interrupt = --m_timedDepth == 0 ? m_outerInterrupt : interruptCPP;
     }
 
 #ifdef WITH_RIVE_TOOLS
@@ -1253,6 +2875,8 @@ public:
 
 private:
     int m_timeoutMs = 200;
+    int m_timedDepth = 0;
+    void (*m_outerInterrupt)(lua_State* L, int gc) = nullptr;
 #ifdef WITH_RIVE_TOOLS
     ConsoleCallback m_consoleCallback = nullptr;
     VectorBinaryStream m_consoleBuffer;
@@ -1275,6 +2899,11 @@ public:
 private:
     lua_State* m_state = nullptr;
     rcp<DataContext> m_dataContext = nullptr;
+
+    // Same reason as ScriptedContext: this wrapper outlives a single call, so
+    // handing back a fresh child per call would leak registry roots.
+    ScriptedWrapperCache<ViewModelInstance> m_viewModelCache;
+    ScriptedWrapperCache<DataContext> m_parentCache;
 };
 
 static void interruptCPP(lua_State* L, int gc)
@@ -1322,5 +2951,52 @@ static void interruptCPP(lua_State* L, int gc)
     }
 }
 } // namespace rive
+
+#ifdef RIVE_CANVAS
+#ifdef RIVE_ORE
+namespace rive
+{
+class ShaderAsset;
+class File;
+} // namespace rive
+// Load a shader by scoped reference into a ScriptedShader (populates both
+// vertex and fragment modules for GLSL targets with split entry points).
+// Checks ScriptingContext::m_shaderRstbs first (editor path, compiled
+// during requestVM), then |fileAsset| if non-null (runtime .riv path).
+// Returns false on failure.
+bool lua_gpu_load_shader_by_name(
+    rive::ScriptedShader* out,
+    rive::ScriptingContext* context,
+    const rive::ScriptingContext::ScopedAssetReference& reference,
+    rive::ShaderAsset* fileAsset);
+
+// The file's ShaderAsset best matching a scoped reference, null when none.
+rive::ShaderAsset* lua_gpu_find_shader_asset(
+    rive::File* file,
+    const rive::ScriptingContext::ScopedAssetReference& reference);
+
+// Compile a shader by name and push the resulting ScriptedShader onto the
+// Lua stack. Returns 1 on success, 0 on failure. Declared here (implemented
+// in lua_gpu.cpp) so callers that only have a forward-declaration of
+// ShaderModule do not need to touch rcp<ShaderModule> directly.
+int lua_gpu_push_shader_by_name(lua_State* L, const char* name);
+#endif // RIVE_ORE
+#endif // RIVE_CANVAS
+
+// Push a GPU features table onto the Lua stack. Queries the ORE context when
+// available, otherwise returns conservative defaults. Always returns 1.
+// Implemented in lua_scripted_context.cpp.
+int lua_push_gpu_features(lua_State* L);
+
+#ifdef WITH_RIVE_TOOLS
+// Push a ScriptedBlob copying `data`, or an empty blob when data is null or
+// size is 0. Only tooling constructs blobs from loose bytes; the runtime
+// wraps in-file assets. Implemented in lua_blob.cpp.
+int lua_push_blob(lua_State* L,
+                  const char* name,
+                  const uint8_t* data,
+                  size_t size);
+#endif
+
 #endif
 #endif

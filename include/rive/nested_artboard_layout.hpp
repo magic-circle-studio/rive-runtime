@@ -20,12 +20,17 @@ public:
     void markHostingLayoutDirty(ArtboardInstance* artboardInstance) override;
     void markLayoutNodeDirty(
         bool shouldForceUpdateLayoutBounds = false) override;
-    void update(ComponentDirt value) override;
     void updateConstraints() override;
     StatusCode onAddedClean(CoreContext* context) override;
 
     bool syncStyleChanges() override;
     void updateLayoutBounds(bool animate = true) override;
+#ifdef WITH_RIVE_LAYOUT
+    bool cascadeLayoutStyle(LayoutStyleInterpolation inheritedInterpolation,
+                            KeyFrameInterpolator* inheritedInterpolator,
+                            float inheritedInterpolationTime,
+                            LayoutDirection direction) override;
+#endif
     AABB layoutBounds() override;
     size_t numLayoutNodes() override { return 1; }
     bool isLayoutProvider() override { return true; }
@@ -37,6 +42,7 @@ public:
         return this->as<TransformComponent>();
     }
     bool isRow();
+    bool isStack();
 
 protected:
     void instanceWidthChanged() override;
@@ -47,6 +53,7 @@ protected:
     void instanceHeightScaleTypeChanged() override;
 
 private:
+    void applyLayoutPlacement();
     void updateWidthOverride();
     void updateHeightOverride();
     StyleOverrider<NestedArtboardLayout> m_styleOverrider =

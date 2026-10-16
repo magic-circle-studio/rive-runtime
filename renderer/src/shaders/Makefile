@@ -73,7 +73,7 @@ $(OUT)/rive_pls_macosx.metallib.c: $(OUT)/macosx/rive_pls_macosx.metallib
 		$(OUT)/macosx/rive_pls_macosx.metallib \
 		$(OUT)/rive_pls_macosx.metallib.c
 
-$(OUT)/ios/rive_pls_ios.metallib: $(MINIFY_GLSL_OUTPUTS) $(METAL_INPUTS) $(DRAW_COMBINATIONS_METAL) | $(OUT)/ios/. 
+$(OUT)/ios/rive_pls_ios.metallib: $(MINIFY_GLSL_OUTPUTS) $(METAL_INPUTS) $(DRAW_COMBINATIONS_METAL) | $(OUT)/ios/.
 	$(foreach FILE, $(METAL_INPUTS), \
 		xcrun -sdk iphoneos metal -std=ios-metal2.2 \
 		-I$(OUT) -mios-version-min=13 -ffast-math -ffp-contract=fast -fpreserve-invariance \
@@ -156,33 +156,72 @@ SPIRV_STANDARD_INPUTS := $(wildcard spirv/*.main) \
 				 $(wildcard spirv/*.vert) \
 				 $(wildcard spirv/*.frag)
 
-# Files that need separate fragment shaders with FIXED_FUNCTION_COLOR_OUTPUT defined.
-SPIRV_FIXEDCOLOR_FRAG_INPUTS := \
+# WebGPU needs some additional shaders to be built specifically for it,
+# to ensure the proper sampler binding set is used.
+SPIRV_WEBGPU_INPUTS := \
+    spirv/tessellate.main \
+	spirv/render_atlas.vert \
+	spirv/render_atlas_fill.frag \
+	spirv/render_atlas_stroke.frag \
+	spirv/blit_texture_as_draw_filtered.main \
+    spirv/atomic_resolve_coalesced.main \
+
+# Clockwise shaders need separate builds with FIXED_FUNCTION_COLOR_OUTPUT
+# defined.
+SPIRV_CLOCKWISE_INPUTS := \
+    spirv/draw_clockwise_path.main \
+    spirv/draw_clockwise_clip.main \
+    spirv/draw_clockwise_interior_triangles.main \
+    spirv/draw_clockwise_clip_interior_triangles.main \
+    spirv/draw_clockwise_atlas_blit.main \
+    spirv/draw_clockwise_image_mesh.main \
+    spirv/draw_clockwise_atomic_path.main \
+    spirv/draw_clockwise_atomic_interior_triangles.main \
+    spirv/draw_clockwise_atomic_atlas_blit.main \
+    spirv/draw_clockwise_atomic_image_mesh.main \
+    spirv/init_clockwise_atomic_workaround.frag \
+    spirv/draw_clockwise_atomic_clip.frag \
+    spirv/draw_clockwise_atomic_clip_interior_triangles.frag \
+    spirv/clear_clockwise_atomic_clip.main \
+
+# Atomic shaders need separate builds with FIXED_FUNCTION_COLOR_OUTPUT, as well
+# as builds for WebGPU.
+SPIRV_DRAW_ATOMIC_INPUTS := \
     spirv/atomic_draw_image_mesh.main \
     spirv/atomic_draw_image_rect.main \
     spirv/atomic_draw_interior_triangles.main \
     spirv/atomic_draw_atlas_blit.main \
     spirv/atomic_draw_path.main \
     spirv/atomic_resolve.main \
-    spirv/draw_clockwise_path.main \
-    spirv/draw_clockwise_clip.main \
-    spirv/draw_clockwise_interior_triangles.main \
-    spirv/draw_clockwise_interior_triangles_clip.main \
-    spirv/draw_clockwise_atlas_blit.main \
-    spirv/draw_clockwise_image_mesh.main \
-    spirv/draw_clockwise_atomic_atlas_blit.main \
-    spirv/draw_clockwise_atomic_image_mesh.main \
-    spirv/draw_msaa_atlas_blit.main \
-    spirv/draw_msaa_image_mesh.main \
-    spirv/draw_msaa_path.main \
-    spirv/draw_msaa_stencil.main \
+    spirv/atomic_init.main \
 
-# MSAA vertex and fragment shaders are built multiple times with different flags.
+# MSAA shaders need separate builds with FIXED_FUNCTION_COLOR_OUTPUT and/or
+# DISABLE_CLIP_DISTANCE_FOR_UBERSHADERS, as well as builds for WebGPU.
 SPIRV_DRAW_MSAA_INPUTS := \
-    spirv/draw_msaa_path.main \
-    spirv/draw_msaa_image_mesh.main \
-    spirv/draw_msaa_atlas_blit.main \
+    spirv/draw_depthstencil_path.main \
+    spirv/draw_depthstencil_atlas_blit.main \
+    spirv/draw_depthstencil_image_mesh.main \
+    spirv/draw_depthstencil_triangles_nocolor.main \
 
+# MSAA advanced blend reads the color attachment via 'subpassInputMS', which is
+# an entirely different type than 'subpassInput' and requires its own build.
+# NOTE: At the time these were added, they cost us 66KB, or +16% the embedded
+# .spv size on android (which excludes atomic modes).
+SPIRV_DRAW_MSAA_DST_READ_INPUTS := \
+    spirv/draw_depthstencil_path.main \
+    spirv/draw_depthstencil_atlas_blit.main \
+    spirv/draw_depthstencil_image_mesh.main \
+
+# WebGPU (compatibility mode) doesn't always support storage buffers in the
+# vertex shader. These files specifically need WebGPU "nossbo" build variants
+# that polyfill the buffers via textures.
+WEBGPU_NOSSBO_NOCLIPDISTANCE_INPUTS := \
+    spirv/draw_depthstencil_path.main \
+    spirv/draw_depthstencil_atlas_blit.main
+WEBGPU_NOSSBO_INPUTS := \
+    $(WEBGPU_NOSSBO_NOCLIPDISTANCE_INPUTS) \
+    spirv/tessellate.main \
+    spirv/render_atlas.vert
 
 ## Helpers for use in SPIRV_LIST_RULE (using lower_snake_case to distinguish things that use inputs like $1, $2, etc)
 spirv_typed_filename = $(basename $1).$2
@@ -190,9 +229,9 @@ spirv_out_filename_no_ext = $(OUT)/$(call spirv_typed_filename,$1,$2)
 spirv_type = $(lastword $(subst _, ,$2))
 spirv_is_vert = $(findstring vert,$(spirv_type))
 spirv_is_webgpu = $(findstring webgpu,$2)
-spirv_is_not_clockwise_atomic = $(ifeq $(findstring clockwise_atomic,$1),)
-spirv_is_atomic = $(and $(findstring atomic,$1),spirv_is_not_clockwise_atomic)
-spirv_is_clockwise = $(and $(findstring clockwise,$1),spirv_is_not_clockwise_atomic)
+spirv_is_atomic_or_clockwise_atomic = $(findstring atomic,$1)
+spirv_is_not_clockwise_atomic = $(if $(findstring clockwise_atomic,$1),,1)
+spirv_is_clockwise = $(and $(findstring clockwise,$1), $(call spirv_is_not_clockwise_atomic,$1))
 
 ## SPIR-V Optimizer settings
 
@@ -201,7 +240,7 @@ spirv_is_clockwise = $(and $(findstring clockwise,$1),spirv_is_not_clockwise_ato
 ##   --merge-return
 ##   --inline-entry-points-exhaustive
 ## without those, the pipelines on the affected devices will fail to link. However, we can do
-## more optimizations while we're here, which 
+## more optimizations while we're here, which will reduce the binary size.
 
 ## Vertex shaders can be optimized using the standard "optimize for performance" option
 ## with no known issues
@@ -224,7 +263,7 @@ SPIRV_STANDARD_VERT_OPT_PARAMS = -O
 ## to get consistent fragment shader optimizations.
 spirv_frag_opt_params = \
 	$(if $(spirv_is_webgpu),-O, \
-		$(if $(spirv_is_atomic), \
+		$(if $(spirv_is_atomic_or_clockwise_atomic), \
 			--preserve-bindings \
 			--preserve-interface \
 			--wrap-opkill \
@@ -288,7 +327,7 @@ spirv_frag_opt_params = \
 
 ## WebGPU fragment shaders need a different PLS_IMPL value
 spirv_frag_params = $(if $(spirv_is_webgpu), \
-                        -DPLS_IMPL_NONE, \
+                        -DPLS_IMPL_STORAGE_BUFFER, \
 					$(if $(spirv_is_clockwise), \
 						-DPLS_IMPL_STORAGE_TEXTURE, \
 						-DPLS_IMPL_SUBPASS_LOAD))
@@ -307,18 +346,18 @@ spirv_opt_params = \
 ## Usage: $(eval $(call spirv_list_rule, INPUT_FILENAME, OUTPUT_TYPE [, ADDITIONAL_COMPILE_OPTIONS]))
 ##   Where OUTPUT_TYPE is, say, "vert" or "frag" or "fixedcolor_frag", etc
 define spirv_list_rule
-  $(spirv_out_filename_no_ext).spirv: $1 $(MINIFY_STAMP) | $(OUT)/spirv/.
-	@glslangValidator -S $(spirv_type) -DTARGET_VULKAN \
+  $(spirv_out_filename_no_ext).spv: $1 $(MINIFY_STAMP) | $(OUT)/spirv/.
+	@glslangValidator -S $(spirv_type) -DTARGET_SPIRV \
 		$(if $(spirv_is_vert), -DVERTEX, -DFRAGMENT $(spirv_frag_params)) \
-		-I$(OUT)  -V $3 -o $(spirv_out_filename_no_ext).spirv.unoptimized $1
+		-I$(OUT)  -V $3 -o $(spirv_out_filename_no_ext).spv.unoptimized $1
 	@spirv-opt --preserve-bindings --preserve-interface $(spirv_opt_params) \
-		$(spirv_out_filename_no_ext).spirv.unoptimized -o $(spirv_out_filename_no_ext).spirv
-	@rm $(spirv_out_filename_no_ext).spirv.unoptimized
+		$(spirv_out_filename_no_ext).spv.unoptimized -o $(spirv_out_filename_no_ext).spv
+	@rm $(spirv_out_filename_no_ext).spv.unoptimized
 
-  $(spirv_out_filename_no_ext).h: $(spirv_out_filename_no_ext).spirv
-	@python3 spirv_binary_to_header.py $(spirv_out_filename_no_ext).spirv $(spirv_out_filename_no_ext).h $(subst $(suffix $1),_$2,$(notdir $1))
+  $(spirv_out_filename_no_ext).h: $(spirv_out_filename_no_ext).spv
+	@python3 spirv_binary_to_header.py $(spirv_out_filename_no_ext).spv $(spirv_out_filename_no_ext).h $(subst $(suffix $1),_$2,$(notdir $1))
 
-  SPIRV_OUTPUTS_BINARY += $(spirv_out_filename_no_ext).spirv
+  SPIRV_OUTPUTS_BINARY += $(spirv_out_filename_no_ext).spv
   SPIRV_OUTPUTS_HEADERS += $(spirv_out_filename_no_ext).h
 endef
 
@@ -334,20 +373,109 @@ define make_spirv_rules
     )
 endef
 
-## All .main/vert/frag files should build 
+## All .main/vert/frag files should build
 $(eval $(call make_spirv_rules, $(SPIRV_STANDARD_INPUTS), vert frag))
 
+SPIRV_COMMON_WEBGPU_PARAMS = -DTARGET_WGSL -DUSE_WEBGPU_SAMPLERS
+
 ## Each of the specialized SPIRV lists have their own associated rules
-$(eval $(call make_spirv_rules, $(SPIRV_FIXEDCOLOR_FRAG_INPUTS), fixedcolor_frag, -DFIXED_FUNCTION_COLOR_OUTPUT))
 $(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), noclipdistance_vert, -DDISABLE_CLIP_DISTANCE_FOR_UBERSHADERS))
-$(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), webgpu_vert, -DSPEC_CONST_NONE))
-$(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), webgpu_noclipdistance_vert, -DSPEC_CONST_NONE -DDISABLE_CLIP_DISTANCE_FOR_UBERSHADERS))
-$(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), webgpu_frag, -DSPEC_CONST_NONE -DINPUT_ATTACHMENT_NONE))
-$(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), webgpu_fixedcolor_frag, -DSPEC_CONST_NONE -DINPUT_ATTACHMENT_NONE -DFIXED_FUNCTION_COLOR_OUTPUT))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_CLOCKWISE_INPUTS) \
+    $(SPIRV_DRAW_ATOMIC_INPUTS) \
+    $(SPIRV_DRAW_MSAA_INPUTS), \
+    fixedcolor_frag, \
+    -DFIXED_FUNCTION_COLOR_OUTPUT))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_DRAW_MSAA_DST_READ_INPUTS), \
+    msaa_frag, \
+    -DMSAA_DST_COLOR))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_WEBGPU_INPUTS) \
+    $(SPIRV_DRAW_ATOMIC_INPUTS) \
+    $(SPIRV_DRAW_MSAA_INPUTS), \
+    webgpu_vert, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS)))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_DRAW_MSAA_INPUTS), \
+    webgpu_noclipdistance_vert, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS) -DDISABLE_CLIP_DISTANCE_FOR_UBERSHADERS))
+$(eval $(call make_spirv_rules, \
+    $(WEBGPU_NOSSBO_INPUTS), \
+    webgpu_nossbo_vert, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS) -DDISABLE_SHADER_STORAGE_BUFFERS))
+$(eval $(call make_spirv_rules, \
+    $(WEBGPU_NOSSBO_NOCLIPDISTANCE_INPUTS), \
+    webgpu_nossbo_noclipdistance_vert, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS) -DDISABLE_SHADER_STORAGE_BUFFERS -DDISABLE_CLIP_DISTANCE_FOR_UBERSHADERS))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_WEBGPU_INPUTS) \
+    $(SPIRV_DRAW_ATOMIC_INPUTS) \
+    $(SPIRV_DRAW_MSAA_INPUTS), \
+    webgpu_frag, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS)))
+$(eval $(call make_spirv_rules, \
+    $(SPIRV_DRAW_ATOMIC_INPUTS) \
+    $(SPIRV_DRAW_MSAA_INPUTS), \
+    webgpu_fixedcolor_frag, \
+    $(SPIRV_COMMON_WEBGPU_PARAMS) -DFIXED_FUNCTION_COLOR_OUTPUT))
 
 
 spirv: $(SPIRV_OUTPUTS_HEADERS)
 spirv-binary: $(SPIRV_OUTPUTS_BINARY)
+
+## WGSL compilation. Translates WebGPU-flavored SPIR-V binaries to WGSL using
+## naga. Some Vulkan-flavored SPIR-V files aren't compatible with WebGPU so we
+## filter to the webgpu_* variants only — plus a hand-curated list of standard
+## variants that translate cleanly (e.g., shaders without combined samplers).
+$(OUT)/wgsl/.: | $(OUT)/.
+	@mkdir -p $@
+
+WGSL_OUTPUTS := \
+    $(patsubst $(OUT)/spirv/%.spv,$(OUT)/wgsl/%.wgsl, \
+        $(filter %.webgpu_vert.spv \
+                 %.webgpu_noclipdistance_vert.spv \
+                 %.webgpu_nossbo_vert.spv \
+                 %.webgpu_nossbo_noclipdistance_vert.spv \
+                 %.webgpu_frag.spv \
+                 %.webgpu_fixedcolor_frag.spv, \
+                 $(SPIRV_OUTPUTS_BINARY))) \
+    $(OUT)/wgsl/draw_depthstencil_triangles_nocolor.vert.wgsl \
+    $(OUT)/wgsl/draw_depthstencil_triangles_nocolor.frag.wgsl \
+    $(OUT)/wgsl/color_ramp.vert.wgsl \
+    $(OUT)/wgsl/color_ramp.frag.wgsl
+
+## Filter naga's noisy "Unknown decoration RelaxedPrecision" warning — WGSL has
+## no precision qualifiers, so naga always drops it. bash with pipefail ensures
+## a real naga failure still fails the build (pipeline exit status reflects
+## naga's, not grep's). The trailing "[ $$? = 1 ]" absorbs grep's "no matches"
+## exit code on clean runs where naga emitted nothing.
+
+## TERM=dumb forces a terminfo entry that always exists. CI sometimes sets
+## TERM=unknown, which makes naga's terminal-detection code (ncurses-backed)
+## abort with "Error opening terminal: unknown" before it can translate.
+
+## --keep-coordinate-space disables naga's default Y-flip on gl_Position. naga
+## assumes Vulkan-flavored SPIR-V (Y-down NDC) and flips to OpenGL/ WebGPU's Y-up
+## NDC. Our GLSL is already authored for Y-up — gpu.cpp sets
+## renderTargetInverseViewportY negative so the math produces WebGPU clip coords
+## directly — and the extra flip would render upside down (Dawn's SPIR-V path
+## didn't apply it either).
+$(OUT)/wgsl/%.wgsl: $(OUT)/spirv/%.spv | $(OUT)/wgsl/.
+	@echo "wgsl/$*.wgsl"
+	@TERM=dumb bash -o pipefail -c 'naga --keep-coordinate-space "$<" "$@" 2>&1 | { grep -v "Unknown decoration RelaxedPrecision" || [ $$? = 1 ]; }'
+
+## Embed each .wgsl as a C++ raw string literal in a .hpp header that downstream
+## code can #include. The variable lives in the wgsl:: namespace and is named
+## after the basename with dots replaced by underscores (e.g.
+## wgsl::tessellate_webgpu_vert). wgsl_to_header.py minifies the source first
+## unless WGSL_FLAGS includes --raw.
+WGSL_HEADER_OUTPUTS := $(patsubst %.wgsl,%.hpp,$(WGSL_OUTPUTS))
+
+$(OUT)/wgsl/%.hpp: $(OUT)/wgsl/%.wgsl wgsl_to_header.py | $(OUT)/wgsl/.
+	@python3 wgsl_to_header.py $(WGSL_FLAGS) $< $@ $(subst .,_,$(basename $(notdir $<)))
+
+wgsl: $(WGSL_HEADER_OUTPUTS)
 
 ## d3d compilation.
 .PHONY: $(OUT)/d3d/render_atlas.frag.h

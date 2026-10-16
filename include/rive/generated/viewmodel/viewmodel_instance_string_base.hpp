@@ -3,6 +3,9 @@
 #include <string>
 #include "rive/core/field_types/core_string_type.hpp"
 #include "rive/viewmodel/viewmodel_instance_value.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class ViewModelInstanceStringBase : public ViewModelInstanceValue
@@ -12,20 +15,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 433;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case ViewModelInstanceStringBase::typeKey:
-            case ViewModelInstanceValueBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -42,14 +31,19 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_STRING_CHANGING(propertyValuePropertyKey,
+                                    m_PropertyValue,
+                                    value);
         m_PropertyValue = value;
-        propertyValueChanged();
+        RIVE_EDITOR_CHANGED(propertyValueChanged());
+        notifyPropertyChanged(propertyValuePropertyKey);
     }
 
     Core* clone() const override;
     void copy(const ViewModelInstanceStringBase& object)
     {
         m_PropertyValue = object.m_PropertyValue;
+        RIVE_EDITOR_COPY(object);
         ViewModelInstanceValue::copy(object);
     }
 
@@ -61,11 +55,15 @@ public:
                 m_PropertyValue = CoreStringType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return ViewModelInstanceValue::deserialize(propertyKey, reader);
     }
 
 protected:
     virtual void propertyValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/viewmodel/viewmodel_instance_string_ext.inl"
+#endif
 };
 } // namespace rive
 

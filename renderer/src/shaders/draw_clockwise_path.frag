@@ -10,7 +10,7 @@ PLS_DECL4F(COLOR_PLANE_IDX, colorBuffer);
 #endif
 PLS_DECLUI(CLIP_PLANE_IDX, clipBuffer);
 #ifndef @FIXED_FUNCTION_COLOR_OUTPUT
-PLS_DECL4F_RGB10_A2(SCRATCH_COLOR_PLANE_IDX, scratchColorBuffer);
+PLS_DECL4F_RGB10_A2(SCRATCH_COLOR_PLANE_IDX, blendColorBuffer);
 #endif
 PLS_DECLUI(COVERAGE_PLANE_IDX, coverageBuffer);
 PLS_BLOCK_END
@@ -22,10 +22,13 @@ PLS_MAIN(@drawFragmentMain)
 #endif
 {
     VARYING_UNPACK(v_paint, float4);
+#ifdef @ENABLE_MODULATED_IMAGE
+    VARYING_UNPACK(v_image, float3);
+#endif
 #ifdef @DRAW_INTERIOR_TRIANGLES
-    VARYING_INIT(v_windingWeight, half);
+    VARYING_UNPACK(v_windingWeight, half);
 #else
-    VARYING_INIT(v_coverages, COVERAGE_TYPE);
+    VARYING_UNPACK(v_coverages, COVERAGE_TYPE);
 #endif //@DRAW_INTERIOR_TRIANGLES
     VARYING_UNPACK(v_pathID, half);
 #ifdef @ENABLE_CLIPPING
@@ -36,6 +39,9 @@ PLS_MAIN(@drawFragmentMain)
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_UNPACK(v_blendMode, half);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
 #endif
 
     // Calculate fragment coverage before entering the interlock.
@@ -53,14 +59,36 @@ PLS_MAIN(@drawFragmentMain)
 #endif
     {
         // Calculate the paint color before entering the interlock.
-        paintColor = find_paint_color(v_paint, 1. FRAGMENT_CONTEXT_UNPACK);
+        paintColor = find_paint_color(
+#ifdef @ENABLE_MODULATED_IMAGE
+            v_image,
+#endif
+#ifdef @ENABLE_ADVANCED_BLEND
+            cast_half_to_ushort(v_blendMode),
+#endif
+            v_paint FRAGMENT_CONTEXT_UNPACK);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+        if (@ENABLE_HSL_BLEND_MODES)
+        {
+            paintColor = apply_surface_material_to_paint(
+                paintColor,
+                v_surfaceMaterialData,
+                
+#ifdef @ENABLE_ADVANCED_BLEND
+            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+#else
+            true
+#endif
+);
+        }
+#endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 
         maxCoverage = 1.;
 #ifdef @ENABLE_CLIP_RECT
         // Calculate the clip rect before entering the interlock.
         if (@ENABLE_CLIP_RECT)
         {
-            half clipRectMin = min_value(cast_float4_to_half4(v_clipRect));
+            half clipRectMin = min_component(cast_float4_to_half4(v_clipRect));
             maxCoverage = min(clipRectMin, maxCoverage);
         }
 #endif
@@ -126,11 +154,12 @@ PLS_MAIN(@drawFragmentMain)
 #ifndef @FIXED_FUNCTION_COLOR_OUTPUT
         half4 dstColorPremul = PLS_LOAD4F(colorBuffer);
 #ifdef @ENABLE_ADVANCED_BLEND
-        if (@ENABLE_ADVANCED_BLEND)
+        if (@ENABLE_ADVANCED_BLEND &&
+            v_blendMode != cast_uint_to_half(BLEND_SRC_OVER))
         {
-            // Don't bother with advanced blend until coverage becomes > 0. This
-            // way, cutout regions don't pay the cost of advanced blend.
-            if (v_blendMode != cast_uint_to_half(BLEND_SRC_OVER) && c1 != .0)
+            // Don't bother with advanced blend until coverage becomes > 0.
+            // This way, cutout regions don't pay the cost of advanced blend.
+            if (c1 != .0)
             {
                 if (c0 == .0)
                 {
@@ -162,16 +191,16 @@ PLS_MAIN(@drawFragmentMain)
 #ifndef @DRAW_INTERIOR_TRIANGLES
                     if (c1 < maxCoverage)
                     {
-                        half3 scratchRGBToSave = paintColor.rgb;
+                        half3 blendRGBToSave = paintColor.rgb;
 #ifdef @ENABLE_DITHER
                         if (@ENABLE_DITHER)
                         {
-                            scratchRGBToSave +=
+                            blendRGBToSave +=
                                 dither * uniforms.ditherConversionToRGB10;
                         }
 #endif
-                        PLS_STORE4F(scratchColorBuffer,
-                                    make_half4(scratchRGBToSave, 0.0));
+                        PLS_STORE4F(blendColorBuffer,
+                                    make_half4(blendRGBToSave, 0.0));
                     }
 #endif
                 }
@@ -181,16 +210,13 @@ PLS_MAIN(@drawFragmentMain)
                     // blend mode, meaning, the current dstColor is no longer
                     // the correct value we need to pass to
                     // advanced_color_blend(). Instead, the first fragment saved
-                    // its result of advanced_color_blend() to the scratch
-                    // buffer, which we can pull back up and use to apply our
-                    // fragment's coverage contribution.
-                    paintColor.rgb = PLS_LOAD4F(scratchColorBuffer).rgb;
-                    PLS_PRESERVE_4F(scratchColorBuffer);
+                    // its result of advanced_color_blend() to the
+                    // blendColorBuffer, which we can pull back up and use to
+                    // apply our fragment's coverage contribution.
+                    paintColor.rgb = PLS_LOAD4F(blendColorBuffer).rgb;
+                    PLS_PRESERVE_4F(blendColorBuffer);
                 }
             }
-            // GENERATE_PREMULTIPLIED_PAINT_COLORS is false when
-            // @ENABLE_ADVANCED_BLEND is defined because advanced blend needs
-            // unmultiplied colors. Premultiply alpha now.
             paintColor.rgb *= paintColor.a;
         }
 #endif // @ENABLE_ADVANCED_BLEND
@@ -198,18 +224,10 @@ PLS_MAIN(@drawFragmentMain)
 
         // Emit a paint color whose post-src-over-blend result is algebraically
         // equivalent to applying the c0 -> c1 coverage delta.
-        //
-        // NOTE: "max(, eps)" is just to avoid a divide by zero. When the
-        // denominator would be 0, c0 == 1, which also means c1 == 1, and there
-        // is no coverage to apply. Since c0 == c1 == 1, (c1 - c0) / eps == 0,
-        // which is the result we want in this case.
-        paintColor *=
-            (c1 - c0) / max(1. - c0 * paintColor.a, EPSILON_FP16_NON_DENORM);
+        paintColor *= incremental_clockwise_coverage(c0, c1, paintColor.a);
 #ifdef @ENABLE_DITHER
-        if (@ENABLE_DITHER)
-        {
-            paintColor.rgb += dither;
-        }
+        paintColor.rgb =
+            add_dither_if_alpha_nonzero(paintColor.rgb, paintColor.a, dither);
 #endif
 #ifndef @DRAW_INTERIOR_TRIANGLES
         // Update the coverage buffer with our final value if we aren't an
@@ -238,10 +256,10 @@ PLS_MAIN(@drawFragmentMain)
 #endif
 
 #ifndef @FIXED_FUNCTION_COLOR_OUTPUT
-        PLS_STORE4F_OPTIONAL_IF(paintColor.a == .0,
-                                colorBuffer,
-                                dstColorPremul * (1. - paintColor.a) +
-                                    paintColor);
+        PLS_STORE4F_OPTIONAL_IF(
+            paintColor.r + paintColor.g + paintColor.b + paintColor.a == .0,
+            colorBuffer,
+            dstColorPremul * (1. - paintColor.a) + paintColor);
 #endif
     }
 
@@ -250,8 +268,10 @@ PLS_MAIN(@drawFragmentMain)
 
 #ifdef @FIXED_FUNCTION_COLOR_OUTPUT
     _fragColor = paintColor;
-#endif
+    EMIT_PLS_AND_FRAG_COLOR
+#else
     EMIT_PLS;
+#endif
 }
 
 #endif // @FRAGMENT

@@ -12,24 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 508;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case NSlicedNodeBase::typeKey:
-            case NodeBase::typeKey:
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t initialWidthPropertyKey = 697;
@@ -51,8 +33,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(initialWidthPropertyKey, &m_InitialWidth, &value);
         m_InitialWidth = value;
-        initialWidthChanged();
+        notifyPropertyChanged(initialWidthPropertyKey);
     }
 
     inline float initialHeight() const { return m_InitialHeight; }
@@ -62,8 +45,11 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(initialHeightPropertyKey,
+                             &m_InitialHeight,
+                             &value);
         m_InitialHeight = value;
-        initialHeightChanged();
+        notifyPropertyChanged(initialHeightPropertyKey);
     }
 
     inline float width() const { return m_Width; }
@@ -73,8 +59,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(widthPropertyKey, &m_Width, &value);
         m_Width = value;
-        widthChanged();
+        RIVE_EDITOR_CHANGED(widthChanged());
+        notifyPropertyChanged(widthPropertyKey);
     }
 
     inline float height() const { return m_Height; }
@@ -84,8 +72,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(heightPropertyKey, &m_Height, &value);
         m_Height = value;
-        heightChanged();
+        RIVE_EDITOR_CHANGED(heightChanged());
+        notifyPropertyChanged(heightPropertyKey);
     }
 
     Core* clone() const override;
@@ -119,10 +109,11 @@ public:
     }
 
 protected:
-    virtual void initialWidthChanged() {}
-    virtual void initialHeightChanged() {}
     virtual void widthChanged() {}
     virtual void heightChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/layout/n_sliced_node_ext.inl"
+#endif
 };
 } // namespace rive
 

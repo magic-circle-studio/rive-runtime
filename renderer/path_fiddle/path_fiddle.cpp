@@ -20,7 +20,40 @@
 #endif
 
 #define GLFW_INCLUDE_NONE
+#ifdef _WIN32
+#define GLFW_EXPOSE_NATIVE_WIN32
+#endif
 #include "GLFW/glfw3.h"
+#ifdef _WIN32
+#include <GLFW/glfw3native.h>
+#endif
+
+#ifdef _WIN32
+// Windows only lets a process take the foreground if it already owns it,
+// or was started by whoever does. Launching from a terminal usually
+// satisfies neither, so SetForegroundWindow() is silently ignored and the
+// window opens behind the shell. AttachThreadInput() makes the two threads
+// share a single input state, which is the attachment SetForegroundWindow()
+// looks for. The sharing is mutual, so the argument order is immaterial --
+// what matters is that the detach repeats the attach.
+static void forceWindowToForeground(GLFWwindow* window)
+{
+    HWND hwnd = glfwGetWin32Window(window);
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread =
+        foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    DWORD thisThread = GetCurrentThreadId();
+    bool attached = foregroundThread != 0 && foregroundThread != thisThread &&
+                    AttachThreadInput(foregroundThread, thisThread, TRUE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    if (attached)
+    {
+        AttachThreadInput(foregroundThread, thisThread, FALSE);
+    }
+}
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -65,6 +98,7 @@ static FiddleContextOptions options;
 static GLFWwindow* window = nullptr;
 static uint32_t msaa = 0;
 static bool forceAtomicMode = false;
+static bool inkbleed = false;
 static bool wireframe = false;
 static bool disableFill = false;
 static bool disableStroke = false;
@@ -92,6 +126,7 @@ static float scale = 1;
 
 static StrokeJoin join = StrokeJoin::round;
 static StrokeCap cap = StrokeCap::round;
+static StrokePosition strokePosition = StrokePosition::center;
 
 static bool doClose = false;
 static bool paused = false;
@@ -253,6 +288,35 @@ API api =
 bool angle = false;
 bool skia = false;
 
+void makeContext()
+{
+    lastWidth = 0;
+    lastHeight = 0;
+
+    switch (api)
+    {
+        case API::metal:
+            fiddleContext = FiddleContext::MakeMetalPLS(options);
+            break;
+        case API::d3d:
+            fiddleContext = FiddleContext::MakeD3DPLS(options);
+            break;
+        case API::d3d12:
+            fiddleContext = FiddleContext::MakeD3D12PLS(options);
+            break;
+        case API::dawn:
+            fiddleContext = FiddleContext::MakeDawnPLS(options);
+            break;
+        case API::vulkan:
+            fiddleContext = FiddleContext::MakeVulkanPLS(options);
+            break;
+        case API::gl:
+            fiddleContext =
+                skia ? FiddleContext::MakeGLSkia() : FiddleContext::MakeGLPLS();
+            break;
+    }
+}
+
 static void key_callback(GLFWwindow* window,
                          int key,
                          int scancode,
@@ -269,6 +333,13 @@ static void key_callback(GLFWwindow* window,
                 break;
             case GLFW_KEY_GRAVE_ACCENT: // ` key, backtick
                 hotloadShaders = true;
+                break;
+            case GLFW_KEY_R:
+                if (shift)
+                {
+                    fiddleContext.reset();
+                    makeContext();
+                }
                 break;
             case GLFW_KEY_A:
                 forceAtomicMode = !forceAtomicMode;
@@ -333,6 +404,10 @@ static void key_callback(GLFWwindow* window,
                 {
                     disableStroke = !disableStroke;
                 }
+                break;
+            case GLFW_KEY_T: // No good keys available for this
+                strokePosition =
+                    StrokePosition((uint32_t(strokePosition) + 1) % 3);
                 break;
             case GLFW_KEY_F:
                 disableFill = !disableFill;
@@ -482,6 +557,13 @@ int main(int argc, const char** argv)
             api = API::gl;
             clockwiseFill = true;
         }
+        else if (!strcmp(argv[i], "--glcwib"))
+        {
+            api = API::gl;
+            msaa = 1;
+            clockwiseFill = true;
+            inkbleed = true;
+        }
         else if (!strcmp(argv[i], "--metal"))
         {
             api = API::metal;
@@ -528,6 +610,13 @@ int main(int argc, const char** argv)
         {
             api = API::dawn;
         }
+        else if (!strcmp(argv[i], "--dawncwib"))
+        {
+            api = API::dawn;
+            msaa = 1;
+            clockwiseFill = true;
+            inkbleed = true;
+        }
         else if (!strcmp(argv[i], "--d3d"))
         {
             api = API::d3d;
@@ -535,6 +624,10 @@ int main(int argc, const char** argv)
         else if (!strcmp(argv[i], "--d3d12"))
         {
             api = API::d3d12;
+        }
+        else if (!strcmp(argv[i], "--d3d12GBV"))
+        {
+            options.enableValidationLayer = true;
         }
         else if (!strcmp(argv[i], "--d3datomic"))
         {
@@ -560,6 +653,13 @@ int main(int argc, const char** argv)
             api = API::vulkan;
             clockwiseFill = true;
             forceAtomicMode = true;
+        }
+        else if (!strcmp(argv[i], "--vkcwib"))
+        {
+            api = API::vulkan;
+            msaa = 1;
+            clockwiseFill = true;
+            inkbleed = true;
         }
         else if (!strcmp(argv[i], "--vulkanatomic") ||
                  !strcmp(argv[i], "--vkatomic"))
@@ -698,7 +798,7 @@ int main(int argc, const char** argv)
             glfwWindowHint(GLFW_SAMPLES, msaa);
         }
         glfwWindowHint(GLFW_STENCIL_BITS, 8);
-        glfwWindowHint(GLFW_DEPTH_BITS, 16);
+        glfwWindowHint(GLFW_DEPTH_BITS, 24);
     }
     glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
     switch (api)
@@ -730,6 +830,10 @@ int main(int argc, const char** argv)
             }
             break;
     }
+    // Create hidden, then show. GLFW_FOCUS_ON_SHOW only applies to a
+    // hidden->visible transition, so with the default (visible) the show
+    // below is a no-op and the window can come up behind the terminal.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
     glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_TRUE);
     // glfwWindowHint(GLFW_FLOATING, GLFW_TRUE);
     window = glfwCreateWindow(1600, 1600, "Rive Renderer", nullptr, nullptr);
@@ -748,29 +852,15 @@ int main(int argc, const char** argv)
         glfwMakeContextCurrent(window);
     }
     glfwShowWindow(window);
+    // Windows can still refuse to hand over the foreground, so ask
+    // explicitly as well.
+    glfwFocusWindow(window);
+#ifdef _WIN32
+    forceWindowToForeground(window);
+#endif
 
-    switch (api)
-    {
-        case API::metal:
-            fiddleContext = FiddleContext::MakeMetalPLS(options);
-            break;
-        case API::d3d:
-            fiddleContext = FiddleContext::MakeD3DPLS(options);
-            break;
-        case API::d3d12:
-            fiddleContext = FiddleContext::MakeD3D12PLS(options);
-            break;
-        case API::dawn:
-            fiddleContext = FiddleContext::MakeDawnPLS(options);
-            break;
-        case API::vulkan:
-            fiddleContext = FiddleContext::MakeVulkanPLS(options);
-            break;
-        case API::gl:
-            fiddleContext =
-                skia ? FiddleContext::MakeGLSkia() : FiddleContext::MakeGLPLS();
-            break;
-    }
+    makeContext();
+
     if (!fiddleContext)
     {
         fprintf(stderr, "Failed to create a fiddle context.\n");
@@ -836,7 +926,14 @@ static void update_window_title(double fps,
     }
     if (msaa)
     {
-        title << " (msaa" << msaa << ')';
+        if (inkbleed)
+        {
+            title << " (inkbleed)";
+        }
+        else
+        {
+            title << " (msaa" << msaa << ')';
+        }
     }
     else if (forceAtomicMode)
     {
@@ -849,7 +946,7 @@ static void update_window_title(double fps,
 void riveMainLoop()
 {
     RIVE_PROF_FRAME()
-    RIVE_PROF_SCOPE()
+    RIVE_PROF_SCOPE_L(0)
 
 #ifdef __EMSCRIPTEN__
     {
@@ -935,6 +1032,7 @@ void riveMainLoop()
         .fillsDisabled = disableFill,
         .strokesDisabled = disableStroke,
         .clockwiseFillOverride = clockwiseFill,
+        .inkbleedOverride = inkbleed,
     });
 
     int instances = 1;
@@ -1030,6 +1128,8 @@ void riveMainLoop()
 
             strokePaint->join(join);
             strokePaint->cap(cap);
+            strokePaint->strokePosition(strokePosition);
+
             renderer->drawPath(path.get(), strokePaint.get());
 
             // Draw the interactive points.

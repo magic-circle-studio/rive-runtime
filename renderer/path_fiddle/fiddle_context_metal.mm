@@ -35,7 +35,14 @@ public:
         }
         m_renderContext =
             RenderContextMetalImpl::MakeContext(m_gpu, metalOptions);
-        printf("==== MTLDevice: %s ====\n", m_gpu.name.UTF8String);
+        // Ore commits on this queue so its passes order ahead of our flush.
+        m_renderContext->static_impl_cast<RenderContextMetalImpl>()
+            ->setCommandQueue(m_queue);
+        printf("==== MTLDevice: %s (%s) ====\n",
+               m_gpu.name.UTF8String,
+               // MTLDebugDevice when API validation is on, the real driver
+               // class when it isn't.
+               NSStringFromClass([m_gpu class]).UTF8String);
     }
 
     float dpiScale(GLFWwindow* window) const override
@@ -95,22 +102,15 @@ public:
     void begin(const RenderContext::FrameDescriptor& frameDescriptor) override
     {
         m_renderContext->beginFrame(frameDescriptor);
+        // Ore replays into the target before the first flush.
+        acquireDrawable();
     }
 
     void flushPLSContext(RenderTarget* offscreenRenderTarget) final
     {
         @autoreleasepool
         {
-            if (m_currentFrameSurface == nil)
-            {
-                m_currentFrameSurface = [m_swapchain nextDrawable];
-                assert(m_currentFrameSurface.texture.width ==
-                       m_renderTarget->width());
-                assert(m_currentFrameSurface.texture.height ==
-                       m_renderTarget->height());
-                m_renderTarget->setTargetTexture(m_currentFrameSurface.texture);
-            }
-
+            acquireDrawable();
             id<MTLCommandBuffer> flushCommandBuffer = [m_queue commandBuffer];
             m_renderContext->flush({
                 .renderTarget = offscreenRenderTarget != nullptr
@@ -194,6 +194,19 @@ public:
     }
 
 private:
+    void acquireDrawable()
+    {
+        if (m_currentFrameSurface == nil)
+        {
+            m_currentFrameSurface = [m_swapchain nextDrawable];
+            assert(m_currentFrameSurface.texture.width ==
+                   m_renderTarget->width());
+            assert(m_currentFrameSurface.texture.height ==
+                   m_renderTarget->height());
+            m_renderTarget->setTargetTexture(m_currentFrameSurface.texture);
+        }
+    }
+
     const FiddleContextOptions m_fiddleOptions;
     id<MTLDevice> m_gpu = MTLCreateSystemDefaultDevice();
     id<MTLCommandQueue> m_queue = [m_gpu newCommandQueue];

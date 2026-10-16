@@ -15,6 +15,11 @@
 #include <rive/shapes/paint/solid_color.hpp>
 #include <rive/shapes/paint/stroke.hpp>
 #include <rive/shapes/shape.hpp>
+#include <rive/viewmodel/viewmodel_instance_viewmodel.hpp>
+#include <rive/viewmodel/viewmodel_instance_number.hpp>
+#include <rive/viewmodel/viewmodel_instance_string.hpp>
+#include <rive/viewmodel/viewmodel_instance_boolean.hpp>
+#include <rive/viewmodel/viewmodel.hpp>
 #include "catch.hpp"
 #include "rive_file_reader.hpp"
 #include "utils/serializing_factory.hpp"
@@ -590,4 +595,412 @@ TEST_CASE("Listeners are sorted in the right order", "[silver]")
     artboard->draw(renderer.get());
 
     CHECK(silver.matches("sorted_listeners"));
+}
+
+// The test asset carries Luau bytecode scripts, which only the Luau
+// backend runs.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
+TEST_CASE("Listeners with multiple types of events", "[silver]")
+{
+    SerializingFactory silver;
+    auto file = ReadRiveFile("assets/multi_listeners.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    auto vmi = file->createDefaultViewModelInstance(artboard.get());
+
+    stateMachine->bindViewModelInstance(vmi);
+    auto renderer = silver.makeRenderer();
+
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    // Trigger first timeline events
+    stateMachine->advanceAndApply(0.5f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    // Trigger second timeline events
+    stateMachine->advanceAndApply(0.5f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    // Process second timeline events
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    stateMachine->pointerMove(rive::Vec2D(490.0f, 10.0f));
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    stateMachine->pointerDown(rive::Vec2D(490.0f, 10.0f));
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    stateMachine->pointerUp(rive::Vec2D(490.0f, 10.0f));
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+
+    CHECK(silver.matches("multi_listeners"));
+}
+
+// The test asset carries Luau bytecode scripts, which only the Luau
+// backend runs.
+#ifdef WITH_RIVE_SCRIPTING_LUAU
+#endif
+
+TEST_CASE("Listeners with multiple types of events and rebinding", "[silver]")
+{
+    SerializingFactory silver;
+    auto file = ReadRiveFile("assets/multi_listeners.riv", &silver);
+
+    auto artboard = file->artboardNamed("Rebind");
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    auto vmi = file->createDefaultViewModelInstance(artboard.get());
+
+    auto vmiChildProp =
+        vmi->propertyValue("child")->as<ViewModelInstanceViewModel>();
+    auto vmiChild = vmiChildProp->referenceViewModelInstance();
+
+    stateMachine->bindViewModelInstance(vmi);
+    auto renderer = silver.makeRenderer();
+
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+    {
+        auto num1 =
+            vmiChild->propertyValue("num")->as<ViewModelInstanceNumber>();
+        auto num2 =
+            vmiChild->propertyValue("num2")->as<ViewModelInstanceNumber>();
+        num1->propertyValue(2);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+        silver.addFrame();
+
+        num2->propertyValue(2);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+        silver.addFrame();
+    }
+
+    // Create a new view model instance for RebindChild that will be used to
+    // replace the vm tree
+    auto vmiChild2 = file->createViewModelInstance("RebindChild");
+    if (vmiChild2)
+    {
+        auto num1 =
+            vmiChild2->propertyValue("num")->as<ViewModelInstanceNumber>();
+        auto num2 =
+            vmiChild2->propertyValue("num2")->as<ViewModelInstanceNumber>();
+        vmi->replaceViewModelByName("child", vmiChild2);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+        silver.addFrame();
+        num1->propertyValue(2);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+        silver.addFrame();
+        num2->propertyValue(2);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+        silver.addFrame();
+        // Nothing should change in this case
+        auto num1Old =
+            vmiChild->propertyValue("num")->as<ViewModelInstanceNumber>();
+        num1Old->propertyValue(3);
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("multi_listeners-rebind"));
+}
+#endif
+
+TEST_CASE("Transition duration in nested state machines is bindable",
+          "[silver]")
+{
+    SerializingFactory silver;
+    auto file =
+        ReadRiveFile("assets/transition_duration_bind_nested.riv", &silver);
+    auto artboard = file->artboardDefault();
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    int viewModelId = artboard.get()->viewModelId();
+
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.0f);
+    auto renderer = silver.makeRenderer();
+
+    int frames = 86;
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("transition_duration_bind_nested"));
+}
+
+TEST_CASE("Transition duration in artboard list state machines is bindable",
+          "[silver]")
+{
+    SerializingFactory silver;
+    auto file =
+        ReadRiveFile("assets/transition_duration_bind_list.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    int viewModelId = artboard.get()->viewModelId();
+
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.0f);
+    auto renderer = silver.makeRenderer();
+
+    int frames = 86;
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.016f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("transition_duration_bind_list"));
+}
+
+TEST_CASE("Replace view model instances with multiple view model levels",
+          "[silver]")
+{
+    SerializingFactory silver;
+    auto file =
+        ReadRiveFile("assets/rebind_with_nested_viewmodel.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+
+    auto vmi = file->createDefaultViewModelInstance(artboard.get());
+
+    stateMachine->bindViewModelInstance(vmi);
+
+    stateMachine->advanceAndApply(0.0f);
+    auto renderer = silver.makeRenderer();
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+    {
+        auto second =
+            vmi->propertyValue("sec")->as<ViewModelInstanceViewModel>();
+        auto secInstance = second->referenceViewModelInstance();
+        auto third =
+            secInstance->propertyValue("thi")->as<ViewModelInstanceViewModel>();
+        auto thirdInstance = third->referenceViewModelInstance();
+        thirdInstance->propertyValue("label")
+            ->as<ViewModelInstanceString>()
+            ->propertyValue("updated");
+    }
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    // Create a new view model with a new child view model
+    auto thirdVM = file->viewModel("Third");
+    auto thirdInstance = thirdVM->createInstance();
+    thirdInstance->propertyValue("label")
+        ->as<ViewModelInstanceString>()
+        ->propertyValue("new updated");
+    auto secondVM = file->viewModel("Second");
+    auto secondInstance = secondVM->createInstance();
+    secondInstance->replaceViewModelByName("thi", thirdInstance);
+    vmi->replaceViewModelByName("sec", secondInstance);
+
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+
+    CHECK(silver.matches("rebind_with_nested_viewmodel"));
+}
+
+TEST_CASE("Component based transition conditions", "[silver]")
+{
+    SerializingFactory silver;
+    auto file = ReadRiveFile("assets/component_based_conditions.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    REQUIRE(stateMachine != nullptr);
+
+    auto vmi = file->createViewModelInstance(artboard.get());
+    REQUIRE(vmi != nullptr);
+    auto numberProperty =
+        vmi->propertyValue("numberProperty")->as<ViewModelInstanceNumber>();
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    numberProperty->propertyValue(1.5);
+
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+
+    int frames = (int)(2.5f / 0.1f);
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.1f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("component_based_conditions"));
+}
+
+TEST_CASE("Component based transition conditions with other props", "[silver]")
+{
+    SerializingFactory silver;
+    auto file = ReadRiveFile("assets/component_based_conditions.riv", &silver);
+
+    auto artboard = file->artboardNamed("Artboard2");
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    REQUIRE(stateMachine != nullptr);
+
+    auto vmi = file->createViewModelInstance(artboard.get());
+    REQUIRE(vmi != nullptr);
+    auto boolProperty =
+        vmi->propertyValue("vmBool")->as<ViewModelInstanceBoolean>();
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+    silver.addFrame();
+
+    boolProperty->propertyValue(true);
+
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+
+    int frames = (int)(2.5f / 0.1f);
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.1f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("component_based_conditions-Artboard2"));
+}
+
+TEST_CASE("Transitions and state layers can trigger actions", "[silver]")
+{
+    SerializingFactory silver;
+    auto file = ReadRiveFile("assets/transition_actions.riv", &silver);
+
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+    REQUIRE(stateMachine != nullptr);
+    int viewModelId = artboard.get()->viewModelId();
+
+    auto vmi = viewModelId == -1
+                   ? file->createViewModelInstance(artboard.get())
+                   : file->createViewModelInstance(viewModelId, 0);
+    REQUIRE(vmi != nullptr);
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+
+    int frames = (int)(1.5f / 0.5f);
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.5f);
+        artboard->draw(renderer.get());
+    }
+
+    stateMachine->pointerDown(Vec2D(250.0f, 250.0f));
+    stateMachine->pointerUp(Vec2D(250.0f, 250.0f));
+    stateMachine->advanceAndApply(0.016f);
+    artboard->draw(renderer.get());
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.5f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("transition_actions"));
+}
+
+TEST_CASE(
+    "Paused state machine changes opacity and relayouts when parent's opacity or layout changes",
+    "[silver]")
+{
+    SerializingFactory silver;
+    auto file =
+        ReadRiveFile("assets/paused_nested_artboard_opacity.riv", &silver);
+    auto artboard = file->artboardDefault();
+    REQUIRE(artboard != nullptr);
+
+    silver.frameSize(artboard->width(), artboard->height());
+
+    auto stateMachine = artboard->stateMachineAt(0);
+
+    auto vmi = file->createDefaultViewModelInstance(artboard.get());
+
+    stateMachine->bindViewModelInstance(vmi);
+    stateMachine->advanceAndApply(0.1f);
+    auto renderer = silver.makeRenderer();
+    artboard->draw(renderer.get());
+
+    silver.addFrame();
+    stateMachine->advanceAndApply(0.1f);
+    artboard->draw(renderer.get());
+
+    int frames = (int)(2.0f / 0.05f);
+    for (int i = 0; i < frames; i++)
+    {
+        silver.addFrame();
+        stateMachine->advanceAndApply(0.05f);
+        artboard->draw(renderer.get());
+    }
+
+    CHECK(silver.matches("paused_nested_artboard_opacity"));
 }

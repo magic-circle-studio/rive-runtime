@@ -12,22 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 97;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case NestedLinearAnimationBase::typeKey:
-            case NestedAnimationBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t mixPropertyKey = 200;
@@ -43,8 +27,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(mixPropertyKey, &m_Mix, &value);
         m_Mix = value;
-        mixChanged();
+        notifyPropertyChanged(mixPropertyKey);
     }
 
     void copy(const NestedLinearAnimationBase& object)
@@ -65,7 +50,9 @@ public:
     }
 
 protected:
-    virtual void mixChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/nested_linear_animation_ext.inl"
+#endif
 };
 } // namespace rive
 

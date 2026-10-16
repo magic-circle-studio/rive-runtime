@@ -24,6 +24,9 @@ public:
     virtual void unbind() = 0;
     virtual void updateDataBinds() = 0;
     virtual void markHostingLayoutDirty(ArtboardInstance* artboardInstance) {}
+    // A hosted artboard the host had marked quiet at `row` (see
+    // Artboard::quietHostRow) saw something that may change it.
+    virtual void hostedRowWoke(Artboard* artboard, uint32_t row) {}
     // The artboard that contains this ArtboardHost
     virtual Artboard* parentArtboard() = 0;
     virtual bool hitTestHost(const Vec2D& position,
@@ -38,10 +41,25 @@ public:
     virtual bool isLayoutProvider() { return false; }
     virtual void file(File* value) = 0;
     virtual File* file() const = 0;
+    /// The file the hosted artboard was bound in from, when it isn't file().
+    virtual const File* foreignFile() const { return nullptr; }
 
     /// Return this host as a Component, if applicable (e.g., NestedArtboard).
     /// Returns nullptr if the host is not a Component.
     virtual class Component* hostComponent() { return nullptr; }
+    virtual void relinkDataContext(rcp<ViewModelInstance> viewModelInstance) {}
+    virtual int type() const = 0;
+
+    /// Where ViewModelInstanceValue's change sequence stood the last time this
+    /// host skipped advancing its artboards because it was collapsed or
+    /// paused, or 0 if it never did. The state machines inside were inactive
+    /// while the changes up to it were made, so those changes aren't pending
+    /// for them once they run again (see
+    /// StateMachineInstance::viewModelValueChanged).
+    uint64_t inactiveChangeSequence() const { return m_inactiveChangeSequence; }
+
+protected:
+    uint64_t m_inactiveChangeSequence = 0;
 };
 } // namespace rive
 

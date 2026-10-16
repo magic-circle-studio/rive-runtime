@@ -13,20 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 174;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case ElasticInterpolatorBase::typeKey:
-            case KeyFrameInterpolatorBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t easingValuePropertyKey = 405;
@@ -46,8 +32,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(easingValuePropertyKey, &m_EasingValue, &value);
         m_EasingValue = value;
-        easingValueChanged();
+        notifyPropertyChanged(easingValuePropertyKey);
     }
 
     inline float amplitude() const { return m_Amplitude; }
@@ -57,8 +44,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(amplitudePropertyKey, &m_Amplitude, &value);
         m_Amplitude = value;
-        amplitudeChanged();
+        notifyPropertyChanged(amplitudePropertyKey);
     }
 
     inline float period() const { return m_Period; }
@@ -68,8 +56,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(periodPropertyKey, &m_Period, &value);
         m_Period = value;
-        periodChanged();
+        notifyPropertyChanged(periodPropertyKey);
     }
 
     Core* clone() const override;
@@ -99,9 +88,9 @@ public:
     }
 
 protected:
-    virtual void easingValueChanged() {}
-    virtual void amplitudeChanged() {}
-    virtual void periodChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/elastic_interpolator_ext.inl"
+#endif
 };
 } // namespace rive
 

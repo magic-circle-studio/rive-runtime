@@ -52,6 +52,7 @@ static CGBlendMode convert(BlendMode mode) {
     CGBlendMode cg = kCGBlendModeNormal;
     switch (mode) {
         case BlendMode::srcOver: cg = kCGBlendModeNormal; break;
+        case BlendMode::additive: cg = kCGBlendModePlusLighter; break;
         case BlendMode::screen: cg = kCGBlendModeScreen; break;
         case BlendMode::overlay: cg = kCGBlendModeOverlay; break;
         case BlendMode::darken: cg = kCGBlendModeDarken; break;
@@ -151,10 +152,12 @@ public:
     }
 
     void rewind() override { m_path.reset(CGPathCreateMutable()); }
-    void addRenderPath(RenderPath* path, const Mat2D& mx) override
+    void addRenderPath(const RenderPath* path, const Mat2D& mx) override
     {
         auto transform = convert(mx);
-        CGPathAddPath(m_path, &transform, ((CGRenderPath*)path)->path());
+        CGPathAddPath(m_path,
+                      &transform,
+                      static_cast<const CGRenderPath*>(path)->path());
     }
     void fillRule(FillRule value) override
     {
@@ -199,6 +202,7 @@ private:
     CGLineCap m_cap = kCGLineCapButt;
     CGBlendMode m_blend = kCGBlendModeNormal;
     rcp<CGRenderShader> m_shader;
+    Mat2D m_gradientTransform;
 
 public:
     CGRenderPaint() {}
@@ -207,6 +211,7 @@ public:
     float opacity() const { return m_rgba[3]; }
 
     CGRenderShader* shader() const { return m_shader.get(); }
+    const Mat2D& gradientTransform() const { return m_gradientTransform; }
 
     void apply(CGContextRef ctx)
     {
@@ -244,6 +249,10 @@ public:
     void shader(rcp<RenderShader> sh) override
     {
         m_shader = lite_rtti_rcp_cast<CGRenderShader>(std::move(sh));
+    }
+    void shaderTransform(const Mat2D& transform) override
+    {
+        m_gradientTransform = transform;
     }
     void invalidateStroke() override {}
 };
@@ -428,6 +437,7 @@ void CGRenderer::drawPath(RenderPath* path, RenderPaint* paint)
         // opacity
         CGContextSetAlpha(m_ctx, cgpaint->opacity() * m_opacityStack.back());
 
+        CGContextConcatCTM(m_ctx, convert(cgpaint->gradientTransform()));
         sh->draw(m_ctx);
         CGContextRestoreGState(m_ctx);
     }
@@ -607,7 +617,8 @@ AutoCF<CGImageRef> CGRenderer::FlipCGImageInY(AutoCF<CGImageRef> image)
     auto w = CGImageGetWidth(image);
     auto h = CGImageGetHeight(image);
     AutoCF space = CGColorSpaceCreateDeviceRGB();
-    auto info = kCGBitmapByteOrder32Big | kCGImageAlphaPremultipliedLast;
+    auto info = static_cast<uint>(kCGBitmapByteOrder32Big) |
+                static_cast<uint>(kCGImageAlphaPremultipliedLast);
     AutoCF ctx = CGBitmapContextCreate(nullptr, w, h, 8, 0, space, info);
     CGContextConcatCTM(ctx, CGAffineTransformMake(1, 0, 0, -1, 0, h));
     CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), image);

@@ -3,6 +3,10 @@
 #include <vector>
 #include "rive/renderer/render_context.hpp"
 
+#ifdef RIVE_VULKAN
+#include <vulkan/vulkan.h>
+#endif
+
 struct GLFWwindow;
 
 namespace rive::gpu
@@ -31,6 +35,7 @@ struct FiddleContextOptions
     bool enableVulkanCoreValidationLayers = false;
     bool enableVulkanSynchronizationValidationLayers = false;
     bool disableDebugCallbacks = false;
+    bool enableValidationLayer = false;
     const char* gpuNameFilter = nullptr; // Substring of GPU name to use.
 };
 
@@ -40,6 +45,12 @@ public:
     virtual ~FiddleContext() {}
     virtual float dpiScale(GLFWwindow*) const = 0;
     virtual rive::Factory* factory() = 0;
+    // Needed by dawn to submit and create the command buffers since they are
+    // created each frame.
+    virtual void* getCommandBuffer() { return nullptr; };
+    virtual void beginOreFrame(rive::ore::Context* oreContext);
+    virtual void endOreFrame(rive::ore::Context* oreContext);
+
     virtual rive::gpu::RenderContext* renderContextOrNull() = 0;
     virtual rive::gpu::RenderContextD3DImpl* renderContextD3DImpl() const
     {

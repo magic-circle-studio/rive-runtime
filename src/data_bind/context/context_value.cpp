@@ -11,16 +11,25 @@
 #include "rive/data_bind/data_values/data_value_list.hpp"
 #include "rive/data_bind/data_values/data_value_symbol_list_index.hpp"
 #include "rive/data_bind/data_values/data_value_asset_image.hpp"
+#include "rive/data_bind/data_values/data_value_asset_font.hpp"
+#include "rive/data_bind/data_values/data_value_asset_blob.hpp"
 #include "rive/data_bind/data_values/data_value_artboard.hpp"
+#include "rive/data_bind/data_values/data_value_viewmodel.hpp"
 #include "rive/generated/core_registry.hpp"
 #include "rive/refcnt.hpp"
 
 using namespace rive;
 
-DataBindContextValue::DataBindContextValue(DataBind* dataBind) :
-    m_dataBind(dataBind)
+DataBindContextValue::DataBindContextValue(DataBind* dataBind)
 {
-    m_targetValue.initialize(dataBind);
+    // Only allocate the target-side cache for binds that will read from the
+    // target (toSource or TwoWay). Pure toTarget binds never touch
+    // m_targetValue — calculateValueAndApply is only reached via
+    // applyToSource(), which is guarded by toSource() in updateSourceBinding.
+    if (dataBind->toSource())
+    {
+        m_targetValue.initialize(dataBind);
+    }
     auto source = dataBind->source();
     if (source != nullptr)
     {
@@ -46,12 +55,18 @@ DataBindContextValue::DataBindContextValue(DataBind* dataBind) :
             {
                 auto viewmodelInstanceEnum =
                     source->as<ViewModelInstanceEnum>();
+                auto viewModelProperty =
+                    viewmodelInstanceEnum->viewModelProperty();
                 auto viewModelPropertyEnum =
-                    viewmodelInstanceEnum->viewModelProperty()
-                        ->as<ViewModelPropertyEnum>();
+                    viewModelProperty != nullptr &&
+                            viewModelProperty->is<ViewModelPropertyEnum>()
+                        ? viewModelProperty->as<ViewModelPropertyEnum>()
+                        : nullptr;
                 m_dataValue =
                     new DataValueEnum(viewmodelInstanceEnum->propertyValue(),
-                                      viewModelPropertyEnum->dataEnum());
+                                      viewModelPropertyEnum != nullptr
+                                          ? viewModelPropertyEnum->dataEnum()
+                                          : nullptr);
             }
             break;
             case ViewModelInstanceTriggerBase::typeKey:
@@ -68,9 +83,20 @@ DataBindContextValue::DataBindContextValue(DataBind* dataBind) :
                 m_dataValue = new DataValueAssetImage(
                     source->as<ViewModelInstanceAssetImage>()->propertyValue());
                 break;
+            case ViewModelInstanceAssetFontBase::typeKey:
+                m_dataValue = new DataValueAssetFont(
+                    source->as<ViewModelInstanceAssetFont>()->propertyValue());
+                break;
+            case ViewModelInstanceAssetBlobBase::typeKey:
+                m_dataValue = new DataValueAssetBlob(
+                    source->as<ViewModelInstanceAssetBlob>()->propertyValue());
+                break;
             case ViewModelInstanceArtboardBase::typeKey:
                 m_dataValue = new DataValueArtboard(
                     source->as<ViewModelInstanceArtboard>()->propertyValue());
+                break;
+            case ViewModelInstanceViewModelBase::typeKey:
+                m_dataValue = new DataValueViewModel();
                 break;
             default:
                 m_dataValue = new DataValue();
@@ -78,9 +104,9 @@ DataBindContextValue::DataBindContextValue(DataBind* dataBind) :
     }
 }
 
-void DataBindContextValue::syncSourceValue()
+void DataBindContextValue::syncSourceValue(DataBind* dataBind)
 {
-    auto source = m_dataBind->source();
+    auto source = dataBind->source();
     if (source != nullptr)
     {
         switch (source->coreType())
@@ -129,9 +155,23 @@ void DataBindContextValue::syncSourceValue()
                 m_dataValue->as<DataValueAssetImage>()->value(
                     source->as<ViewModelInstanceAssetImage>()->propertyValue());
                 break;
+            case ViewModelInstanceAssetFontBase::typeKey:
+                m_dataValue->as<DataValueAssetFont>()->value(
+                    source->as<ViewModelInstanceAssetFont>()->propertyValue());
+                break;
+            case ViewModelInstanceAssetBlobBase::typeKey:
+                m_dataValue->as<DataValueAssetBlob>()->value(
+                    source->as<ViewModelInstanceAssetBlob>()->propertyValue());
+                break;
             case ViewModelInstanceArtboardBase::typeKey:
                 m_dataValue->as<DataValueArtboard>()->value(
                     source->as<ViewModelInstanceArtboard>()->propertyValue());
+                break;
+            case ViewModelInstanceViewModelBase::typeKey:
+                m_dataValue->as<DataValueViewModel>()->value(
+                    source->as<ViewModelInstanceViewModel>()
+                        ->referenceViewModelInstance()
+                        .get());
                 break;
         }
     }
@@ -139,9 +179,10 @@ void DataBindContextValue::syncSourceValue()
 
 void DataBindContextValue::applyToSource(Core* component,
                                          uint32_t propertyKey,
-                                         bool isMainDirection)
+                                         bool isMainDirection,
+                                         DataBind* dataBind)
 {
-    auto source = m_dataBind->source();
+    auto source = dataBind->source();
     switch (source->coreType())
     {
         case ViewModelInstanceNumberBase::typeKey:
@@ -149,41 +190,47 @@ void DataBindContextValue::applyToSource(Core* component,
 
             calculateValueAndApply<DataValueNumber,
                                    float,
-                                   ViewModelInstanceNumber>(isMainDirection);
+                                   ViewModelInstanceNumber>(isMainDirection,
+                                                            dataBind);
         }
         break;
         case ViewModelInstanceStringBase::typeKey:
         {
             calculateValueAndApply<DataValueString,
                                    std::string,
-                                   ViewModelInstanceString>(isMainDirection);
+                                   ViewModelInstanceString>(isMainDirection,
+                                                            dataBind);
         }
         break;
         case ViewModelInstanceColorBase::typeKey:
         {
             calculateValueAndApply<DataValueColor, int, ViewModelInstanceColor>(
-                isMainDirection);
+                isMainDirection,
+                dataBind);
         }
         break;
         case ViewModelInstanceBooleanBase::typeKey:
         {
             calculateValueAndApply<DataValueBoolean,
                                    bool,
-                                   ViewModelInstanceBoolean>(isMainDirection);
+                                   ViewModelInstanceBoolean>(isMainDirection,
+                                                             dataBind);
         }
         break;
         case ViewModelInstanceEnumBase::typeKey:
         {
             calculateValueAndApply<DataValueInteger,
                                    uint32_t,
-                                   ViewModelInstanceEnum>(isMainDirection);
+                                   ViewModelInstanceEnum>(isMainDirection,
+                                                          dataBind);
         }
         break;
         case ViewModelInstanceTriggerBase::typeKey:
         {
             calculateValueAndApply<DataValueInteger,
                                    uint32_t,
-                                   ViewModelInstanceTrigger>(isMainDirection);
+                                   ViewModelInstanceTrigger>(isMainDirection,
+                                                             dataBind);
         }
         break;
         case ViewModelInstanceSymbolListIndexBase::typeKey:
@@ -191,22 +238,48 @@ void DataBindContextValue::applyToSource(Core* component,
             calculateValueAndApply<DataValueInteger,
                                    uint32_t,
                                    ViewModelInstanceSymbolListIndex>(
-                isMainDirection);
+                isMainDirection,
+                dataBind);
         }
         break;
         case ViewModelInstanceAssetImageBase::typeKey:
         {
             calculateValueAndApply<DataValueInteger,
                                    uint32_t,
-                                   ViewModelInstanceAssetImage>(
-                isMainDirection);
+                                   ViewModelInstanceAssetImage>(isMainDirection,
+                                                                dataBind);
+        }
+        break;
+        case ViewModelInstanceAssetFontBase::typeKey:
+        {
+            calculateValueAndApply<DataValueInteger,
+                                   uint32_t,
+                                   ViewModelInstanceAssetFont>(isMainDirection,
+                                                               dataBind);
+        }
+        break;
+        case ViewModelInstanceAssetBlobBase::typeKey:
+        {
+            calculateValueAndApply<DataValueInteger,
+                                   uint32_t,
+                                   ViewModelInstanceAssetBlob>(isMainDirection,
+                                                               dataBind);
         }
         break;
         case ViewModelInstanceArtboardBase::typeKey:
         {
             calculateValueAndApply<DataValueInteger,
                                    uint32_t,
-                                   ViewModelInstanceArtboard>(isMainDirection);
+                                   ViewModelInstanceArtboard>(isMainDirection,
+                                                              dataBind);
+        }
+        break;
+        case ViewModelInstanceViewModelBase::typeKey:
+        {
+            calculateValueAndApply<DataValueViewModel,
+                                   ViewModelInstance*,
+                                   ViewModelInstanceViewModel>(isMainDirection,
+                                                               dataBind);
         }
         break;
     }

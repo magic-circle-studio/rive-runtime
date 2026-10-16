@@ -12,21 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 107;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case VertexBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t xPropertyKey = 24;
@@ -44,8 +29,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(xPropertyKey, &m_X, &value);
         m_X = value;
-        xChanged();
+        RIVE_EDITOR_CHANGED(xChanged());
+        notifyPropertyChanged(xPropertyKey);
     }
 
     inline float y() const { return m_Y; }
@@ -55,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(yPropertyKey, &m_Y, &value);
         m_Y = value;
-        yChanged();
+        RIVE_EDITOR_CHANGED(yChanged());
+        notifyPropertyChanged(yPropertyKey);
     }
 
     void copy(const VertexBase& object)
@@ -83,6 +72,9 @@ public:
 protected:
     virtual void xChanged() {}
     virtual void yChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/vertex_ext.inl"
+#endif
 };
 } // namespace rive
 

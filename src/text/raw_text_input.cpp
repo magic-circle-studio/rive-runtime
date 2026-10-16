@@ -7,6 +7,7 @@
 using namespace rive;
 
 static const Unichar zeroWidthSpace = 8203;
+static const Unichar obscuringBullet = 8226;
 
 RawTextInput::RawTextInput() :
     m_cursor(Cursor::atStart()),
@@ -14,6 +15,8 @@ RawTextInput::RawTextInput() :
     m_cursorVisualPosition(CursorVisualPosition::missing())
 {
     m_text.push_back(zeroWidthSpace);
+    // The empty text is where undo stops, so the first edit can be undone.
+    m_journal.push_back({m_cursor, m_cursor, std::string()});
 }
 
 void RawTextInput::draw(Factory* factory,
@@ -50,7 +53,6 @@ void RawTextInput::draw(Factory* factory,
 void RawTextInput::backspace(int32_t direction)
 {
     Cursor startingCursor = m_cursor;
-    int32_t offset = direction > 0 ? 0 : -1;
     if (!m_cursor.isCollapsed())
     {
         erase();
@@ -59,15 +61,37 @@ void RawTextInput::backspace(int32_t direction)
     }
     m_idealCursorX = -1.0f;
 
-    auto index = m_cursor.first().codePointIndex(offset);
-
-    if (index >= m_text.size() - 1)
+    ensureShape();
+    const auto& glyphLookup = m_shape.glyphLookup();
+    if (direction > 0)
     {
-        return;
+        // Delete forward: erase the full glyph cluster at cursor position.
+        auto index = m_cursor.first().codePointIndex();
+        if (index >= m_text.size() - 1)
+        {
+            return;
+        }
+        uint32_t clusterCount = glyphLookup.count(index);
+        m_text.erase(m_text.begin() + index,
+                     m_text.begin() + index + clusterCount);
+        auto position = CursorPosition(index);
+        m_cursor = Cursor::collapsed(position);
     }
-    m_text.erase(m_text.begin() + index);
-    auto position = CursorPosition(index);
-    m_cursor = Cursor::collapsed(position);
+    else
+    {
+        // Backspace: erase the full glyph cluster before cursor position.
+        auto index = m_cursor.first().codePointIndex();
+        if (index == 0)
+        {
+            return;
+        }
+        uint32_t clusterStart = glyphLookup.glyphStart(index - 1);
+        uint32_t clusterCount = glyphLookup.count(clusterStart);
+        m_text.erase(m_text.begin() + clusterStart,
+                     m_text.begin() + clusterStart + clusterCount);
+        auto position = CursorPosition(clusterStart);
+        m_cursor = Cursor::collapsed(position);
+    }
     flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
     captureJournalEntry(startingCursor);
 }
@@ -186,6 +210,46 @@ void RawTextInput::overflow(TextOverflow value)
     flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
 }
 
+void RawTextInput::align(TextAlign value)
+{
+    if (m_align == value)
+    {
+        return;
+    }
+    m_align = value;
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+}
+
+void RawTextInput::alignWidth(float value)
+{
+    if (m_alignWidth == value)
+    {
+        return;
+    }
+    m_alignWidth = value;
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+}
+
+void RawTextInput::verticalAlign(VerticalTextAlign value)
+{
+    if (m_verticalAlign == value)
+    {
+        return;
+    }
+    m_verticalAlign = value;
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+}
+
+void RawTextInput::alignHeight(float value)
+{
+    if (m_alignHeight == value)
+    {
+        return;
+    }
+    m_alignHeight = value;
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+}
+
 void RawTextInput::font(rcp<Font> value)
 {
     if (m_textRun.font == value)
@@ -201,19 +265,26 @@ void RawTextInput::computeVisualPositionFromCursor()
     m_cursorVisualPosition = cursorVisualPosition(m_cursor.end());
 }
 
-RawTextInput::Flags RawTextInput::update(Factory* factory)
+// The text handed to the shaper: the real text, or one bullet per code point
+// when obscured. The trailing zero width space sentinel stays so cursor
+// positions keep a one to one index mapping with m_text.
+std::vector<Unichar>& RawTextInput::shapeableText()
 {
-    Flags updated = Flags::none;
-    if (m_textRun.font == nullptr)
+    if (!flagged(Flags::obscured))
     {
-        return updated;
+        return m_text;
     }
-    bool updateTextPath = false;
+    m_obscuredText.assign(m_text.size(), obscuringBullet);
+    m_obscuredText.back() = zeroWidthSpace;
+    return m_obscuredText;
+}
+
+void RawTextInput::ensureShape()
+{
     if (unflag(Flags::shapeDirty))
     {
-        updated |= Flags::shapeDirty;
         m_textRun.unicharCount = (uint32_t)m_text.size();
-        m_shape.shape(m_text,
+        m_shape.shape(shapeableText(),
                       Span<TextRun>(&m_textRun, 1),
                       m_sizing,
                       m_maxWidth,
@@ -222,7 +293,25 @@ RawTextInput::Flags RawTextInput::update(Factory* factory)
                       m_wrap,
                       m_origin,
                       m_overflow,
-                      m_paragraphSpacing);
+                      m_paragraphSpacing,
+                      m_alignWidth,
+                      m_verticalAlign,
+                      m_alignHeight);
+    }
+}
+
+RawTextInput::Flags RawTextInput::update(Factory* factory)
+{
+    Flags updated = Flags::none;
+    if (m_textRun.font == nullptr)
+    {
+        return updated;
+    }
+    bool updateTextPath = false;
+    if (flagged(Flags::shapeDirty))
+    {
+        updated |= Flags::shapeDirty;
+        ensureShape();
         updateTextPath = true;
     }
     if (unflag(Flags::selectionDirty))
@@ -298,7 +387,9 @@ void RawTextInput::buildTextPaths(Factory* factory)
         m_clipRenderPath = nullptr;
     }
 
-    float y = 0;
+    // Walks the lines itself rather than reading the ordered lines' y, so it
+    // has to pick up the vertical alignment offset they already carry.
+    float y = m_shape.verticalOffset();
     const SimpleArray<SimpleArray<GlyphLine>>& paragraphLines =
         m_shape.paragraphLines();
     const std::vector<OrderedLine>& orderedLines = m_shape.orderedLines();
@@ -441,6 +532,41 @@ void RawTextInput::selectWord()
     flag(Flags::selectionDirty);
 }
 
+void RawTextInput::selectAll()
+{
+    ensureShape();
+    m_idealCursorX = -1.0f;
+    CursorPosition start = CursorPosition::atIndex(0, m_shape);
+    CursorPosition end = CursorPosition::atIndex((uint32_t)length(), m_shape);
+    m_cursor = Cursor(start, end);
+    flag(Flags::selectionDirty);
+}
+
+void RawTextInput::selectLine()
+{
+    ensureShape();
+    m_idealCursorX = -1.0f;
+    CursorPosition cursor = m_cursor.start();
+    cursor.resolveLine(m_shape);
+    const OrderedLine* line = orderedLine(cursor);
+    if (line == nullptr)
+    {
+        return;
+    }
+    const auto& glyphLookup = m_shape.glyphLookup();
+    CursorPosition start(cursor.lineIndex(),
+                         line->firstCodePointIndex(glyphLookup));
+    CursorPosition end(cursor.lineIndex(),
+                       line->lastCodePointIndex(glyphLookup));
+    m_cursor = Cursor(start, end);
+    flag(Flags::selectionDirty);
+}
+
+void RawTextInput::clearSelection()
+{
+    cursor(Cursor::collapsed(m_cursor.end()));
+}
+
 const OrderedLine* RawTextInput::orderedLine(CursorPosition position) const
 {
     const std::vector<OrderedLine>& orderedLines = m_shape.orderedLines();
@@ -455,26 +581,53 @@ void RawTextInput::cursorHorizontal(int32_t offset,
                                     CursorBoundary boundary,
                                     bool select)
 {
+    ensureShape();
     m_idealCursorX = -1.0f;
-    CursorPosition end = m_cursor.end();
+    // Collapsing a selection with a leftward move works off its leading edge,
+    // so the cursor ends up before the selection's first character instead of
+    // before its last. Clamping keeps a selection that already starts at the
+    // beginning there.
+    CursorPosition basePosition =
+        !select && offset < 0 && m_cursor.hasSelection() ? m_cursor.first()
+                                                         : m_cursor.end();
 
-    CursorPosition position = end;
+    CursorPosition position = basePosition;
     switch (boundary)
     {
         case CursorBoundary::character:
-            position =
-                CursorPosition::atIndex(end.codePointIndex(offset), m_shape);
+        {
+            const auto& glyphLookup = m_shape.glyphLookup();
+            uint32_t nextIndex = basePosition.codePointIndex(offset);
+            // Skip over interior codepoints of multi-codepoint glyphs.
+            if (offset > 0)
+            {
+                while (nextIndex < (uint32_t)(m_text.size() - 1) &&
+                       !glyphLookup.isGlyphBoundary(nextIndex))
+                {
+                    nextIndex++;
+                }
+            }
+            else
+            {
+                while (nextIndex > 0 && !glyphLookup.isGlyphBoundary(nextIndex))
+                {
+                    nextIndex--;
+                }
+            }
+            position = CursorPosition::atIndex(nextIndex, m_shape);
             break;
+        }
         case CursorBoundary::line:
         {
-            auto line = orderedLine(end);
+            auto line = orderedLine(basePosition);
             if (line != nullptr)
             {
                 uint32_t codePointIndex =
                     offset < 0
                         ? line->firstCodePointIndex(m_shape.glyphLookup())
                         : line->lastCodePointIndex(m_shape.glyphLookup());
-                position = CursorPosition(end.lineIndex(), codePointIndex);
+                position =
+                    CursorPosition(basePosition.lineIndex(), codePointIndex);
             }
             break;
         }
@@ -593,7 +746,11 @@ RawTextInput::Delineator RawTextInput::classify(CursorPosition position) const
     {
         return Delineator::whitespace;
     }
-    return classify(m_text[position.codePointIndex()]);
+    // Word boundaries follow what is displayed, so obscured text moves as one
+    // run of bullets and reveals nothing.
+    return classify(flagged(Flags::obscured)
+                        ? obscuringBullet
+                        : m_text[position.codePointIndex()]);
 }
 
 RawTextInput::Delineator RawTextInput::find(uint8_t delineatorMask,
@@ -656,6 +813,7 @@ void RawTextInput::cursorRight(CursorBoundary boundary, bool select)
 
 void RawTextInput::cursorUp(bool select)
 {
+    ensureShape();
     if (m_idealCursorX == -1.0f)
     {
         m_idealCursorX = m_cursorVisualPosition.x();
@@ -680,6 +838,7 @@ void RawTextInput::cursorUp(bool select)
 
 void RawTextInput::cursorDown(bool select)
 {
+    ensureShape();
     if (m_idealCursorX == -1.0f)
     {
         m_idealCursorX = m_cursorVisualPosition.x();
@@ -705,6 +864,7 @@ void RawTextInput::cursorDown(bool select)
 
 void RawTextInput::moveCursorTo(Vec2D translation, bool select)
 {
+    ensureShape();
     m_idealCursorX = -1.0f;
     auto position = CursorPosition::fromTranslation(translation, m_shape);
 
@@ -719,16 +879,8 @@ void RawTextInput::moveCursorTo(Vec2D translation, bool select)
     flag(Flags::selectionDirty);
 }
 
-std::string RawTextInput::text() const
+static std::string encodeCodePoints(Span<const Unichar> codePoints)
 {
-    size_t size = m_text.size();
-    if (size == 0)
-    {
-        return std::string();
-    }
-
-    auto codePoints = Span<const Unichar>(m_text.data(), size - 1);
-
     std::vector<uint8_t> buffer(UTF::CountCodePointLength(codePoints));
     uint8_t* encoded = buffer.data();
     for (auto codePoint : codePoints)
@@ -739,6 +891,35 @@ std::string RawTextInput::text() const
     std::string str;
     std::move(buffer.begin(), buffer.end(), std::back_inserter(str));
     return str;
+}
+
+std::string RawTextInput::text() const
+{
+    size_t size = m_text.size();
+    if (size == 0)
+    {
+        return std::string();
+    }
+
+    return encodeCodePoints(Span<const Unichar>(m_text.data(), size - 1));
+}
+
+std::string RawTextInput::selectedText() const
+{
+    if (m_text.empty())
+    {
+        return std::string();
+    }
+    // Exclude the trailing sentinel code point from the selectable range.
+    size_t textEnd = m_text.size() - 1;
+    size_t first = std::min((size_t)m_cursor.first().codePointIndex(), textEnd);
+    size_t last = std::min((size_t)m_cursor.last().codePointIndex(), textEnd);
+    if (first >= last)
+    {
+        return std::string();
+    }
+    return encodeCodePoints(
+        Span<const Unichar>(m_text.data() + first, last - first));
 }
 
 void RawTextInput::setTextPrivate(std::string value)
@@ -755,10 +936,29 @@ void RawTextInput::setTextPrivate(std::string value)
 
 void RawTextInput::text(std::string value)
 {
-    Cursor startingCursor = m_cursor;
     setTextPrivate(value);
     auto position = CursorPosition::zero();
     m_cursor = Cursor::collapsed(position);
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+    // Text set from outside (the file's own, a data bind) starts a new undo
+    // history with it as the baseline: undo takes back the edits after it,
+    // never the text itself.
+    m_journal.clear();
+    m_journal.push_back({m_cursor, m_cursor, text()});
+    m_journalIndex = 0;
+}
+
+void RawTextInput::textPreserveCursor(std::string value)
+{
+    Cursor startingCursor = m_cursor;
+    m_idealCursorX = -1.0f;
+    setTextPrivate(value);
+    uint32_t maxIndex = static_cast<uint32_t>(length());
+    CursorPosition start(
+        std::min(startingCursor.start().codePointIndex(), maxIndex));
+    CursorPosition end(
+        std::min(startingCursor.end().codePointIndex(), maxIndex));
+    m_cursor = Cursor(start, end);
     flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
     captureJournalEntry(startingCursor);
 }
@@ -818,12 +1018,12 @@ void RawTextInput::redo()
 
 bool RawTextInput::flagged(RawTextInput::Flags mask) const
 {
-    return m_flags & mask;
+    return enums::any_flag_set(m_flags, mask);
 }
 
 bool RawTextInput::unflag(RawTextInput::Flags mask)
 {
-    if (m_flags & mask)
+    if (enums::any_flag_set(m_flags, mask))
     {
         m_flags &= ~mask;
         return true;
@@ -852,6 +1052,41 @@ void RawTextInput::separateSelectionText(bool value)
     flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
 }
 
+bool RawTextInput::obscured() const { return flagged(Flags::obscured); }
+
+static Cursor withoutLineIndices(const Cursor& cursor)
+{
+    return Cursor(CursorPosition(cursor.start().codePointIndex()),
+                  CursorPosition(cursor.end().codePointIndex()));
+}
+
+void RawTextInput::obscured(bool value)
+{
+    if (obscured() == value)
+    {
+        return;
+    }
+    if (value)
+    {
+        flag(Flags::obscured);
+    }
+    else
+    {
+        unflag(Flags::obscured);
+    }
+    // Masking can reflow lines, so resolved line indices are stale; keep only
+    // the code point indices. The journal holds cursor snapshots too, or undo
+    // would restore one resolved against the old layout.
+    m_cursor = withoutLineIndices(m_cursor);
+    for (JournalEntry& entry : m_journal)
+    {
+        entry.cursorFrom = withoutLineIndices(entry.cursorFrom);
+        entry.cursorTo = withoutLineIndices(entry.cursorTo);
+    }
+    m_idealCursorX = -1.0f;
+    flag(Flags::shapeDirty | Flags::measureDirty | Flags::selectionDirty);
+}
+
 AABB RawTextInput::measure(float maxWidth, float maxHeight)
 {
     if (m_textRun.font == nullptr)
@@ -863,21 +1098,24 @@ AABB RawTextInput::measure(float maxWidth, float maxHeight)
     if (!m_measuringShape)
     {
         force = true;
-        m_measuringShape = rivestd::make_unique<FullyShapedText>();
+        m_measuringShape = std::make_unique<FullyShapedText>();
     }
     if (unflag(Flags::measureDirty) || force)
     {
         m_textRun.unicharCount = (uint32_t)m_text.size();
-        m_measuringShape->shape(m_text,
+        m_measuringShape->shape(shapeableText(),
                                 Span<TextRun>(&m_textRun, 1),
-                                TextSizing::autoHeight,
+                                m_sizing,
                                 maxWidth,
                                 maxHeight,
                                 m_align,
                                 m_wrap,
                                 m_origin,
                                 m_overflow,
-                                m_paragraphSpacing);
+                                m_paragraphSpacing,
+                                m_alignWidth,
+                                m_verticalAlign,
+                                m_alignHeight);
         m_lastMeasureMaxWidth = maxWidth;
         m_lastMeasureMaxHeight = maxHeight;
 #ifdef TESTING

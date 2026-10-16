@@ -2,6 +2,8 @@
  * Copyright 2025 Rive
  */
 
+#pragma once
+
 #include <vulkan/vulkan.h>
 #include <optional>
 #include <vector>
@@ -16,7 +18,7 @@ class VulkanInstance;
 class VulkanFrameSynchronizer
 {
 public:
-    ~VulkanFrameSynchronizer();
+    virtual ~VulkanFrameSynchronizer();
 
     VulkanFrameSynchronizer(const VulkanFrameSynchronizer&) = delete;
     VulkanFrameSynchronizer& operator=(const VulkanFrameSynchronizer&) = delete;
@@ -26,6 +28,21 @@ public:
     }
     uint64_t safeFrameNumber() const { return current().safeFrameNumber; }
     uint64_t currentFrameNumber() const { return m_monotonicFrameNumber; }
+
+    /** @return Width of the prepared frame image. */
+    virtual uint32_t width() const = 0;
+    /** @return Height of the prepared frame image. */
+    virtual uint32_t height() const = 0;
+    /** @return Vulkan format of the prepared frame image. */
+    virtual VkFormat imageFormat() const = 0;
+    /** @return Vulkan usage flags for the prepared frame image. */
+    virtual VkImageUsageFlags imageUsageFlags() const = 0;
+    /** @return Vulkan image for the current prepared frame. */
+    virtual VkImage vkImage() const = 0;
+    /** @return Vulkan image view for the current prepared frame. */
+    virtual VkImageView vkImageView() const = 0;
+    /** @return Last known access state for the current prepared frame image. */
+    virtual rive::gpu::vkutil::ImageAccess lastAccess() const = 0;
 
     // Queue a copy of the specified image with optional bounds. Must be done
     // before endFrame.
@@ -38,6 +55,26 @@ public:
     // after the endFrame of the frame the request occurred during.
     [[nodiscard]] VkResult getPixelsFromLastImageCopy(
         std::vector<uint8_t>* outPixels);
+
+    // Zero-copy pixel readback: waits for the GPU fence and returns a pointer
+    // directly into the mapped Vulkan buffer. The pointer is valid until the
+    // next call to submitRender / beginFrame that reuses the same in-flight
+    // slot. Caller must call finishPixelRead() when done.
+    struct MappedPixelRead
+    {
+        const uint8_t* data;
+        uint32_t width;
+        uint32_t height;
+        uint32_t strideBytes;
+        VkFormat format;
+    };
+
+    [[nodiscard]] VkResult waitForPixelRead(MappedPixelRead* outRead);
+    void finishPixelRead();
+
+    VkQueue graphicsQueue() const { return m_graphicsQueue; }
+
+    bool checkMostRecentFrameCompletion();
 
 protected:
     struct Options
@@ -89,8 +126,6 @@ protected:
 
     rive::gpu::VulkanContext* context() const { return m_vk.get(); }
 
-    VkQueue graphicsQueue() const { return m_graphicsQueue; }
-
     VkResult createSemaphore(VkSemaphore*);
     void destroySemaphore(VkSemaphore);
 
@@ -122,6 +157,9 @@ private:
     // frame, and one for the currently-building frame.
     std::vector<InFlightFrame> m_inFlightFrames;
 
+    bool m_isFrameStarted = false;
+    bool m_isMostRecentFrameDone = false;
+
     // These are all the commands the swapchain needs to do its work - this
     // macro is also used to load them in the .cpp
 #define RIVE_VK_FRAME_SYNC_INSTANCE_COMMANDS(F)                                \
@@ -134,6 +172,7 @@ private:
     F(vkAllocateCommandBuffers)                                                \
     F(vkFreeCommandBuffers)                                                    \
     F(vkWaitForFences)                                                         \
+    F(vkGetFenceStatus)                                                        \
     F(vkCmdPipelineBarrier)                                                    \
     F(vkQueueSubmit)                                                           \
     F(vkGetDeviceQueue)                                                        \

@@ -2,7 +2,8 @@
 #define _RIVE_LAYOUT_COMPONENT_BASE_HPP_
 #include "rive/core/field_types/core_bool_type.hpp"
 #include "rive/core/field_types/core_double_type.hpp"
-#include "rive/core/field_types/core_uint_type.hpp"
+#include "rive/core/field_types/core_id_type.hpp"
+#include "rive/core/id.hpp"
 #include "rive/drawable.hpp"
 namespace rive
 {
@@ -13,25 +14,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 409;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case LayoutComponentBase::typeKey:
-            case DrawableBase::typeKey:
-            case NodeBase::typeKey:
-            case TransformComponentBase::typeKey:
-            case WorldTransformComponentBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -46,7 +28,7 @@ protected:
     bool m_Clip = false;
     float m_Width = 0.0f;
     float m_Height = 0.0f;
-    uint32_t m_StyleId = -1;
+    Id m_StyleId = kEmptyId;
     float m_FractionalWidth = 1.0f;
     float m_FractionalHeight = 1.0f;
 
@@ -58,8 +40,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(clipPropertyKey, &m_Clip, &value);
         m_Clip = value;
-        clipChanged();
+        RIVE_EDITOR_CHANGED(clipChanged());
+        notifyPropertyChanged(clipPropertyKey);
     }
 
     inline float width() const { return m_Width; }
@@ -69,8 +53,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(widthPropertyKey, &m_Width, &value);
         m_Width = value;
-        widthChanged();
+        RIVE_EDITOR_CHANGED(widthChanged());
+        notifyPropertyChanged(widthPropertyKey);
     }
 
     inline float height() const { return m_Height; }
@@ -80,19 +66,23 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(heightPropertyKey, &m_Height, &value);
         m_Height = value;
-        heightChanged();
+        RIVE_EDITOR_CHANGED(heightChanged());
+        notifyPropertyChanged(heightPropertyKey);
     }
 
-    inline uint32_t styleId() const { return m_StyleId; }
-    void styleId(uint32_t value)
+    inline Id styleId() const { return m_StyleId; }
+    void styleId(Id value)
     {
         if (m_StyleId == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(styleIdPropertyKey, &m_StyleId, &value);
         m_StyleId = value;
-        styleIdChanged();
+        RIVE_EDITOR_CHANGED(styleIdChanged());
+        notifyPropertyChanged(styleIdPropertyKey);
     }
 
     inline float fractionalWidth() const { return m_FractionalWidth; }
@@ -102,8 +92,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(fractionalWidthPropertyKey,
+                             &m_FractionalWidth,
+                             &value);
         m_FractionalWidth = value;
-        fractionalWidthChanged();
+        RIVE_EDITOR_CHANGED(fractionalWidthChanged());
+        notifyPropertyChanged(fractionalWidthPropertyKey);
     }
 
     inline float fractionalHeight() const { return m_FractionalHeight; }
@@ -113,8 +107,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(fractionalHeightPropertyKey,
+                             &m_FractionalHeight,
+                             &value);
         m_FractionalHeight = value;
-        fractionalHeightChanged();
+        RIVE_EDITOR_CHANGED(fractionalHeightChanged());
+        notifyPropertyChanged(fractionalHeightPropertyKey);
     }
 
     Core* clone() const override;
@@ -143,7 +141,7 @@ public:
                 m_Height = CoreDoubleType::deserialize(reader);
                 return true;
             case styleIdPropertyKey:
-                m_StyleId = CoreUintType::deserialize(reader);
+                m_StyleId = CoreIdType::runtimeDeserialize(reader);
                 return true;
             case fractionalWidthPropertyKey:
                 m_FractionalWidth = CoreDoubleType::deserialize(reader);
@@ -162,6 +160,9 @@ protected:
     virtual void styleIdChanged() {}
     virtual void fractionalWidthChanged() {}
     virtual void fractionalHeightChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/layout_component_ext.inl"
+#endif
 };
 } // namespace rive
 

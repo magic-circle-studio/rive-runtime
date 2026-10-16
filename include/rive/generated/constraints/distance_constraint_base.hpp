@@ -13,22 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 82;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DistanceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t distancePropertyKey = 177;
@@ -46,8 +30,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distancePropertyKey, &m_Distance, &value);
         m_Distance = value;
-        distanceChanged();
+        RIVE_EDITOR_CHANGED(distanceChanged());
+        notifyPropertyChanged(distancePropertyKey);
     }
 
     inline uint32_t modeValue() const { return m_ModeValue; }
@@ -57,8 +43,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(modeValuePropertyKey, &m_ModeValue, &value);
         m_ModeValue = value;
-        modeValueChanged();
+        RIVE_EDITOR_CHANGED(modeValueChanged());
+        notifyPropertyChanged(modeValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -86,6 +74,9 @@ public:
 protected:
     virtual void distanceChanged() {}
     virtual void modeValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/distance_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

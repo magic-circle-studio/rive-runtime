@@ -1,6 +1,6 @@
 #!/usr/bin/python
 
-# get opencv dependency if needed. We do it here for imageDiff 
+# get opencv dependency if needed. We do it here for imageDiff
 # because we spawn multiple processes so we would have a race condition with each one trying to check and download opencv
 import subprocess
 import os.path
@@ -29,8 +29,8 @@ from genericpath import exists
 import argparse
 import glob
 import csv
-from multiprocessing import Pool
-from functools import partial
+import threading
+import queue
 from xml.etree import ElementTree as ET
 from typing import TypeVar
 import shutil
@@ -47,15 +47,13 @@ parser.add_argument("-r", "--recursive", action='store_true', help="recursively 
 parser.add_argument("-p", "--pack", action='store_true', help="copy candidates and goldens into output folder along with results")
 parser.add_argument("-H", "--histogram_compare", action='store_true', help="Use histogram compare method to determine if candidate matches gold")
 parser.add_argument("-t", "--threshold", default=0.06, type=float, help="if histogram_compare is set, then threshold used for histogram pass result otherwise the threshold for pixel diff pass result")
+parser.add_argument("--allow-new", action='store_true', help="candidates with no golden are listed but do not fail; missing candidates still do")
 
 clean_mode = parser.add_mutually_exclusive_group(required=False)
 clean_mode.add_argument("-x", "--clean", action='store_true', help="delete golden and candidate images that are identical, also dont add identical images to index.html")
 clean_mode.add_argument("-f", "--fails_only", action='store_true', help="delete images of all tests except for fails, also only adds failing tests to index.html, acts the same as -x if histogram_compare is false")
 
 args = parser.parse_args()
-
-# _winapi.WaitForMultipleObjects only supports 64 handles, which we exceed if we span >61 diff jobs.
-args.jobs = min(args.jobs, 61)
 
 status_filename_base = "_imagediff_status"
 status_filename_pattern = f"{status_filename_base}_%i_*.txt" % os.getpid()
@@ -66,6 +64,7 @@ class TestEntry(object):
     error_entry_template:str = None
     identical_entry_template:str = None
     missing_file_entry_template:str = None
+    size_mismatch_entry_template:str = None
 
     @classmethod
     def load_templates(cls, path):
@@ -77,6 +76,8 @@ class TestEntry(object):
             cls.identical_entry_template = t.read()
         with open(os.path.join(path, "missing_file_entry.html")) as t:
             cls.missing_file_entry_template = t.read()
+        with open(os.path.join(path, "size_mismatch_entry.html")) as t:
+            cls.size_mismatch_entry_template = t.read()
 
     def __init__(self, words, candidates_path, golden_path, output_path, device_name=None, browserstack_details=None):
         self.diff0_path_abs = None
@@ -95,11 +96,30 @@ class TestEntry(object):
             self.candidates_path = pathlib.Path(os.path.relpath(os.path.join(candidates_path, f"{self.name}.png"), output_path)).as_posix()
             self.golden_path = pathlib.Path(os.path.relpath(os.path.join(golden_path, f"{self.name}.png"), output_path)).as_posix()
 
-        if len(words) == 2:
+        # image_diff.py writes small thumbnails next to the diff images in the
+        # output directory. The landing page uses these for its <img src> so it
+        # doesn't download every full resolution image at once; the full image is
+        # still linked via the surrounding <a href>. Thumbnails always live in
+        # the output directory regardless of --pack/--recursive, so their layout
+        # mirrors the diff images (device sub-folder when there is one).
+        thumb_dir = device_name if device_name is not None else ""
+        self.golden_thumb = pathlib.Path(os.path.join(thumb_dir, f"{self.name}.golden.thumb.png")).as_posix()
+        self.candidate_thumb = pathlib.Path(os.path.join(thumb_dir, f"{self.name}.candidate.thumb.png")).as_posix()
+        self.diff0_thumb = pathlib.Path(os.path.join(thumb_dir, f"{self.name}.diff0.thumb.png")).as_posix()
+        self.diff1_thumb = pathlib.Path(os.path.join(thumb_dir, f"{self.name}.diff1.thumb.png")).as_posix()
+
+
+        if words[1] == 'size_mismatch' or words[1] == 'sizemismatch':
             self.avg = None
-            self.histogram = None
+            self.threshold = None
+            self.type = 'size_mismatch'
+            self.golden_size = words[2] if len(words) >= 4 else '?'
+            self.candidate_size = words[3] if len(words) >= 4 else '?'
+        elif len(words) == 2:
+            self.avg = None
+            self.threshold = None
             self.type = words[1]
-        else:    
+        else:
             self.max_diff = int(words[1])
             self.avg = float(words[2])
             self.total_diff_count = int(words[3])
@@ -113,13 +133,13 @@ class TestEntry(object):
                 self.diff0_path = os.path.relpath(os.path.join(output_path, f"{self.name}.diff0.png"), output_path)
                 self.diff1_path = os.path.relpath(os.path.join(output_path, f"{self.name}.diff1.png"), output_path)
             if len(words) == 6:
-                self.histogram = float(words[5])
-                if self.histogram < (1.0-args.threshold):
+                self.threshold = float(words[5])
+                if self.threshold < (1.0-args.threshold):
                     self.type = "failed"
                 else:
                     self.type = "pass"
             else:
-                self.histogram = None
+                self.threshold = None
                 if self.max_diff > args.threshold:
                     self.type = "failed"
                 else:
@@ -135,14 +155,18 @@ class TestEntry(object):
 
     # this is equivalent of implementing < operator. We use this for sorted and sort functions
     def __lt__(self, other):
+        if self.avg is None:
+            return False
+        if other.avg is None:
+            return True
         # Always sort by avg first. Histogram is a good heuristic to divide into
         # "pass/fail" buckets, but it's helpful to then see the fail bucked
         # sorted by avg, which is more sensitive to differences.
-        if (self.avg == other.avg and
-            self.histogram is not None and
-            other.histogram is not None):
-            # LOWER histogram values mean worse matches. Sort the bad matches first.
-            return self.histogram > other.histogram
+        if (self.threshold != other.threshold and
+            self.threshold is not None and
+            other.threshold is not None):
+            # LOWER threshold values mean worse matches. Sort the bad matches first.
+            return self.threshold > other.threshold
         else:
             # HIGHER avg values mean worse matches. Sort the bad matches first.
             return self.avg < other.avg
@@ -154,24 +178,41 @@ class TestEntry(object):
         if self.type == 'missing_golden':
             # show candidate, since golden is missing
             vals['image'] = self.candidates_path
+            vals['image_thumb'] = self.candidate_thumb
             return self.missing_file_entry_template.format_map(vals)
-        
+
         elif self.type == 'missing_candidate':
             # show golden, since candidate is missing
             vals['image'] = self.golden_path
+            vals['image_thumb'] = self.golden_thumb
             return self.missing_file_entry_template.format_map(vals)
 
         vals['golden'] = self.golden_path
         vals['candidate'] = self.candidates_path
-        
+        vals['golden_thumb'] = self.golden_thumb
+        vals['candidate_thumb'] = self.candidate_thumb
+
+        if self.type == 'size_mismatch':
+            vals['golden_size'] = self.golden_size
+            vals['candidate_size'] = self.candidate_size
+            return self.size_mismatch_entry_template.format_map(vals)
+
         if self.type == "pass" or self.type == "failed":
+            if self.avg is None:
+                return self.identical_entry_template.format_map(vals)
             vals['max'] = self.max_diff
             vals['avg'] = self.avg
             vals['total_diff'] = self.total_diff_count
             vals['percent'] = float(self.total_diff_count) / float(self.total_pixels)
-            vals['histogram'] = self.histogram if self.histogram is not None else 'None'
+            if args.histogram_compare:
+                vals['thresh_type'] = 'histogram'
+            else:
+                vals['thresh_type'] = 'N/A'
+            vals['threshold'] = self.threshold if self.threshold is not None else 'N/A'
             vals['diff0'] = self.diff0_path
             vals['diff1'] = self.diff1_path
+            vals['diff0_thumb'] = self.diff0_thumb
+            vals['diff1_thumb'] = self.diff1_thumb
 
             if self.type == 'pass':
                 return self.pass_entry_template.format_map(vals)
@@ -180,7 +221,7 @@ class TestEntry(object):
 
         if self.type == 'identical':
             return self.identical_entry_template.format_map(vals)
-        
+
         return ''
 
     def clean(self):
@@ -202,7 +243,7 @@ class TestEntry(object):
     @property
     def success(self):
         return self.type == "pass" or self.type == "identical"
-    
+
     @property
     def csv_dict(self):
         val = dict()
@@ -210,12 +251,19 @@ class TestEntry(object):
         val['file_name'] = self.name
         val['original'] = self.golden_path
         val['candidate'] = self.candidates_path
-        if self.type == "pass" or self.type == "failed":
+        if self.type == 'size_mismatch' or (self.type == 'failed' and self.avg is None):
+            val['max_rgb'] = '255'
+            val['avg_rgb'] = '255'
+            val['pixel_diff_count'] = '1'
+            val['pixel_diff_percent'] = '100'
+            val['color_diff'] = ''
+            val['pixel_diff'] = ''
+        elif self.type == "pass" or self.type == "failed":
             val['max_rgb'] = str(self.max_diff)
             val['avg_rgb'] = str(self.avg)
             val['pixel_diff_count'] = str(self.total_diff_count)
             val['pixel_diff_percent'] = '100'
-            if self.histogram is not None:
+            if self.threshold is not None:
                 val['hist_result'] = str(self.histogram)
             val['color_diff'] = self.diff0_path
             val['pixel_diff'] = self.diff1_path
@@ -230,17 +278,12 @@ class TestEntry(object):
             val['pixel_diff'] = ''
 
         return val
-    
+
 
 def shallow_copy_images(src, dest):
     file_names = [file for file in os.scandir(src) if file.is_file() and '.png' in file.name]
     for file in file_names:
         shutil.copyfile(file.path, os.path.join(dest, file.name))
-
-def remove_suffix(name, oldsuffix):
-    if name.endswith(oldsuffix):
-        name = name[:-len(oldsuffix)]
-    return name
 
 def write_csv(entries, origpath, candidatepath, diffpath, missing_candidates):
     origpath = os.path.relpath(origpath, diffpath)
@@ -258,7 +301,7 @@ def write_csv(entries, origpath, candidatepath, diffpath, missing_candidates):
             if args.histogram_compare:
                 writer.writerow({
                     'file_name': name.split('.')[0],
-                    'original': os.path.join(origpath, name), 
+                    'original': os.path.join(origpath, name),
                     'candidate': '',
                     'max_rgb':255,
                     'avg_rgb':255,
@@ -272,7 +315,7 @@ def write_csv(entries, origpath, candidatepath, diffpath, missing_candidates):
             else:
                 writer.writerow({
                     'file_name': name.split('.')[0],
-                    'original': os.path.join(origpath, name), 
+                    'original': os.path.join(origpath, name),
                     'candidate': '',
                     'max_rgb':255,
                     'avg_rgb':255,
@@ -285,9 +328,9 @@ def write_csv(entries, origpath, candidatepath, diffpath, missing_candidates):
 
         for entry in entries:
             writer.writerow(entry.csv_dict)
-            
 
-def write_min_csv(total_passing, total_failing, total_missing_candidates, total_missing_goldens, total_identical, total_entries, csv_path):
+
+def write_min_csv(total_passing, total_failing, total_missing_candidates, total_missing_goldens, total_identical, total_size_mismatch, total_entries, csv_path):
     # delete and old data
     if os.path.exists(csv_path):
         os.remove(csv_path)
@@ -299,31 +342,47 @@ def write_min_csv(total_passing, total_failing, total_missing_candidates, total_
         csv_writer.writerow({'type':'missing_candidates', 'number' : str(total_missing_candidates)})
         csv_writer.writerow({'type':'missing_goldens', 'number' : str(total_missing_goldens)})
         csv_writer.writerow({'type':'identical', 'number' : str(total_identical)})
+        csv_writer.writerow({'type':'incorrect_size', 'number' : str(total_size_mismatch)})
         csv_writer.writerow({'type':'total', 'number' : str(total_entries)})
 
-def call_imagediff(filename, golden, candidate, output, parent_pid):
-    cmd = [PYTHON, "image_diff.py",
-           "-n", remove_suffix(filename, ".png"),
-           "-g", os.path.join(golden, filename),
-           "-c", os.path.join(candidate, filename),
+def diff_worker(index, work_queue, golden, candidate, output, parent_pid):
+    # One long-lived image_diff.py process that pulls filenames off the shared
+    # work_queue one at a time. Keeping the process alive means cv2 is imported
+    # only once (that import + process spawn dominate on Windows).
+    cmd = [PYTHON, "image_diff.py", "--serve",
+           "-g", golden,
+           "-c", candidate,
            # Each process writes its own status file in order to avoid race conditions.
-           "-s", "%s_%i_%i.txt" % (status_filename_base, parent_pid, os.getpid())]
+           "-s", "%s_%i_%i.txt" % (status_filename_base, parent_pid, index)]
     if output is not None:
         cmd.extend(["-o", output])
     if args.verbose:
         cmd.extend(["-v", "-l"])
     if args.histogram_compare:
         cmd.extend(["-H"])
-    
+
     if show_commands:
-        str = ""
-        for c in cmd:
-            str += c + " "
-        print(str)
-    
-    if 0 != subprocess.call(cmd):
-        print("Error calling " + cmd[0])
-        return -1
+        print(" ".join(cmd))
+
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            text=True)
+    try:
+        while True:
+            try:
+                filename = work_queue.get_nowait()
+            except queue.Empty:
+                break
+            proc.stdin.write(filename + "\n")
+            proc.stdin.flush()
+            # Block until the worker signals it finished this image. If the pipe
+            # closed early the worker died; stop feeding it (the missing status
+            # line is caught by the line-count check in diff_directory_shallow).
+            if proc.stdout.readline().strip() != "done":
+                print("image_diff.py worker %i died processing %s" % (index, filename))
+                break
+    finally:
+        proc.stdin.close()
+        proc.wait()
 
 def parse_status(candidates_path, golden_path, output_path, device_name, browserstack_details):
     total_lines = 0
@@ -338,51 +397,64 @@ def parse_status(candidates_path, golden_path, output_path, device_name, browser
             words = line.rstrip().split('\t')
             entry = TestEntry(words, candidates_path, golden_path, output_path, device_name, browserstack_details)
             test_entries.append(entry)
-            if not entry.success:
+            if not entry.success and not (args.allow_new and entry.type == 'missing_golden'):
                 success = False
 
     return (total_lines, test_entries, success)
 
 def diff_directory_shallow(candidates_path, output_path, golden_path, device_name=None, browserstack_details=None):
-    original_filenames = set((file.name for file in os.scandir(candidates_path)
-                              if file.is_file() and file.name.endswith('.png')))
-    candidate_filenames = set(os.listdir(golden_path))
-    intersect_filenames = original_filenames.intersection(candidate_filenames)
+    candidate_filenames = set((file.name for file in os.scandir(candidates_path)
+                               if file.is_file() and file.name.endswith('.png')))
+    golden_filenames = set((file.name for file in os.scandir(golden_path)
+                            if file.is_file() and file.name.endswith('.png')))
+    # Diff every file that appears in either directory. image_diff.py reports a
+    # missing_candidate / missing_golden status for files that only exist on one
+    # side and writes a thumbnail of the single image that does exist, so the
+    # landing page can use thumbnails for missing entries too (rather than
+    # eagerly loading the full resolution image).
+    all_filenames = candidate_filenames | golden_filenames
 
-    missing = []
-    for file in original_filenames.difference(candidate_filenames):
+    # Log which files are missing where; image_diff.py records them as entries.
+    for file in candidate_filenames.difference(golden_filenames):
         print(f'Candidate file {file} missing in goldens.')
-        missing.append(TestEntry([file.split('.')[0], 'missing_golden'], candidates_path, golden_path, output_path, device_name, browserstack_details))
-
-    for file in candidate_filenames.difference(original_filenames):
+    for file in golden_filenames.difference(candidate_filenames):
         print(f'Golden file {file} missing in candidates.')
-        missing.append(TestEntry([file.split('.')[0], 'missing_candidate'], candidates_path, golden_path, output_path, device_name, browserstack_details))
 
     if args.jobs > 1:
-        print("Diffing %i candidates in %i processes..." % (len(intersect_filenames), args.jobs))
+        print("Diffing %i candidates in %i processes..." % (len(all_filenames), args.jobs))
     else:
-        print("Diffing %i candidates..." % len(intersect_filenames))
+        print("Diffing %i candidates..." % len(all_filenames))
     sys.stdout.flush()
 
-#   generate the diffs (if any) and write to the status file
-    f = partial(call_imagediff,
-                golden=golden_path,
-                candidate=candidates_path,
-                output=output_path,
-                parent_pid=os.getpid())
-    
-    Pool(args.jobs).map(f, intersect_filenames)
+    # Fill a shared queue with every filename.
+    work_queue = queue.Queue()
+    for filename in all_filenames:
+        work_queue.put(filename)
+
+    # Generate the diffs (if any) and write to the status file(s). Start up to
+    # `jobs` long-lived image_diff.py workers that each pull filenames off the
+    # queue as fast as they can finish them.
+    njobs = min(args.jobs, len(all_filenames))
+    parent_pid = os.getpid()
+    threads = []
+    for index in range(njobs):
+        t = threading.Thread(target=diff_worker,
+                             args=(index, work_queue, golden_path,
+                                   candidates_path, output_path, parent_pid))
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+
     (total_lines, entries, success) = parse_status(candidates_path, golden_path, output_path, device_name, browserstack_details)
-    
-    entries.extend(missing)
 
     print(f'finished with Succes:{success} and {total_lines} lines')
 
-    if total_lines != len(intersect_filenames):
-        print(f"Internal failure: Got {total_lines} status lines. Expected {len(intersect_filenames)}.")
+    if total_lines != len(all_filenames):
+        print(f"Internal failure: Got {total_lines} status lines. Expected {len(all_filenames)}.")
         success = False
 
-    if original_filenames.symmetric_difference(candidate_filenames):
+    if golden_filenames - candidate_filenames or (candidate_filenames - golden_filenames and not args.allow_new):
         print("golden and candidate directories do not have identical files.")
         success = False
 
@@ -390,11 +462,13 @@ def diff_directory_shallow(candidates_path, output_path, golden_path, device_nam
     for status_filename in glob.iglob(status_filename_pattern):
         os.remove(status_filename)
 
+    missing = [entry for entry in entries
+               if entry.type in ('missing_golden', 'missing_candidate')]
     return (entries, missing, success)
 
 # Sort descending total failure count (missing + failure), then by descending failure count, then by name
 # (put the failed ones at the top)
-def device_entry_sort_key(kv): 
+def device_entry_sort_key(kv):
     return (-(kv[1]["missing_candidate"] + kv[1]["failed"]), -(kv[1]["failed"]), kv[0])
 
 # returns entries sorted into identical, passing and failing as well as html str list of each
@@ -404,13 +478,15 @@ def sort_entries(entries):
     missing_golden_str = [str(entry) for entry in entries if entry.type == "missing_golden"]
     missing_candidate_str = [str(entry) for entry in entries if entry.type == "missing_candidate"]
 
-    failed_entires = [entry for entry in entries if entry.type == "failed"]
-    pass_entires = [entry for entry in entries if entry.type == "pass"]
-    identical_entires = [entry for entry in entries if entry.type == "identical"]
+    failed_entries = [entry for entry in entries if entry.type == "failed"]
+    pass_entries = [entry for entry in entries if entry.type == "pass"]
+    identical_entries = [entry for entry in entries if entry.type == "identical"]
+    size_mismatch_entries = [entry for entry in entries if entry.type == "size_mismatch"]
+    size_mismatch_str = [str(entry) for entry in size_mismatch_entries]
 
-    sorted_failed_entires = sorted(failed_entires, reverse=True)
+    sorted_failed_entries = sorted(failed_entries, reverse=True)
 
-    sorted_failed_str = [str(entry) for entry in sorted_failed_entires]
+    sorted_failed_str = [str(entry) for entry in sorted_failed_entries]
 
     # Build a list of stat counts by device name
     all_device_stats = dict()
@@ -418,7 +494,7 @@ def sort_entries(entries):
         if entry.device not in all_device_stats:
             all_device_stats[entry.device] = defaultdict(int)
             all_device_stats[entry.device]["url"] = entry.browserstack_details['browser_url'] if entry.browserstack_details is not None else ' '
-        all_device_stats[entry.device][entry.type] += 1
+        all_device_stats[entry.device]["failed" if entry.type == "size_mismatch" else entry.type] += 1
 
     # Now build the device summary text using the template
     device_summary_str = ""
@@ -430,7 +506,7 @@ def sort_entries(entries):
             any_failed = device_summary["failed"] > 0
             any_missing = device_summary["missing_candidate"] > 0
             device_summary_str += device_summary_entry_template.format(
-                name=device_name, 
+                name=device_name,
                 url=device_summary["url"],
                 failed_count=device_summary["failed"] if any_failed else "-",
                 failed_class="fail" if any_failed else "deemphasize",
@@ -445,48 +521,53 @@ def sort_entries(entries):
     # identical and pass object lists for cleaning, but we dont bother sorting them
     if args.fails_only:
         return (
-            sorted_failed_entires,
-            pass_entires,
-            identical_entires,
+            sorted_failed_entries,
+            pass_entries,
+            identical_entries,
+            size_mismatch_entries,
             sorted_failed_str,
             [],
             [],
+            size_mismatch_str,
             missing_golden_str,
             missing_candidate_str,
             device_summary_str,
             len(all_device_stats))
 
-    
-    # now sort passed entires and build the html list
-    sorted_passed_entires = sorted(pass_entires, reverse=True)
-    sorted_passed_str = [str(entry) for entry in sorted_passed_entires]
+
+    # now sort passed entries and build the html list
+    sorted_passed_entries = sorted(pass_entries, reverse=True)
+    sorted_passed_str = [str(entry) for entry in sorted_passed_entries]
 
     # if we are cleaning then return empty html list for identical. do everything else the same
     if args.clean:
-         return (sorted_failed_entires, sorted_passed_entires, identical_entires, sorted_failed_str, sorted_passed_str, [], missing_golden_str, missing_candidate_str, device_summary_str, len(all_device_stats))
+         return (sorted_failed_entries, sorted_passed_entries, identical_entries, size_mismatch_entries, sorted_failed_str, sorted_passed_str, [], size_mismatch_str, missing_golden_str, missing_candidate_str, device_summary_str, len(all_device_stats))
 
     # otherwise build identical html entry list and include it in the return
-    identical_str = [str(entry) for entry in identical_entires]
+    identical_str = [str(entry) for entry in identical_entries]
 
     return (
-        sorted_failed_entires,
-        sorted_passed_entires,
-        identical_entires,
+        sorted_failed_entries,
+        sorted_passed_entries,
+        identical_entries,
+        size_mismatch_entries,
         sorted_failed_str,
         sorted_passed_str,
         identical_str,
+        size_mismatch_str,
         missing_golden_str,
         missing_candidate_str,
         device_summary_str,
         len(all_device_stats))
 
-def write_html(templates_path, failed_entries, passing_entries, identical_entries, missing_golden_entries, missing_candidate_entries, device_summary_str, device_number, output_path):
+def write_html(templates_path, failed_entries, passing_entries, identical_entries, size_mismatch_entries, missing_golden_entries, missing_candidate_entries, device_summary_str, device_number, output_path):
     with open(os.path.join(templates_path, "index.html")) as t:
         index_template = t.read()
-    
+
     html = index_template.format(identical=" ".join(identical_entries), passing=" ".join(passing_entries),
                                  failed=" ".join(failed_entries), failed_number=len(failed_entries),
                                  passing_number=len(passing_entries), identical_number=len(identical_entries),
+                                 size_mismatch=" ".join(size_mismatch_entries), size_mismatch_number=len(size_mismatch_entries),
                                  missing_candidate=" ".join(missing_candidate_entries), missing_candidate_number=len(missing_candidate_entries),
                                  missing_golden=" ".join(missing_golden_entries), missing_golden_number=len(missing_golden_entries),
                                  device_summaries=device_summary_str, device_number=device_number,
@@ -495,7 +576,7 @@ def write_html(templates_path, failed_entries, passing_entries, identical_entrie
 
     with open(os.path.join(output_path, "index.html"), "w") as file:
         file.write(html)
-    
+
     #copy our icon to the output folder
     shutil.copyfile(os.path.join(TEMPLATE_PATH, "favicon.ico"), os.path.join(output_path, "favicon.ico"))
 
@@ -506,7 +587,7 @@ def diff_directory_deep(candidates_path, output_path):
         os.makedirs(new_golden_path, exist_ok=True)
         shallow_copy_images(args.goldens, new_golden_path)
         golden_path = new_golden_path
-    
+
     all_entries = []
 
     for folder in os.scandir(candidates_path):
@@ -521,26 +602,26 @@ def diff_directory_deep(candidates_path, output_path):
                 with open(browserstack_details_path, 'rt') as file:
                     browserstack_details = json.load(file)
                 os.remove(browserstack_details_path)
-            
+
             (entries, _, _) = diff_directory_shallow(folder.path, output, golden_path, folder.name, browserstack_details)
-            
+
             all_entries.extend(entries)
 
             if args.pack:
                 shallow_copy_images(folder.path, output)
 
-    (failed, passed, identical, failed_str, passed_str, identical_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number) = sort_entries(all_entries)
+    (failed, passed, identical, size_mismatch, failed_str, passed_str, identical_str, size_mismatch_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number) = sort_entries(all_entries)
 
     to_clean = []
     to_check = []
     # choose who to clean and who to check against
     if args.clean:
         to_clean = identical
-        to_check = failed + passed
+        to_check = failed + passed + size_mismatch
 
     if args.fails_only:
         to_clean = identical + passed
-        to_check = failed
+        to_check = failed + size_mismatch
 
     # clean them
     for obj in to_clean:
@@ -558,12 +639,12 @@ def diff_directory_deep(candidates_path, output_path):
             os.remove(os.path.join(args.goldens, f"{obj.name}.png"))
 
 
-    write_html(TEMPLATE_PATH, failed_str, passed_str, identical_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number, output_path)
+    write_html(TEMPLATE_PATH, failed_str, passed_str, identical_str, size_mismatch_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number, output_path)
 
     print(f"total entries {len(all_entries)}")
-    write_min_csv(len(passed), len(failed), len(missing_candidate_str), len(missing_golden_str), len(identical), len(all_entries), output_path + "/issues.csv")
+    write_min_csv(len(passed), len(failed), len(missing_candidate_str), len(missing_golden_str), len(identical), len(size_mismatch), len(all_entries), output_path + "/issues.csv")
 
-def main(argv=None):    
+def main(argv=None):
     if not os.path.exists(args.goldens):
         print("Can't find goldens " + args.goldens)
         return -1
@@ -588,9 +669,9 @@ def main(argv=None):
     else:
         (entries, missing, success) = diff_directory_shallow(args.candidates, args.output, args.goldens)
         if len(entries) > 0:
-            (failed, passed, identical, failed_str, passed_str, identical_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number) = sort_entries(entries)
-            assert(len(failed) + len(passed) + len(identical) + len(missing_candidate_str) + len(missing_golden_str) == len(entries))
-            write_html(TEMPLATE_PATH, failed_str, passed_str, identical_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number, args.output)
+            (failed, passed, identical, size_mismatch, failed_str, passed_str, identical_str, size_mismatch_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number) = sort_entries(entries)
+            assert(len(failed) + len(passed) + len(identical) + len(size_mismatch) + len(missing_candidate_str) + len(missing_golden_str) == len(entries))
+            write_html(TEMPLATE_PATH, failed_str, passed_str, identical_str, size_mismatch_str, missing_golden_str, missing_candidate_str, device_summary_str, device_number, args.output)
             # note could add these to the html output but w/e
             missing_candidates = [os.path.basename(entry.candidates_path_abs) for entry in missing if entry.type == 'missing_candidate']
             write_csv(entries, args.goldens, args.candidates, args.output, missing_candidates)
@@ -605,7 +686,7 @@ def main(argv=None):
                     if args.verbose:
                         print(f"deleting orphaned golden {golden_path}")
                     os.remove(golden_path)
-                    
+
             elif args.clean:
                 for obj in identical:
                     obj.clean()
@@ -613,11 +694,11 @@ def main(argv=None):
                     if args.verbose:
                         print(f"deleting orphaned golden {golden_path}")
                     os.remove(golden_path)
-                    
-            
+
+
         # if we are in fail only mode than make it succesful when there are only "passing" entries
         if args.fails_only:
-            if failed:
+            if failed or size_mismatch:
                 # if there were diffs, its gotta fail
                 print("FAILED.")
                 return -1
@@ -626,8 +707,8 @@ def main(argv=None):
             # if there were diffs, its gotta fail
             print("FAILED.")
             return -1
-        
+
     return 0
-    
+
 if __name__ == "__main__":
     sys.exit(main())

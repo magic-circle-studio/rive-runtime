@@ -14,23 +14,6 @@ protected:
 public:
     static const uint16_t typeKey = 85;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TransformComponentConstraintBase::typeKey:
-            case TransformSpaceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t minMaxSpaceValuePropertyKey = 195;
@@ -60,8 +43,11 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minMaxSpaceValuePropertyKey,
+                             &m_MinMaxSpaceValue,
+                             &value);
         m_MinMaxSpaceValue = value;
-        minMaxSpaceValueChanged();
+        notifyPropertyChanged(minMaxSpaceValuePropertyKey);
     }
 
     inline float copyFactor() const { return m_CopyFactor; }
@@ -71,8 +57,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(copyFactorPropertyKey, &m_CopyFactor, &value);
         m_CopyFactor = value;
-        copyFactorChanged();
+        notifyPropertyChanged(copyFactorPropertyKey);
     }
 
     inline float minValue() const { return m_MinValue; }
@@ -82,8 +69,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minValuePropertyKey, &m_MinValue, &value);
         m_MinValue = value;
-        minValueChanged();
+        notifyPropertyChanged(minValuePropertyKey);
     }
 
     inline float maxValue() const { return m_MaxValue; }
@@ -93,8 +81,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxValuePropertyKey, &m_MaxValue, &value);
         m_MaxValue = value;
-        maxValueChanged();
+        notifyPropertyChanged(maxValuePropertyKey);
     }
 
     inline bool offset() const { return m_Offset; }
@@ -104,8 +93,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     inline bool doesCopy() const { return m_DoesCopy; }
@@ -115,8 +106,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(doesCopyPropertyKey, &m_DoesCopy, &value);
         m_DoesCopy = value;
-        doesCopyChanged();
+        notifyPropertyChanged(doesCopyPropertyKey);
     }
 
     inline bool min() const { return m_Min; }
@@ -126,8 +118,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(minPropertyKey, &m_Min, &value);
         m_Min = value;
-        minChanged();
+        notifyPropertyChanged(minPropertyKey);
     }
 
     inline bool max() const { return m_Max; }
@@ -137,8 +130,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(maxPropertyKey, &m_Max, &value);
         m_Max = value;
-        maxChanged();
+        notifyPropertyChanged(maxPropertyKey);
     }
 
     void copy(const TransformComponentConstraintBase& object)
@@ -187,14 +181,10 @@ public:
     }
 
 protected:
-    virtual void minMaxSpaceValueChanged() {}
-    virtual void copyFactorChanged() {}
-    virtual void minValueChanged() {}
-    virtual void maxValueChanged() {}
     virtual void offsetChanged() {}
-    virtual void doesCopyChanged() {}
-    virtual void minChanged() {}
-    virtual void maxChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/transform_component_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

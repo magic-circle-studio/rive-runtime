@@ -12,20 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 45;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case WeightBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t valuesPropertyKey = 102;
@@ -43,8 +29,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(valuesPropertyKey, &m_Values, &value);
         m_Values = value;
-        valuesChanged();
+        RIVE_EDITOR_CHANGED(valuesChanged());
+        notifyPropertyChanged(valuesPropertyKey);
     }
 
     inline uint32_t indices() const { return m_Indices; }
@@ -54,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(indicesPropertyKey, &m_Indices, &value);
         m_Indices = value;
-        indicesChanged();
+        RIVE_EDITOR_CHANGED(indicesChanged());
+        notifyPropertyChanged(indicesPropertyKey);
     }
 
     Core* clone() const override;
@@ -83,6 +73,9 @@ public:
 protected:
     virtual void valuesChanged() {}
     virtual void indicesChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/bones/weight_ext.inl"
+#endif
 };
 } // namespace rive
 

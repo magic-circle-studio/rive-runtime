@@ -12,20 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 532;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DataConverterStringTrimBase::typeKey:
-            case DataConverterBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t trimTypePropertyKey = 746;
@@ -41,8 +27,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(trimTypePropertyKey, &m_TrimType, &value);
         m_TrimType = value;
-        trimTypeChanged();
+        RIVE_EDITOR_CHANGED(trimTypeChanged());
+        notifyPropertyChanged(trimTypePropertyKey);
     }
 
     Core* clone() const override;
@@ -65,6 +53,9 @@ public:
 
 protected:
     virtual void trimTypeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/converters/data_converter_string_trim_ext.inl"
+#endif
 };
 } // namespace rive
 

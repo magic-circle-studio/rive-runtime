@@ -9,13 +9,7 @@
 namespace rive
 {
 class FocusAction : public FocusActionBase
-{
-public:
-    void perform(StateMachineInstance* stateMachineInstance,
-                 Vec2D position,
-                 Vec2D previousPosition,
-                 int pointerId) const override;
-};
+{};
 } // namespace rive
 
 #endif

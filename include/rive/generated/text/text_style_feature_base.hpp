@@ -12,20 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 164;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TextStyleFeatureBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t tagPropertyKey = 356;
@@ -43,8 +29,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(tagPropertyKey, &m_Tag, &value);
         m_Tag = value;
-        tagChanged();
+        RIVE_EDITOR_CHANGED(tagChanged());
+        notifyPropertyChanged(tagPropertyKey);
     }
 
     inline uint32_t featureValue() const { return m_FeatureValue; }
@@ -54,8 +42,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(featureValuePropertyKey, &m_FeatureValue, &value);
         m_FeatureValue = value;
-        featureValueChanged();
+        notifyPropertyChanged(featureValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -82,7 +71,9 @@ public:
 
 protected:
     virtual void tagChanged() {}
-    virtual void featureValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/text/text_style_feature_ext.inl"
+#endif
 };
 } // namespace rive
 

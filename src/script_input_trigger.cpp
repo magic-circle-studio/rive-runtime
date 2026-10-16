@@ -18,8 +18,7 @@ ScriptInputTrigger::~ScriptInputTrigger()
 
 StatusCode ScriptInputTrigger::import(ImportStack& importStack)
 {
-    auto importer =
-        importStack.latest<ScriptedObjectImporter>(ScriptedDrawable::typeKey);
+    auto importer = ScriptInput::ownerImporter(importStack, this);
     if (importer == nullptr)
     {
         return StatusCode::MissingObject;
@@ -29,8 +28,9 @@ StatusCode ScriptInputTrigger::import(ImportStack& importStack)
     auto obj = scriptedObject();
     if (obj && obj->component() != nullptr)
     {
-        // If the ScriptedObject is a Component, we need the ArtboardImporter
-        // to add it as a Component, otherwise, return Ok
+        // If the ScriptedObject is a Component, this input is an artboard
+        // child (File::readObjects gave it a slot, see takesArtboardSlot), so
+        // import it as a Component, otherwise, return Ok
         return Super::import(importStack);
     }
     return StatusCode::Ok;
@@ -59,6 +59,7 @@ StatusCode ScriptInputTrigger::onAddedClean(CoreContext* context)
 
 void ScriptInputTrigger::propertyValueChanged()
 {
+    CustomPropertyTrigger::propertyValueChanged();
     if (propertyValue() != 0)
     {
         scriptedObject()->trigger(name());

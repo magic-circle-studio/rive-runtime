@@ -13,23 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 165;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case FollowPathConstraintBase::typeKey:
-            case TransformSpaceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t distancePropertyKey = 363;
@@ -49,8 +32,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(distancePropertyKey, &m_Distance, &value);
         m_Distance = value;
-        distanceChanged();
+        RIVE_EDITOR_CHANGED(distanceChanged());
+        notifyPropertyChanged(distancePropertyKey);
     }
 
     inline bool orient() const { return m_Orient; }
@@ -60,8 +45,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(orientPropertyKey, &m_Orient, &value);
         m_Orient = value;
-        orientChanged();
+        RIVE_EDITOR_CHANGED(orientChanged());
+        notifyPropertyChanged(orientPropertyKey);
     }
 
     inline bool offset() const { return m_Offset; }
@@ -71,8 +58,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     Core* clone() const override;
@@ -105,6 +94,9 @@ protected:
     virtual void distanceChanged() {}
     virtual void orientChanged() {}
     virtual void offsetChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/follow_path_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

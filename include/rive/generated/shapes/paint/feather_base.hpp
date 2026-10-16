@@ -4,6 +4,9 @@
 #include "rive/core/field_types/core_bool_type.hpp"
 #include "rive/core/field_types/core_double_type.hpp"
 #include "rive/core/field_types/core_uint_type.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class FeatherBase : public ContainerComponent
@@ -13,21 +16,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 533;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case FeatherBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -52,8 +40,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(spaceValuePropertyKey, &m_SpaceValue, &value);
         m_SpaceValue = value;
-        spaceValueChanged();
+        notifyPropertyChanged(spaceValuePropertyKey);
     }
 
     inline float strength() const { return m_Strength; }
@@ -63,8 +52,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(strengthPropertyKey, &m_Strength, &value);
         m_Strength = value;
-        strengthChanged();
+        RIVE_EDITOR_CHANGED(strengthChanged());
+        notifyPropertyChanged(strengthPropertyKey);
     }
 
     inline float offsetX() const { return m_OffsetX; }
@@ -74,8 +65,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetXPropertyKey, &m_OffsetX, &value);
         m_OffsetX = value;
-        offsetXChanged();
+        RIVE_EDITOR_CHANGED(offsetXChanged());
+        notifyPropertyChanged(offsetXPropertyKey);
     }
 
     inline float offsetY() const { return m_OffsetY; }
@@ -85,8 +78,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetYPropertyKey, &m_OffsetY, &value);
         m_OffsetY = value;
-        offsetYChanged();
+        RIVE_EDITOR_CHANGED(offsetYChanged());
+        notifyPropertyChanged(offsetYPropertyKey);
     }
 
     inline bool inner() const { return m_Inner; }
@@ -96,8 +91,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(innerPropertyKey, &m_Inner, &value);
         m_Inner = value;
-        innerChanged();
+        notifyPropertyChanged(innerPropertyKey);
     }
 
     Core* clone() const override;
@@ -108,6 +104,7 @@ public:
         m_OffsetX = object.m_OffsetX;
         m_OffsetY = object.m_OffsetY;
         m_Inner = object.m_Inner;
+        RIVE_EDITOR_COPY(object);
         ContainerComponent::copy(object);
     }
 
@@ -131,15 +128,17 @@ public:
                 m_Inner = CoreBoolType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return ContainerComponent::deserialize(propertyKey, reader);
     }
 
 protected:
-    virtual void spaceValueChanged() {}
     virtual void strengthChanged() {}
     virtual void offsetXChanged() {}
     virtual void offsetYChanged() {}
-    virtual void innerChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/paint/feather_ext.inl"
+#endif
 };
 } // namespace rive
 

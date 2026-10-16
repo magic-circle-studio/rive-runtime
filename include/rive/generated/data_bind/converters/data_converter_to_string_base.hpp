@@ -14,20 +14,6 @@ protected:
 public:
     static const uint16_t typeKey = 490;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DataConverterToStringBase::typeKey:
-            case DataConverterBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t flagsPropertyKey = 764;
@@ -47,8 +33,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(flagsPropertyKey, &m_Flags, &value);
         m_Flags = value;
-        flagsChanged();
+        RIVE_EDITOR_CHANGED(flagsChanged());
+        notifyPropertyChanged(flagsPropertyKey);
     }
 
     inline uint32_t decimals() const { return m_Decimals; }
@@ -58,8 +46,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(decimalsPropertyKey, &m_Decimals, &value);
         m_Decimals = value;
-        decimalsChanged();
+        RIVE_EDITOR_CHANGED(decimalsChanged());
+        notifyPropertyChanged(decimalsPropertyKey);
     }
 
     inline const std::string& colorFormat() const { return m_ColorFormat; }
@@ -69,8 +59,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_STRING_CHANGING(colorFormatPropertyKey,
+                                    m_ColorFormat,
+                                    value);
         m_ColorFormat = value;
-        colorFormatChanged();
+        RIVE_EDITOR_CHANGED(colorFormatChanged());
+        notifyPropertyChanged(colorFormatPropertyKey);
     }
 
     Core* clone() const override;
@@ -103,6 +97,9 @@ protected:
     virtual void flagsChanged() {}
     virtual void decimalsChanged() {}
     virtual void colorFormatChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/converters/data_converter_to_string_ext.inl"
+#endif
 };
 } // namespace rive
 

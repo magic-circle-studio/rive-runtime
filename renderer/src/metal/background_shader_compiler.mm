@@ -4,15 +4,17 @@
 
 #include "background_shader_compiler.h"
 
-#include "generated/shaders/metal.glsl.hpp"
+#include "generated/shaders/advanced_blend.glsl.hpp"
 #include "generated/shaders/constants.glsl.hpp"
 #include "generated/shaders/common.glsl.hpp"
-#include "generated/shaders/advanced_blend.glsl.hpp"
+#include "generated/shaders/draw_image_mesh.vert.hpp"
+#include "generated/shaders/draw_mesh.frag.hpp"
 #include "generated/shaders/draw_path_common.glsl.hpp"
 #include "generated/shaders/draw_path.vert.hpp"
 #include "generated/shaders/draw_raster_order_path.frag.hpp"
-#include "generated/shaders/draw_image_mesh.vert.hpp"
-#include "generated/shaders/draw_mesh.frag.hpp"
+#include "generated/shaders/flush_uniforms.glsl.hpp"
+#include "generated/shaders/gradient_packing_common.glsl.hpp"
+#include "generated/shaders/metal.glsl.hpp"
 
 #ifndef RIVE_IOS
 // iOS doesn't need the atomic shaders; every non-simulated iOS device supports
@@ -98,10 +100,10 @@ void BackgroundShaderCompiler::threadMain()
         auto defines = [[NSMutableDictionary alloc] init];
         defines[@GLSL_VERTEX] = @"";
         defines[@GLSL_FRAGMENT] = @"";
-        for (size_t i = 0; i < gpu::kShaderFeatureCount; ++i)
+        for (size_t i = 0; i < gpu::ShaderFeatureCount; ++i)
         {
-            ShaderFeatures feature = static_cast<ShaderFeatures>(1 << i);
-            if (shaderFeatures & feature)
+            const auto feature = ShaderFeatures(1 << i);
+            if (enums::is_flag_set(shaderFeatures, feature))
             {
                 const char* macro = gpu::GetShaderFeatureGLSLName(feature);
                 defines[[NSString stringWithUTF8String:macro]] = @"1";
@@ -116,13 +118,15 @@ void BackgroundShaderCompiler::threadMain()
             {
                 defines[@GLSL_PLS_IMPL_DEVICE_BUFFER_RASTER_ORDERED] = @"";
             }
-            if (shaderMiscFlags &
-                gpu::ShaderMiscFlags::fixedFunctionColorOutput)
+            if (enums::is_flag_set(
+                    shaderMiscFlags,
+                    gpu::ShaderMiscFlags::fixedFunctionColorOutput))
             {
                 defines[@GLSL_FIXED_FUNCTION_COLOR_OUTPUT] = @"";
             }
         }
-        if (shaderMiscFlags & gpu::ShaderMiscFlags::clockwiseFill)
+        if (enums::is_flag_set(shaderMiscFlags,
+                               gpu::ShaderMiscFlags::clockwiseFill))
         {
             defines[@GLSL_CLOCKWISE_FILL] = @"1";
         }
@@ -130,9 +134,12 @@ void BackgroundShaderCompiler::threadMain()
         auto source =
             [[NSMutableString alloc] initWithCString:gpu::glsl::metal
                                             encoding:NSUTF8StringEncoding];
-        [source
-            appendFormat:@"%s\n%s\n", gpu::glsl::constants, gpu::glsl::common];
-        if (shaderFeatures & ShaderFeatures::ENABLE_ADVANCED_BLEND)
+        [source appendFormat:@"%s\n%s\n%s\n",
+                             gpu::glsl::constants,
+                             gpu::glsl::flush_uniforms,
+                             gpu::glsl::common];
+        if (enums::is_flag_set(shaderFeatures,
+                               ShaderFeatures::ENABLE_ADVANCED_BLEND))
         {
             [source appendFormat:@"%s\n", gpu::glsl::advanced_blend];
         }
@@ -149,8 +156,8 @@ void BackgroundShaderCompiler::threadMain()
             case DrawType::interiorTriangulation:
                 defines[@GLSL_DRAW_INTERIOR_TRIANGLES] = @"";
                 break;
-            case DrawType::atlasBlit:
-                defines[@GLSL_ATLAS_BLIT] = @"1";
+            case DrawType::featherAtlasBlit:
+                defines[@GLSL_FEATHER_ATLAS_BLIT] = @"1";
                 break;
             case DrawType::imageRect:
 #ifdef RIVE_IOS
@@ -172,12 +179,22 @@ void BackgroundShaderCompiler::threadMain()
                 assert(interlockMode == InterlockMode::atomics);
                 defines[@GLSL_DRAW_RENDER_TARGET_UPDATE_BOUNDS] = @"";
                 defines[@GLSL_INITIALIZE_PLS] = @"";
-                if (shaderMiscFlags & gpu::ShaderMiscFlags::storeColorClear)
+                if (enums::is_flag_set(shaderMiscFlags,
+                                       gpu::ShaderMiscFlags::storeColorClear))
                 {
-                    defines[@GLSL_STORE_COLOR_CLEAR] = @"";
+                    // Define this as "true" instead of an empty string because
+                    // it's a specialization constant in some backends and gets
+                    // branched on at runtime.
+                    defines[@GLSL_STORE_COLOR_CLEAR] = @"true";
                 }
-                if (shaderMiscFlags &
-                    gpu::ShaderMiscFlags::swizzleColorBGRAToRGBA)
+                // Metal copies the render target directly to the storage buffer
+                // instead of seeding it with the shader.
+                assert(!enums::is_flag_set(
+                    shaderMiscFlags,
+                    gpu::ShaderMiscFlags::loadColorFromDstTexture));
+                if (enums::is_flag_set(
+                        shaderMiscFlags,
+                        gpu::ShaderMiscFlags::swizzleColorBGRAToRGBA))
                 {
                     defines[@GLSL_SWIZZLE_COLOR_BGRA_TO_RGBA] = @"";
                 }
@@ -190,21 +207,30 @@ void BackgroundShaderCompiler::threadMain()
                 assert(interlockMode == InterlockMode::atomics);
                 defines[@GLSL_DRAW_RENDER_TARGET_UPDATE_BOUNDS] = @"";
                 defines[@GLSL_RESOLVE_PLS] = @"";
-                if (shaderMiscFlags &
-                    gpu::ShaderMiscFlags::coalescedResolveAndTransfer)
+                if (enums::is_flag_set(
+                        shaderMiscFlags,
+                        gpu::ShaderMiscFlags::coalescedResolveAndTransfer))
                 {
                     defines[@GLSL_COALESCED_PLS_RESOLVE_AND_TRANSFER] = @"";
                 }
 #endif
                 break;
-            case DrawType::msaaStrokes:
-            case DrawType::msaaMidpointFanBorrowedCoverage:
-            case DrawType::msaaMidpointFans:
-            case DrawType::msaaMidpointFanStencilReset:
-            case DrawType::msaaMidpointFanPathsStencil:
-            case DrawType::msaaMidpointFanPathsCover:
-            case DrawType::msaaOuterCubics:
-            case DrawType::msaaStencilClipReset:
+            case DrawType::stencilMidpointFanBorrowedCoverage:
+            case DrawType::stencilDynamicMidpointFans:
+            case DrawType::stencilDynamicOuterCubics:
+            case DrawType::stencilMidpointFans:
+            case DrawType::stencilMidpointFanReset:
+            case DrawType::stencilMidpointFanWinding:
+            case DrawType::stencilMidpointFanCover:
+            case DrawType::stencilOuterCubicBorrowedCoverage:
+            case DrawType::stencilOuterCubicReset:
+            case DrawType::stencilOuterCubicWinding:
+            case DrawType::stencilOuterCubicCover:
+            case DrawType::stencilOuterCubics:
+            case DrawType::clipReset:
+            case DrawType::depthStrokes:
+            case DrawType::depthAAStrokes:
+            case DrawType::depthAAOuterHairline:
                 RIVE_UNREACHABLE();
         }
 
@@ -212,6 +238,7 @@ void BackgroundShaderCompiler::threadMain()
         if (interlockMode == gpu::InterlockMode::atomics)
         {
             [source appendFormat:@"%s\n", gpu::glsl::draw_path_common];
+            [source appendFormat:@"%s\n", gpu::glsl::gradient_packing_common];
             [source appendFormat:@"%s\n", gpu::glsl::atomic_draw];
         }
         else
@@ -225,13 +252,17 @@ void BackgroundShaderCompiler::threadMain()
                 case DrawType::outerCurvePatches:
                 case DrawType::interiorTriangulation:
                     [source appendFormat:@"%s\n", gpu::glsl::draw_path_common];
+                    [source appendFormat:@"%s\n",
+                                         gpu::glsl::gradient_packing_common];
                     [source appendFormat:@"%s\n", gpu::glsl::draw_path_vert];
                     [source
                         appendFormat:@"%s\n",
                                      gpu::glsl::draw_raster_order_path_frag];
                     break;
-                case DrawType::atlasBlit:
+                case DrawType::featherAtlasBlit:
                     [source appendFormat:@"%s\n", gpu::glsl::draw_path_common];
+                    [source appendFormat:@"%s\n",
+                                         gpu::glsl::gradient_packing_common];
                     [source appendFormat:@"%s\n", gpu::glsl::draw_path_vert];
                     [source appendFormat:@"%s\n", gpu::glsl::draw_mesh_frag];
                     break;
@@ -241,16 +272,24 @@ void BackgroundShaderCompiler::threadMain()
                     [source appendFormat:@"%s\n", gpu::glsl::draw_mesh_frag];
                     break;
                 case DrawType::imageRect:
-                case DrawType::msaaStrokes:
-                case DrawType::msaaMidpointFanBorrowedCoverage:
-                case DrawType::msaaMidpointFans:
-                case DrawType::msaaMidpointFanStencilReset:
-                case DrawType::msaaMidpointFanPathsStencil:
-                case DrawType::msaaMidpointFanPathsCover:
-                case DrawType::msaaOuterCubics:
-                case DrawType::msaaStencilClipReset:
+                case DrawType::stencilMidpointFanBorrowedCoverage:
+                case DrawType::stencilDynamicMidpointFans:
+                case DrawType::stencilDynamicOuterCubics:
+                case DrawType::stencilMidpointFans:
+                case DrawType::stencilMidpointFanReset:
+                case DrawType::stencilMidpointFanWinding:
+                case DrawType::stencilMidpointFanCover:
+                case DrawType::stencilOuterCubicBorrowedCoverage:
+                case DrawType::stencilOuterCubicReset:
+                case DrawType::stencilOuterCubicWinding:
+                case DrawType::stencilOuterCubicCover:
+                case DrawType::stencilOuterCubics:
+                case DrawType::clipReset:
                 case DrawType::renderPassInitialize:
                 case DrawType::renderPassResolve:
+                case DrawType::depthStrokes:
+                case DrawType::depthAAStrokes:
+                case DrawType::depthAAOuterHairline:
                     RIVE_UNREACHABLE();
             }
         }

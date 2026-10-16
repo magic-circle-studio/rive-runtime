@@ -74,6 +74,14 @@ void CubicVertex::deform(const Mat2D& worldTransform,
 {
     Super::deform(worldTransform, boneTransforms);
 
+    // See `Vertex::deform`: a skinned cubic vertex can reach us without its
+    // CubicWeight (editor coop hydration, or a tool that added the vertex
+    // after the bind), and nothing at import rejects it. Hold the bind
+    // position, as Vertex::deform does, rather than dereference null.
+    if (!hasWeight())
+    {
+        return;
+    }
     auto cubicWeight = weight<CubicWeight>();
 
     cubicWeight->inTranslation() = Weight::deform(inPoint(),

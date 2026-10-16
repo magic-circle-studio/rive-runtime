@@ -9,10 +9,22 @@
 
 #include "rive/factory.hpp"
 #include "rive/renderer_utils.hpp"
+#include "rive/shapes/paint/color.hpp"
 
 #include "hb.h"
 #include "hb-ot.h"
+#include <algorithm>
 #include <unordered_set>
+
+// harfbuzz's own file loader is compiled out (HB_NO_OPEN/HB_NO_MMAP keep it
+// out of the wasm builds), so map the file ourselves and hand harfbuzz a
+// borrowed pointer. RIVE_HB_FILE_MAPPING is defined in font_hb.hpp.
+#ifdef RIVE_HB_FILE_MAPPING
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 extern "C"
 {
@@ -24,28 +36,148 @@ rive::Font::FallbackProc rive::Font::gFallbackProc;
 
 bool rive::Font::gFallbackProcEnabled = true;
 
+namespace
+{
+// Takes ownership of blob, which is null when harfbuzz already released its
+// data.
+hb_font_t* hbFontFromBlob(hb_blob_t* blob, unsigned faceIndex = 0)
+{
+    if (blob == nullptr)
+    {
+        return nullptr;
+    }
+    auto face = hb_face_create_or_fail(blob, faceIndex);
+    hb_blob_destroy(blob);
+    if (face == nullptr)
+    {
+        return nullptr;
+    }
+    auto font = hb_font_create(face);
+    hb_face_destroy(face);
+    return font;
+}
+
+/** Takes ownership of blob and initializes a Rive font from its first face. */
+rive::rcp<rive::Font> fontFromBlob(hb_blob_t* blob)
+{
+    auto* font = hbFontFromBlob(blob);
+    return font ? rive::rcp<rive::Font>(new HBFont(font)) : nullptr;
+}
+} // namespace
+
 rive::rcp<rive::Font> HBFont::Decode(rive::Span<const uint8_t> span)
 {
-    auto blob = hb_blob_create_or_fail((const char*)span.data(),
-                                       (unsigned)span.size(),
-                                       HB_MEMORY_MODE_DUPLICATE,
-                                       nullptr,
-                                       nullptr);
-    if (blob)
+    return fontFromBlob(hb_blob_create_or_fail((const char*)span.data(),
+                                               (unsigned)span.size(),
+                                               HB_MEMORY_MODE_DUPLICATE,
+                                               nullptr,
+                                               nullptr));
+}
+
+rive::rcp<rive::Font> HBFont::Decode(std::vector<uint8_t>&& bytes)
+{
+    auto* owned = new std::vector<uint8_t>(std::move(bytes));
+    return fontFromBlob(hb_blob_create_or_fail(
+        reinterpret_cast<const char*>(owned->data()),
+        static_cast<unsigned>(owned->size()),
+        HB_MEMORY_MODE_WRITABLE,
+        owned,
+        [](void* context) {
+            delete static_cast<std::vector<uint8_t>*>(context);
+        }));
+}
+
+#ifdef RIVE_HB_FILE_MAPPING
+namespace
+{
+struct HBFileMapping
+{
+    void* data;
+    size_t size;
+};
+
+void destroyHBFileMapping(void* context)
+{
+    auto* mapping = static_cast<HBFileMapping*>(context);
+    munmap(mapping->data, mapping->size);
+    delete mapping;
+}
+} // namespace
+#endif
+
+HBFont::FileProbe::FileProbe(hb_font_t* font) : m_font(font)
+{
+    hb_ot_font_set_funcs(m_font);
+}
+
+HBFont::FileProbe::~FileProbe() { hb_font_destroy(m_font); }
+
+bool HBFont::FileProbe::hasGlyph(rive::Unichar codepoint) const
+{
+    hb_codepoint_t glyph;
+    return m_font && hb_font_get_nominal_glyph(m_font, codepoint, &glyph);
+}
+
+rive::rcp<rive::Font> HBFont::FileProbe::makeFont()
+{
+    if (!m_font)
     {
-        auto face = hb_face_create_or_fail(blob, 0);
-        hb_blob_destroy(blob);
-        if (face)
-        {
-            auto font = hb_font_create(face);
-            hb_face_destroy(face);
-            if (font)
-            {
-                return rive::rcp<rive::Font>(new HBFont(font));
-            }
-        }
+        return nullptr;
     }
+    auto* font = m_font;
+    m_font = nullptr; // HBFont now owns the same face and mapped bytes.
+    return rive::rcp<rive::Font>(new HBFont(font));
+}
+
+rive::rcp<rive::Font> HBFont::DecodeFile(const char* path, unsigned faceIndex)
+{
+    auto probe = ProbeFile(path, faceIndex);
+    return probe ? probe->makeFont() : nullptr;
+}
+
+std::unique_ptr<HBFont::FileProbe> HBFont::ProbeFile(const char* path,
+                                                     unsigned faceIndex)
+{
+#ifdef RIVE_HB_FILE_MAPPING
+    if (path == nullptr)
+    {
+        return nullptr;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd == -1)
+    {
+        return nullptr;
+    }
+    struct stat info;
+    // hb_blob_create_or_fail rejects >= 2GB, so bail before mapping.
+    if (fstat(fd, &info) == -1 || info.st_size <= 0 ||
+        static_cast<uint64_t>(info.st_size) >= (1ull << 31))
+    {
+        close(fd);
+        return nullptr;
+    }
+    size_t size = static_cast<size_t>(info.st_size);
+    void* data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    // The mapping holds its own reference to the file.
+    close(fd);
+    if (data == MAP_FAILED)
+    {
+        return nullptr;
+    }
+
+    // READONLY_MAY_MAKE_WRITABLE: harfbuzz reads our clean, evictable file
+    // pages and only copies if it ever needs to write.
+    auto* font = hbFontFromBlob(
+        hb_blob_create_or_fail(static_cast<const char*>(data),
+                               static_cast<unsigned>(size),
+                               HB_MEMORY_MODE_READONLY_MAY_MAKE_WRITABLE,
+                               new HBFileMapping{data, size},
+                               &destroyHBFileMapping),
+        faceIndex);
+    return font ? std::unique_ptr<FileProbe>(new FileProbe(font)) : nullptr;
+#else
     return nullptr;
+#endif
 }
 
 #if defined(RIVE_NO_CORETEXT) || !defined(__APPLE__)
@@ -130,6 +262,338 @@ extern "C"
     }
 }
 
+// Convert HarfBuzz color (BGRA byte order) to Rive ColorInt (ARGB).
+static rive::ColorInt hbColorToColorInt(hb_color_t c)
+{
+    uint8_t b = hb_color_get_blue(c);
+    uint8_t g = hb_color_get_green(c);
+    uint8_t r = hb_color_get_red(c);
+    uint8_t a = hb_color_get_alpha(c);
+    return rive::colorARGB(a, r, g, b);
+}
+
+// ── COLRv1 paint callbacks ──────────────────────────────────────────────
+// We flatten the COLRv1 paint tree into a list of (path, fill) layers.
+
+struct PaintState
+{
+    hb_font_t* font;
+    hb_draw_funcs_t* drawFuncs;
+    std::vector<rive::Font::ColorGlyphLayer>* layers;
+    rive::RawPath clipPath;
+    bool hasClip = false;
+    rive::ColorInt foreground = 0xFF000000;
+
+    // HarfBuzz transforms conjugated into Rive glyph space (scaled, Y down).
+    std::vector<rive::Mat2D> transformStack;
+
+    void pushTransform(float xx,
+                       float yx,
+                       float xy,
+                       float yy,
+                       float dx,
+                       float dy)
+    {
+        rive::Mat2D m(xx, -yx, -xy, yy, dx * gInvScale, -dy * gInvScale);
+        transformStack.push_back(
+            transformStack.empty() ? m : transformStack.back() * m);
+    }
+
+    void popTransform()
+    {
+        if (!transformStack.empty())
+        {
+            transformStack.pop_back();
+        }
+    }
+
+    rive::Mat2D glyphTransform() const
+    {
+        rive::Mat2D scale = rive::Mat2D::fromScale(gInvScale, -gInvScale);
+        return transformStack.empty() ? scale : transformStack.back() * scale;
+    }
+
+    rive::Vec2D mapPoint(float x, float y) const
+    {
+        return glyphTransform() * rive::Vec2D(x, y);
+    }
+
+    float mapRadius(float r) const
+    {
+        float scaled = r * gInvScale;
+        if (transformStack.empty())
+        {
+            return scaled;
+        }
+        const auto& m = transformStack.back();
+        return scaled * std::sqrt(m[0] * m[0] + m[1] * m[1]);
+    }
+
+    void pushClipGlyph(hb_codepoint_t glyph)
+    {
+        clipPath.rewind();
+        hb_font_draw_glyph(font, glyph, drawFuncs, &clipPath);
+        if (!transformStack.empty())
+        {
+            clipPath.transformInPlace(transformStack.back());
+        }
+        hasClip = true;
+    }
+
+    // Helper: extract color stops from hb_color_line_t.
+    static std::vector<rive::Font::GradientStop> extractStops(
+        hb_color_line_t* colorLine,
+        rive::ColorInt foreground)
+    {
+        unsigned int count =
+            hb_color_line_get_color_stops(colorLine, 0, nullptr, nullptr);
+        std::vector<hb_color_stop_t> hbStops(count);
+        hb_color_line_get_color_stops(colorLine, 0, &count, hbStops.data());
+        std::vector<rive::Font::GradientStop> stops;
+        stops.reserve(count);
+        for (auto& s : hbStops)
+        {
+            rive::ColorInt c =
+                s.is_foreground ? foreground : hbColorToColorInt(s.color);
+            stops.push_back(
+                {std::clamp(s.offset, 0.0f, 1.0f), c, (bool)s.is_foreground});
+        }
+        // Variations can reorder stops and renderers expect them ascending.
+        std::stable_sort(
+            stops.begin(),
+            stops.end(),
+            [](const auto& a, const auto& b) { return a.offset < b.offset; });
+        return stops;
+    }
+
+    rive::Font::ColorGlyphLayer makeClipLayer() const
+    {
+        rive::Font::ColorGlyphLayer layer;
+        layer.path = clipPath;
+        return layer;
+    }
+};
+
+static void paint_push_transform(hb_paint_funcs_t*,
+                                 void* paint_data,
+                                 float xx,
+                                 float yx,
+                                 float xy,
+                                 float yy,
+                                 float dx,
+                                 float dy,
+                                 void*)
+{
+    ((PaintState*)paint_data)->pushTransform(xx, yx, xy, yy, dx, dy);
+}
+
+static void paint_pop_transform(hb_paint_funcs_t*, void* paint_data, void*)
+{
+    ((PaintState*)paint_data)->popTransform();
+}
+
+static void paint_push_clip_glyph(hb_paint_funcs_t*,
+                                  void* paint_data,
+                                  hb_codepoint_t glyph,
+                                  hb_font_t*,
+                                  void*)
+{
+    ((PaintState*)paint_data)->pushClipGlyph(glyph);
+}
+
+static void paint_push_clip_rectangle(hb_paint_funcs_t*,
+                                      void*,
+                                      float,
+                                      float,
+                                      float,
+                                      float,
+                                      void*)
+{}
+
+static void paint_pop_clip(hb_paint_funcs_t*, void* paint_data, void*)
+{
+    ((PaintState*)paint_data)->hasClip = false;
+}
+
+static void paint_solid(hb_paint_funcs_t*,
+                        void* paint_data,
+                        hb_bool_t is_foreground,
+                        hb_color_t color,
+                        void*)
+{
+    auto* state = (PaintState*)paint_data;
+    if (!state->hasClip)
+        return;
+
+    auto layer = state->makeClipLayer();
+    layer.paintType = rive::Font::ColorGlyphPaintType::solid;
+    if (is_foreground)
+    {
+        layer.useForeground = true;
+        layer.color = state->foreground;
+    }
+    else
+    {
+        layer.color = hbColorToColorInt(color);
+    }
+    state->layers->push_back(std::move(layer));
+}
+
+static void paint_linear_gradient(hb_paint_funcs_t*,
+                                  void* paint_data,
+                                  hb_color_line_t* colorLine,
+                                  float x0,
+                                  float y0,
+                                  float x1,
+                                  float y1,
+                                  float x2,
+                                  float y2,
+                                  void*)
+{
+    auto* state = (PaintState*)paint_data;
+    if (!state->hasClip)
+        return;
+
+    auto layer = state->makeClipLayer();
+    layer.paintType = rive::Font::ColorGlyphPaintType::linearGradient;
+    layer.stops = PaintState::extractStops(colorLine, state->foreground);
+
+    // OpenType linear gradient uses 3 points: p0 (start), p1 (end), p2
+    // (rotation). The gradient line goes from p0 toward p1, and p2 is used
+    // to rotate the direction. For Rive we need a 2-point definition.
+    // The actual gradient direction is: start = p0, end = p1 projected
+    // along the p0->p2 direction. For simplicity, just use p0 and p1.
+    auto sp0 = state->mapPoint(x0, y0);
+    auto sp1 = state->mapPoint(x1, y1);
+    layer.x0 = sp0.x;
+    layer.y0 = sp0.y;
+    layer.x1 = sp1.x;
+    layer.y1 = sp1.y;
+
+    state->layers->push_back(std::move(layer));
+}
+
+static void paint_radial_gradient(hb_paint_funcs_t*,
+                                  void* paint_data,
+                                  hb_color_line_t* colorLine,
+                                  float x0,
+                                  float y0,
+                                  float radius0,
+                                  float x1,
+                                  float y1,
+                                  float radius1,
+                                  void*)
+{
+    auto* state = (PaintState*)paint_data;
+    if (!state->hasClip)
+        return;
+
+    auto layer = state->makeClipLayer();
+    layer.paintType = rive::Font::ColorGlyphPaintType::radialGradient;
+    layer.stops = PaintState::extractStops(colorLine, state->foreground);
+
+    auto sp0 = state->mapPoint(x0, y0);
+    auto sp1 = state->mapPoint(x1, y1);
+    layer.x0 = sp0.x;
+    layer.y0 = sp0.y;
+    layer.x1 = sp1.x;
+    layer.y1 = sp1.y;
+    layer.r0 = state->mapRadius(radius0);
+    layer.r1 = state->mapRadius(radius1);
+    layer.radialTransform =
+        state->glyphTransform() *
+        rive::Mat2D::fromScaleAndTranslation(radius1, radius1, x1, y1);
+
+    state->layers->push_back(std::move(layer));
+}
+
+static void paint_sweep_gradient(hb_paint_funcs_t*,
+                                 void* paint_data,
+                                 hb_color_line_t* colorLine,
+                                 float cx,
+                                 float cy,
+                                 float startAngle,
+                                 float endAngle,
+                                 void*)
+{
+    auto* state = (PaintState*)paint_data;
+    if (!state->hasClip)
+        return;
+
+    auto layer = state->makeClipLayer();
+    layer.paintType = rive::Font::ColorGlyphPaintType::sweepGradient;
+    layer.stops = PaintState::extractStops(colorLine, state->foreground);
+
+    auto sc = state->mapPoint(cx, cy);
+    layer.x0 = sc.x;
+    layer.y0 = sc.y;
+    layer.startAngle = startAngle;
+    layer.endAngle = endAngle;
+
+    state->layers->push_back(std::move(layer));
+}
+
+static void paint_push_group(hb_paint_funcs_t*, void*, void*) {}
+static void paint_pop_group(hb_paint_funcs_t*,
+                            void*,
+                            hb_paint_composite_mode_t,
+                            void*)
+{}
+
+static hb_bool_t paint_color_glyph(hb_paint_funcs_t*,
+                                   void*,
+                                   hb_codepoint_t,
+                                   hb_font_t*,
+                                   void*)
+{
+    return false;
+}
+
+static hb_bool_t paint_image(hb_paint_funcs_t*,
+                             void* paint_data,
+                             hb_blob_t* blob,
+                             unsigned int width,
+                             unsigned int height,
+                             hb_tag_t format,
+                             float slant,
+                             hb_glyph_extents_t* extents,
+                             void*)
+{
+    // We only support PNG images (SBIX / CBDT).
+    if (format != HB_TAG('p', 'n', 'g', ' '))
+    {
+        return false;
+    }
+
+    unsigned int length;
+    const char* data = hb_blob_get_data(blob, &length);
+    if (data == nullptr || length == 0)
+    {
+        return false;
+    }
+
+    auto* state = (PaintState*)paint_data;
+
+    rive::Font::ColorGlyphLayer layer;
+    layer.paintType = rive::Font::ColorGlyphPaintType::image;
+    layer.imageBytes.assign(reinterpret_cast<const uint8_t*>(data),
+                            reinterpret_cast<const uint8_t*>(data) + length);
+    layer.imageWidth = width;
+    layer.imageHeight = height;
+    if (extents != nullptr)
+    {
+        layer.imageBearingX = extents->x_bearing * gInvScale;
+        layer.imageBearingY = -extents->y_bearing * gInvScale;
+        layer.imageExtentX = extents->width * gInvScale;
+        layer.imageExtentY = -extents->height * gInvScale;
+    }
+
+    state->layers->push_back(std::move(layer));
+    return true;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+
 static rive::Font::LineMetrics make_lmx(hb_font_t* font)
 {
     // premable on font...
@@ -138,7 +602,27 @@ static rive::Font::LineMetrics make_lmx(hb_font_t* font)
 
     hb_font_extents_t extents;
     hb_font_get_h_extents(font, &extents);
-    return {-extents.ascender * gInvScale, -extents.descender * gInvScale};
+
+    // Cap height / x-height: distances from the baseline to the top of capital
+    // and lowercase letters, stored negative (up is -Y) to match ascent. We
+    // measure the 'H' and 'x' glyphs directly (their top-side bearing) rather
+    // than the OS/2 metrics, since the metrics API is compiled out of this
+    // HarfBuzz build (HB_NO_METRICS). Each falls back to the ascent for fonts
+    // without the reference glyph so vertical trim becomes a no-op at the top.
+    float ascent = -extents.ascender * gInvScale;
+    auto measureGlyphTop = [&](hb_codepoint_t unicode) -> float {
+        hb_codepoint_t glyph = 0;
+        hb_glyph_extents_t glyphExtents;
+        if (hb_font_get_nominal_glyph(font, unicode, &glyph) &&
+            hb_font_get_glyph_extents(font, glyph, &glyphExtents))
+        {
+            return -glyphExtents.y_bearing * gInvScale;
+        }
+        return ascent;
+    };
+    float capHeight = measureGlyphTop('H');
+    float xHeight = measureGlyphTop('x');
+    return {ascent, -extents.descender * gInvScale, capHeight, xHeight};
 }
 
 HBFont::HBFont(hb_font_t* font) : HBFont(font, {}, {}, {}) {}
@@ -175,11 +659,82 @@ HBFont::HBFont(hb_font_t* font,
                                       nullptr,
                                       nullptr);
     hb_draw_funcs_make_immutable(m_drawFuncs);
+
+    // Initialize COLRv1 paint funcs.
+    m_paintFuncs = hb_paint_funcs_create();
+    hb_paint_funcs_set_push_transform_func(m_paintFuncs,
+                                           paint_push_transform,
+                                           nullptr,
+                                           nullptr);
+    hb_paint_funcs_set_pop_transform_func(m_paintFuncs,
+                                          paint_pop_transform,
+                                          nullptr,
+                                          nullptr);
+    hb_paint_funcs_set_push_clip_glyph_func(m_paintFuncs,
+                                            paint_push_clip_glyph,
+                                            nullptr,
+                                            nullptr);
+    hb_paint_funcs_set_push_clip_rectangle_func(m_paintFuncs,
+                                                paint_push_clip_rectangle,
+                                                nullptr,
+                                                nullptr);
+    hb_paint_funcs_set_pop_clip_func(m_paintFuncs,
+                                     paint_pop_clip,
+                                     nullptr,
+                                     nullptr);
+    hb_paint_funcs_set_color_func(m_paintFuncs, paint_solid, nullptr, nullptr);
+    hb_paint_funcs_set_push_group_func(m_paintFuncs,
+                                       paint_push_group,
+                                       nullptr,
+                                       nullptr);
+    hb_paint_funcs_set_pop_group_func(m_paintFuncs,
+                                      paint_pop_group,
+                                      nullptr,
+                                      nullptr);
+    hb_paint_funcs_set_color_glyph_func(m_paintFuncs,
+                                        paint_color_glyph,
+                                        nullptr,
+                                        nullptr);
+    hb_paint_funcs_set_linear_gradient_func(m_paintFuncs,
+                                            paint_linear_gradient,
+                                            nullptr,
+                                            nullptr);
+    hb_paint_funcs_set_radial_gradient_func(m_paintFuncs,
+                                            paint_radial_gradient,
+                                            nullptr,
+                                            nullptr);
+    hb_paint_funcs_set_sweep_gradient_func(m_paintFuncs,
+                                           paint_sweep_gradient,
+                                           nullptr,
+                                           nullptr);
+    hb_paint_funcs_set_image_func(m_paintFuncs, paint_image, nullptr, nullptr);
+    hb_paint_funcs_make_immutable(m_paintFuncs);
+
+    // Initialize color glyph (COLR/CPAL/SBIX/CBDT) support.
+    hb_face_t* face = hb_font_get_face(font);
+    m_hasColorLayers = hb_ot_color_has_layers(face);
+    m_hasColorPaint = hb_ot_color_has_paint(face);
+    m_hasPNG = hb_ot_color_has_png(face);
+    if (m_hasColorLayers || m_hasColorPaint)
+    {
+        unsigned int colorCount = 0;
+        hb_ot_color_palette_get_colors(face, 0, 0, &colorCount, nullptr);
+        if (colorCount > 0)
+        {
+            m_paletteColors.resize(colorCount);
+            hb_ot_color_palette_get_colors(face,
+                                           0,
+                                           0,
+                                           &colorCount,
+                                           m_paletteColors.data());
+        }
+    }
 }
 
 HBFont::~HBFont()
 {
     hb_draw_funcs_destroy(m_drawFuncs);
+    hb_paint_funcs_destroy(m_paintFuncs);
     hb_font_destroy(m_font);
 }
 
@@ -382,6 +937,166 @@ rive::RawPath HBFont::getPath(rive::GlyphID glyph) const
     rive::RawPath rpath;
     hb_font_draw_glyph(m_font, glyph, m_drawFuncs, &rpath);
     return rpath;
+}
+
+bool HBFont::hasColorGlyphs() const
+{
+    return m_hasColorLayers || m_hasColorPaint || m_hasPNG;
+}
+
+bool HBFont::isColorGlyph(rive::GlyphID glyph) const
+{
+    if (!m_hasColorLayers && !m_hasColorPaint && !m_hasPNG)
+    {
+        return false;
+    }
+    hb_face_t* face = hb_font_get_face(m_font);
+    // Check COLRv0 layers first.
+    if (m_hasColorLayers)
+    {
+        unsigned int total =
+            hb_ot_color_glyph_get_layers(face, glyph, 0, nullptr, nullptr);
+        if (total > 0)
+        {
+            return true;
+        }
+    }
+    // Check COLRv1 paint.
+    if (m_hasColorPaint)
+    {
+        if (hb_ot_color_glyph_has_paint(face, glyph))
+        {
+            return true;
+        }
+    }
+    // Check SBIX/CBDT PNG.
+    if (m_hasPNG)
+    {
+        hb_blob_t* blob = hb_ot_color_glyph_reference_png(m_font, glyph);
+        if (blob != nullptr)
+        {
+            bool has = hb_blob_get_length(blob) > 0;
+            hb_blob_destroy(blob);
+            return has;
+        }
+    }
+    return false;
+}
+
+size_t HBFont::getColorLayers(rive::GlyphID glyph,
+                              std::vector<ColorGlyphLayer>& out,
+                              rive::ColorInt foreground) const
+{
+    if (!m_hasColorLayers && !m_hasColorPaint && !m_hasPNG)
+    {
+        return 0;
+    }
+
+    // Check cache first.
+    auto cacheIt = m_colorLayerCache.find(glyph);
+    if (cacheIt != m_colorLayerCache.end())
+    {
+        // Copy from cache, but update foreground colors.
+        for (ColorGlyphLayer layer : cacheIt->second)
+        {
+            if (layer.useForeground)
+            {
+                layer.color = foreground;
+            }
+            for (auto& stop : layer.stops)
+            {
+                if (stop.isForeground)
+                {
+                    stop.color = foreground;
+                }
+            }
+            out.push_back(std::move(layer));
+        }
+        return cacheIt->second.size();
+    }
+
+    std::vector<ColorGlyphLayer> layers;
+    hb_face_t* face = hb_font_get_face(m_font);
+
+    // Try COLRv0 first.
+    if (m_hasColorLayers)
+    {
+        unsigned int layerCount =
+            hb_ot_color_glyph_get_layers(face, glyph, 0, nullptr, nullptr);
+        if (layerCount > 0)
+        {
+            std::vector<hb_ot_color_layer_t> hbLayers(layerCount);
+            hb_ot_color_glyph_get_layers(face,
+                                         glyph,
+                                         0,
+                                         &layerCount,
+                                         hbLayers.data());
+
+            layers.reserve(layerCount);
+            for (unsigned int i = 0; i < layerCount; i++)
+            {
+                ColorGlyphLayer layer;
+                hb_font_draw_glyph(m_font,
+                                   hbLayers[i].glyph,
+                                   m_drawFuncs,
+                                   &layer.path);
+                if (hbLayers[i].color_index == 0xFFFF)
+                {
+                    layer.useForeground = true;
+                    layer.color = foreground;
+                }
+                else
+                {
+                    layer.useForeground = false;
+                    if (hbLayers[i].color_index < m_paletteColors.size())
+                    {
+                        layer.color = hbColorToColorInt(
+                            m_paletteColors[hbLayers[i].color_index]);
+                    }
+                    else
+                    {
+                        layer.color = 0xFF000000;
+                    }
+                }
+                layers.push_back(std::move(layer));
+            }
+        }
+    }
+
+    // Fall back to COLRv1 paint if no COLRv0 layers found.
+    if (layers.empty() && (m_hasColorPaint || m_hasPNG))
+    {
+        // hb_font_paint_glyph handles both COLRv1 and SBIX/CBDT.
+        // For COLRv1 it calls paint_solid/gradient callbacks;
+        // for SBIX/CBDT it calls paint_image.
+        PaintState state;
+        state.font = m_font;
+        state.drawFuncs = m_drawFuncs;
+        state.layers = &layers;
+        state.foreground = foreground;
+
+        hb_font_paint_glyph(m_font,
+                            glyph,
+                            m_paintFuncs,
+                            &state,
+                            0,                       // palette_index
+                            HB_COLOR(0, 0, 0, 255)); // foreground
+    }
+
+    if (layers.empty())
+    {
+        return 0;
+    }
+
+    size_t count = layers.size();
+    // Cache the result.
+    m_colorLayerCache[glyph] = layers;
+    // Move into output.
+    for (auto& layer : layers)
+    {
+        out.push_back(std::move(layer));
+    }
+    return count;
 }
 
 ///////////////////////////////////////////////////////////
@@ -702,6 +1417,34 @@ rive::SimpleArray<rive::Paragraph> HBFont::onShapeText(
         {
             auto gr = shape_run(&text[unicharIndex], tr, unicharIndex);
             unicharIndex += tr.unicharCount;
+
+            // Handle dual-presentation characters (e.g. ☠ U+2620) that have a
+            // text-form glyph in the current font but are followed by U+FE0F
+            // (VARIATION SELECTOR-16), which requests emoji presentation.
+            // The standard fallback only fires for glyph ID 0, so we explicitly
+            // force such glyphs to 0 here — but only when a color emoji
+            // fallback font is actually available for that codepoint, to avoid
+            // regressing the rendering when no emoji font is loaded.
+            if (gFallbackProc && gFallbackProcEnabled && !hasColorGlyphs())
+            {
+                for (size_t gi = 0; gi < gr.glyphs.size(); ++gi)
+                {
+                    if (gr.glyphs[gi] != 0)
+                    {
+                        auto textPos = gr.textIndices[gi];
+                        if (textPos + 1 < text.size() &&
+                            text[textPos + 1] == 0xFE0F)
+                        {
+                            auto emojiFont =
+                                gFallbackProc(text[textPos], 0, this);
+                            if (emojiFont && emojiFont->hasColorGlyphs())
+                            {
+                                gr.glyphs[gi] = 0;
+                            }
+                        }
+                    }
+                }
+            }
 
             auto end = gr.glyphs.end();
             auto iter = std::find(gr.glyphs.begin(), end, 0);

@@ -13,21 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 506;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DashPathBase::typeKey:
-            case ContainerComponentBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t offsetPropertyKey = 690;
@@ -45,8 +30,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     inline bool offsetIsPercentage() const { return m_OffsetIsPercentage; }
@@ -56,8 +43,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetIsPercentagePropertyKey,
+                             &m_OffsetIsPercentage,
+                             &value);
         m_OffsetIsPercentage = value;
-        offsetIsPercentageChanged();
+        RIVE_EDITOR_CHANGED(offsetIsPercentageChanged());
+        notifyPropertyChanged(offsetIsPercentagePropertyKey);
     }
 
     Core* clone() const override;
@@ -85,6 +76,9 @@ public:
 protected:
     virtual void offsetChanged() {}
     virtual void offsetIsPercentageChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/paint/dash_path_ext.inl"
+#endif
 };
 } // namespace rive
 

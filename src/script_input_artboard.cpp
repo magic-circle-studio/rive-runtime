@@ -25,10 +25,7 @@ StatusCode ScriptInputArtboard::import(ImportStack& importStack)
     {
         return StatusCode::MissingObject;
     }
-    backboardImporter->addArtboardReferencer(this);
-
-    auto importer =
-        importStack.latest<ScriptedObjectImporter>(ScriptedDrawable::typeKey);
+    auto importer = ScriptInput::ownerImporter(importStack, this);
     if (importer == nullptr)
     {
         return StatusCode::MissingObject;
@@ -38,10 +35,17 @@ StatusCode ScriptInputArtboard::import(ImportStack& importStack)
     auto obj = scriptedObject();
     if (obj && obj->component() != nullptr)
     {
-        // If the ScriptedObject is a Component, we need the ArtboardImporter
-        // to add it as a Component, otherwise, return Ok
-        return Super::import(importStack);
+        // If the ScriptedObject is a Component, this input is an artboard
+        // child (File::readObjects gave it a slot, see takesArtboardSlot), so
+        // import it as a Component, otherwise, return Ok
+        StatusCode code = Super::import(importStack);
+        if (code != StatusCode::Ok)
+        {
+            return code;
+        }
     }
+    // Registered last, and only once this object is certain to survive.
+    backboardImporter->addArtboardReferencer(this);
     return StatusCode::Ok;
 }
 
@@ -49,6 +53,19 @@ void ScriptInputArtboard::initScriptedValue()
 {
     ScriptInput::initScriptedValue();
     syncReferencedArtboard();
+}
+
+bool ScriptInputArtboard::validateForColdScriptInit() { return true; }
+
+bool ScriptInputArtboard::validateHydrationPrerequisites()
+{
+    return m_referencedArtboard != nullptr;
+}
+
+bool ScriptInputArtboard::hydrateScriptInput()
+{
+    initScriptedValue();
+    return m_referencedArtboard != nullptr;
 }
 
 void ScriptInputArtboard::syncReferencedArtboard()

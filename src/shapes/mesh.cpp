@@ -1,5 +1,5 @@
 #include "rive/shapes/mesh.hpp"
-#include "rive/shapes/image.hpp"
+#include "rive/shapes/mesh_host.hpp"
 #include "rive/shapes/vertex.hpp"
 #include "rive/shapes/mesh_vertex.hpp"
 #include "rive/bones/skin.hpp"
@@ -32,27 +32,33 @@ StatusCode Mesh::onAddedDirty(CoreContext* context)
         return result;
     }
 
-    if (!parent()->is<Image>())
+    MeshHost* host = MeshHost::from(parent());
+    if (host == nullptr)
     {
         return StatusCode::MissingObject;
     }
 
-    // All good, tell the image it has a mesh.
-    parent()->as<Image>()->setMesh(this);
+#ifndef WITH_RIVE_EDITOR
+    // Runtime-only; editor build registers via editorParentChanged.
+    host->setMesh(this);
+#endif
 
     return StatusCode::Ok;
 }
 
 StatusCode Mesh::onAddedClean(CoreContext* context)
 {
-    // Make sure Core found indices in the file for this Mesh.
+#ifndef WITH_RIVE_EDITOR
+    // Runtime .riv loads: indices must be present and in range.
+    // Editor mode: UAT coop batches don't transmit triangle indices —
+    // editor computes them separately (mirrors Dart's
+    // `packages/rive_core/lib/shapes/mesh.dart:252` onAdded →
+    // triangulate()). Skip the validation so editor-side Meshes load
+    // cleanly; bounds correctness is the editor's responsibility.
     if (m_IndexBuffer == nullptr)
     {
         return StatusCode::InvalidObject;
     }
-
-    // Check the indices are all in range. We should consider having a better
-    // error reporting system to the implementor.
     for (auto index : *m_IndexBuffer)
     {
         if (index >= m_Vertices.size())
@@ -60,6 +66,7 @@ StatusCode Mesh::onAddedClean(CoreContext* context)
             return StatusCode::InvalidObject;
         }
     }
+#endif
     return Super::onAddedClean(context);
 }
 
@@ -86,13 +93,11 @@ void Mesh::markSkinDirty() { addDirt(ComponentDirt::Vertices); }
 
 Core* Mesh::clone() const
 {
-    auto factory = artboard()->factory();
     auto clone = static_cast<Mesh*>(MeshBase::clone());
     clone->m_VertexRenderBufferDirty = true;
-    clone->m_VertexRenderBuffer =
-        factory->makeRenderBuffer(RenderBufferType::vertex,
-                                  RenderBufferFlags::none,
-                                  m_Vertices.size() * sizeof(Vec2D));
+    // The vertex buffer is created lazily at first draw so it lands on the
+    // instance's factory, not the source artboard's. UV and index buffers
+    // are immutable and shared across instances.
     clone->m_UVRenderBuffer = m_UVRenderBuffer;
     clone->m_IndexRenderBuffer = m_IndexRenderBuffer;
     return clone;
@@ -100,16 +105,25 @@ Core* Mesh::clone() const
 
 void Mesh::onAssetLoaded(RenderImage* renderImage)
 {
-    Mat2D uvTransform =
-        renderImage != nullptr ? renderImage->uvTransform() : Mat2D();
-
     auto factory = artboard()->factory();
     m_VertexRenderBufferDirty = true;
     m_VertexRenderBuffer =
         factory->makeRenderBuffer(RenderBufferType::vertex,
                                   RenderBufferFlags::none,
                                   m_Vertices.size() * sizeof(Vec2D));
+    buildUVAndIndexBuffers(renderImage != nullptr ? renderImage->uvTransform()
+                                                  : Mat2D());
+}
 
+void Mesh::uvTransformChanged(const Mat2D& uvTransform)
+{
+    // New buffers: clone() shares UVs and indices with other instances.
+    buildUVAndIndexBuffers(uvTransform);
+}
+
+void Mesh::buildUVAndIndexBuffers(const Mat2D& uvTransform)
+{
+    auto factory = artboard()->factory();
     m_UVRenderBuffer =
         factory->makeRenderBuffer(RenderBufferType::vertex,
                                   RenderBufferFlags::mappedOnceAtInitialization,
@@ -176,8 +190,17 @@ void Mesh::draw(Renderer* renderer,
                 const RenderImage* image,
                 ImageSampler ImageSampler,
                 BlendMode blendMode,
-                float opacity)
+                float opacity,
+                float additiveness)
 {
+    if (m_VertexRenderBufferDirty && m_VertexRenderBuffer == nullptr &&
+        !m_Vertices.empty())
+    {
+        m_VertexRenderBuffer = artboard()->factory()->makeRenderBuffer(
+            RenderBufferType::vertex,
+            RenderBufferFlags::none,
+            m_Vertices.size() * sizeof(Vec2D));
+    }
     if (m_VertexRenderBufferDirty && m_VertexRenderBuffer != nullptr)
     {
         Vec2D* mappedVertices =
@@ -196,8 +219,11 @@ void Mesh::draw(Renderer* renderer,
 
     if (skin() == nullptr)
     {
+        MeshHost* host = MeshHost::from(parent());
         renderer->transform(
-            parent()->as<WorldTransformComponent>()->worldTransform());
+            host != nullptr
+                ? host->meshHostWorldTransform()
+                : parent()->as<WorldTransformComponent>()->worldTransform());
     }
     renderer->drawImageMesh(image,
                             ImageSampler,
@@ -207,5 +233,6 @@ void Mesh::draw(Renderer* renderer,
                             static_cast<uint32_t>(m_Vertices.size()),
                             static_cast<uint32_t>(m_IndexBuffer->size()),
                             blendMode,
-                            opacity);
+                            opacity,
+                            additiveness);
 }

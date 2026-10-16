@@ -12,23 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 83;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TransformConstraintBase::typeKey:
-            case TransformSpaceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t originXPropertyKey = 372;
@@ -46,8 +29,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(originXPropertyKey, &m_OriginX, &value);
         m_OriginX = value;
-        originXChanged();
+        RIVE_EDITOR_CHANGED(originXChanged());
+        notifyPropertyChanged(originXPropertyKey);
     }
 
     inline float originY() const { return m_OriginY; }
@@ -57,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(originYPropertyKey, &m_OriginY, &value);
         m_OriginY = value;
-        originYChanged();
+        RIVE_EDITOR_CHANGED(originYChanged());
+        notifyPropertyChanged(originYPropertyKey);
     }
 
     Core* clone() const override;
@@ -86,6 +73,9 @@ public:
 protected:
     virtual void originXChanged() {}
     virtual void originYChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/transform_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

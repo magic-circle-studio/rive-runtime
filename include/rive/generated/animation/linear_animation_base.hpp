@@ -4,6 +4,9 @@
 #include "rive/core/field_types/core_bool_type.hpp"
 #include "rive/core/field_types/core_double_type.hpp"
 #include "rive/core/field_types/core_uint_type.hpp"
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/editor_field_types.hpp"
+#endif
 namespace rive
 {
 class LinearAnimationBase : public Animation
@@ -13,20 +16,6 @@ protected:
 
 public:
     static const uint16_t typeKey = 31;
-
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case LinearAnimationBase::typeKey:
-            case AnimationBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
 
     uint16_t coreType() const override { return typeKey; }
 
@@ -57,8 +46,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(fpsPropertyKey, &m_Fps, &value);
         m_Fps = value;
-        fpsChanged();
+        notifyPropertyChanged(fpsPropertyKey);
     }
 
     inline uint32_t duration() const { return m_Duration; }
@@ -68,8 +58,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(durationPropertyKey, &m_Duration, &value);
         m_Duration = value;
-        durationChanged();
+        RIVE_EDITOR_CHANGED(durationChanged());
+        notifyPropertyChanged(durationPropertyKey);
     }
 
     inline float speed() const { return m_Speed; }
@@ -79,8 +71,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(speedPropertyKey, &m_Speed, &value);
         m_Speed = value;
-        speedChanged();
+        notifyPropertyChanged(speedPropertyKey);
     }
 
     inline uint32_t loopValue() const { return m_LoopValue; }
@@ -90,8 +83,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(loopValuePropertyKey, &m_LoopValue, &value);
         m_LoopValue = value;
-        loopValueChanged();
+        notifyPropertyChanged(loopValuePropertyKey);
     }
 
     inline uint32_t workStart() const { return m_WorkStart; }
@@ -101,8 +95,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(workStartPropertyKey, &m_WorkStart, &value);
         m_WorkStart = value;
-        workStartChanged();
+        notifyPropertyChanged(workStartPropertyKey);
     }
 
     inline uint32_t workEnd() const { return m_WorkEnd; }
@@ -112,8 +107,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(workEndPropertyKey, &m_WorkEnd, &value);
         m_WorkEnd = value;
-        workEndChanged();
+        notifyPropertyChanged(workEndPropertyKey);
     }
 
     inline bool enableWorkArea() const { return m_EnableWorkArea; }
@@ -123,8 +119,11 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(enableWorkAreaPropertyKey,
+                             &m_EnableWorkArea,
+                             &value);
         m_EnableWorkArea = value;
-        enableWorkAreaChanged();
+        notifyPropertyChanged(enableWorkAreaPropertyKey);
     }
 
     inline bool quantize() const { return m_Quantize; }
@@ -134,8 +133,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(quantizePropertyKey, &m_Quantize, &value);
         m_Quantize = value;
-        quantizeChanged();
+        notifyPropertyChanged(quantizePropertyKey);
     }
 
     Core* clone() const override;
@@ -149,6 +149,7 @@ public:
         m_WorkEnd = object.m_WorkEnd;
         m_EnableWorkArea = object.m_EnableWorkArea;
         m_Quantize = object.m_Quantize;
+        RIVE_EDITOR_COPY(object);
         Animation::copy(object);
     }
 
@@ -181,18 +182,15 @@ public:
                 m_Quantize = CoreBoolType::deserialize(reader);
                 return true;
         }
+        RIVE_EDITOR_DESERIALIZE(propertyKey, reader);
         return Animation::deserialize(propertyKey, reader);
     }
 
 protected:
-    virtual void fpsChanged() {}
     virtual void durationChanged() {}
-    virtual void speedChanged() {}
-    virtual void loopValueChanged() {}
-    virtual void workStartChanged() {}
-    virtual void workEndChanged() {}
-    virtual void enableWorkAreaChanged() {}
-    virtual void quantizeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/animation/linear_animation_ext.inl"
+#endif
 };
 } // namespace rive
 

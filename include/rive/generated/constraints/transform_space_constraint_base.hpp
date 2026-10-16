@@ -12,22 +12,6 @@ protected:
 public:
     static const uint16_t typeKey = 90;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TransformSpaceConstraintBase::typeKey:
-            case TargetedConstraintBase::typeKey:
-            case ConstraintBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t sourceSpaceValuePropertyKey = 179;
@@ -45,8 +29,11 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(sourceSpaceValuePropertyKey,
+                             &m_SourceSpaceValue,
+                             &value);
         m_SourceSpaceValue = value;
-        sourceSpaceValueChanged();
+        notifyPropertyChanged(sourceSpaceValuePropertyKey);
     }
 
     inline uint32_t destSpaceValue() const { return m_DestSpaceValue; }
@@ -56,8 +43,11 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(destSpaceValuePropertyKey,
+                             &m_DestSpaceValue,
+                             &value);
         m_DestSpaceValue = value;
-        destSpaceValueChanged();
+        notifyPropertyChanged(destSpaceValuePropertyKey);
     }
 
     void copy(const TransformSpaceConstraintBase& object)
@@ -82,8 +72,9 @@ public:
     }
 
 protected:
-    virtual void sourceSpaceValueChanged() {}
-    virtual void destSpaceValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/constraints/transform_space_constraint_ext.inl"
+#endif
 };
 } // namespace rive
 

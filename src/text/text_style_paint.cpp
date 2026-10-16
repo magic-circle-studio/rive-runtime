@@ -2,6 +2,8 @@
 #include "rive/text/text.hpp"
 #include "rive/text/text_variation_helper.hpp"
 #include "rive/shapes/paint/shape_paint.hpp"
+#include "rive/shapes/paint/fill.hpp"
+#include "rive/shapes/paint/solid_color.hpp"
 #include "rive/shapes/paint/feather.hpp"
 #include "rive/artboard.hpp"
 #include "rive/factory.hpp"
@@ -54,7 +56,8 @@ void TextStylePaint::draw(Renderer* renderer, const Mat2D& worldTransform)
         {
             continue;
         }
-        shapePaint->blendMode(parent()->as<Text>()->blendMode());
+        shapePaint->blendMode(parent()->as<Text>()->blendMode(),
+                              parent()->as<Text>()->additiveAmount());
 
         // For blend modes to work, opaque paths render first
         auto itr = m_opacityPaths.find(1.0f);
@@ -84,10 +87,11 @@ void TextStylePaint::draw(Renderer* renderer, const Mat2D& worldTransform)
             }
             RenderPaint* renderPaint = m_paintPool[paintIndex++].get();
             shapePaint->applyTo(renderPaint, itr->first);
-            if (auto feather = shapePaint->feather())
-            {
-                renderPaint->feather(feather->strength());
-            }
+            // Pooled paints are shared across shape paints; always set feather
+            // so one paint's feather doesn't leak into the others.
+            auto feather = shapePaint->feather();
+            renderPaint->feather(feather != nullptr ? feather->strength()
+                                                    : 0.0f);
             ShapePaintPath& path = itr->second;
             shapePaint->draw(renderer,
                              &path,
@@ -96,6 +100,20 @@ void TextStylePaint::draw(Renderer* renderer, const Mat2D& worldTransform)
                              renderPaint);
         }
     }
+}
+
+ColorInt TextStylePaint::foregroundColor() const
+{
+    for (auto shapePaint : m_ShapePaints)
+    {
+        if (shapePaint->is<Fill>() && shapePaint->paint()->is<SolidColor>())
+        {
+            return (ColorInt)shapePaint->paint()
+                ->as<SolidColor>()
+                ->colorValue();
+        }
+    }
+    return 0xFF000000;
 }
 
 const Mat2D& TextStylePaint::shapeWorldTransform() const

@@ -2,6 +2,7 @@
 #include "rive/data_bind/data_values/data_value_asset_image.hpp"
 #include "rive/generated/core_registry.hpp"
 #include "rive/file.hpp"
+#include "rive/shapes/paint/paint_image.hpp"
 
 using namespace rive;
 
@@ -10,10 +11,10 @@ DataBindContextValueAssetImage::DataBindContextValueAssetImage(
     DataBindContextValue(dataBind)
 {}
 
-rcp<ImageAsset> DataBindContextValueAssetImage::fileAsset()
+rcp<ImageAsset> DataBindContextValueAssetImage::fileAsset(DataBind* dataBind)
 {
-    auto file = m_dataBind->file();
-    auto source = m_dataBind->source();
+    auto file = dataBind->file();
+    auto source = dataBind->source();
     if (file != nullptr && source != nullptr &&
         source->is<ViewModelInstanceAssetImage>())
     {
@@ -30,25 +31,44 @@ rcp<ImageAsset> DataBindContextValueAssetImage::fileAsset()
 
 void DataBindContextValueAssetImage::apply(Core* target,
                                            uint32_t propertyKey,
-                                           bool isMainDirection)
+                                           bool isMainDirection,
+                                           DataBind* dataBind)
 {
     if (target->is<Image>())
     {
-        auto asset = fileAsset();
+        auto source = dataBind->source()->as<ViewModelInstanceAssetImage>();
+        auto image = target->as<Image>();
+        image->surfaceMaterial(source->surfaceMaterial());
+        auto asset = fileAsset(dataBind);
         if (asset != nullptr)
         {
-            target->as<Image>()->setAsset(asset);
+            image->setAsset(asset);
         }
         else
         {
-            auto source = m_dataBind->source();
-            target->as<Image>()->setAsset(
+            image->setAsset(source->asset());
+        }
+    }
+    else if (target->is<PaintImage>())
+    {
+        // A fill/stroke painted with an image binds through its PaintImage
+        // child: same asset-referencer path as Image, so the bound image
+        // modulates the parent paint.
+        auto asset = fileAsset(dataBind);
+        if (asset != nullptr)
+        {
+            target->as<PaintImage>()->setAsset(asset);
+        }
+        else
+        {
+            auto source = dataBind->source();
+            target->as<PaintImage>()->setAsset(
                 source->as<ViewModelInstanceAssetImage>()->asset());
         }
     }
     else if (target->is<BindablePropertyAsset>())
     {
-        auto source = m_dataBind->source();
+        auto source = dataBind->source();
         target->as<BindablePropertyAsset>()->imageValue(
             source->as<ViewModelInstanceAssetImage>()->asset()->renderImage());
         CoreRegistry::setUint(
@@ -56,9 +76,24 @@ void DataBindContextValueAssetImage::apply(Core* target,
             propertyKey,
             source->as<ViewModelInstanceAssetImage>()->propertyValue());
     }
+    else if (target->is<ViewModelInstanceAssetImage>())
+    {
+        auto source = dataBind->source()->as<ViewModelInstanceAssetImage>();
+        auto image = target->as<ViewModelInstanceAssetImage>();
+        image->setSurfaceMaterial(source->surfaceMaterial());
+        auto sourceValue = source->propertyValue();
+        if (sourceValue == static_cast<uint32_t>(-1))
+        {
+            image->value(source->asset()->renderImage());
+        }
+        else
+        {
+            CoreRegistry::setUint(target, propertyKey, sourceValue);
+        }
+    }
     else
     {
-        auto source = m_dataBind->source();
+        auto source = dataBind->source();
         CoreRegistry::setUint(
             target,
             propertyKey,

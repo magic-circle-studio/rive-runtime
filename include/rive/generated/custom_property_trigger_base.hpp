@@ -13,21 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 613;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case CustomPropertyTriggerBase::typeKey:
-            case CustomPropertyBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t firePropertyKey = 869;
@@ -46,8 +31,12 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(propertyValuePropertyKey,
+                             &m_PropertyValue,
+                             &value);
         m_PropertyValue = value;
-        propertyValueChanged();
+        RIVE_EDITOR_CHANGED(propertyValueChanged());
+        notifyPropertyChanged(propertyValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -70,6 +59,9 @@ public:
 
 protected:
     virtual void propertyValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/custom_property_trigger_ext.inl"
+#endif
 };
 } // namespace rive
 

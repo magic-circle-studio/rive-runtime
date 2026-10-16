@@ -20,8 +20,11 @@ public:
     void cap(StrokeCap value) override {}
     void blendMode(BlendMode value) override {}
     void shader(rcp<RenderShader>) override {}
+    void shaderTransform(const Mat2D& transform) override {}
     void invalidateStroke() override {}
     void feather(float value) override {}
+    void modulatedImage(const RenderImage*, ImageSampler, const Mat2D&) override
+    {}
 };
 
 class NoOpRenderPath : public RenderPath
@@ -31,7 +34,8 @@ public:
 
     void fillRule(FillRule value) override {}
     void addPath(CommandPath* path, const Mat2D& transform) override {}
-    void addRenderPath(RenderPath* path, const Mat2D& transform) override {}
+    void addRenderPath(const RenderPath* path, const Mat2D& transform) override
+    {}
 
     void moveTo(float x, float y) override {}
     void lineTo(float x, float y) override {}

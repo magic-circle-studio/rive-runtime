@@ -61,6 +61,13 @@ public:
         input->copyValue(animationData->to);
         input->copyValue(m_currentValue);
     }
+    void resetToStart(DataValue* input)
+    {
+        resetValues(input);
+        m_isSmoothingAnimation = false;
+        m_animationDataA.elapsedSeconds = 0;
+        m_animationDataB.elapsedSeconds = 0;
+    }
     void reset()
     {
         dispose();
@@ -120,6 +127,7 @@ public:
     DataValue* convert(DataValue* value, DataBind* dataBind) override;
     DataValue* reverseConvert(DataValue* value, DataBind* dataBind) override;
     bool advance(float elapsedTime) override;
+    bool mayAdvance() const override { return true; }
     void reset() override;
     void copy(const DataConverterInterpolatorBase& object);
     void durationChanged() override;

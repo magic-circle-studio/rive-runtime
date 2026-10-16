@@ -13,22 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 547;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TextFollowPathModifierBase::typeKey:
-            case TextTargetModifierBase::typeKey:
-            case TextModifierBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t radialPropertyKey = 779;
@@ -54,8 +38,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(radialPropertyKey, &m_Radial, &value);
         m_Radial = value;
-        radialChanged();
+        RIVE_EDITOR_CHANGED(radialChanged());
+        notifyPropertyChanged(radialPropertyKey);
     }
 
     inline bool orient() const { return m_Orient; }
@@ -65,8 +51,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(orientPropertyKey, &m_Orient, &value);
         m_Orient = value;
-        orientChanged();
+        RIVE_EDITOR_CHANGED(orientChanged());
+        notifyPropertyChanged(orientPropertyKey);
     }
 
     inline float start() const { return m_Start; }
@@ -76,8 +64,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(startPropertyKey, &m_Start, &value);
         m_Start = value;
-        startChanged();
+        RIVE_EDITOR_CHANGED(startChanged());
+        notifyPropertyChanged(startPropertyKey);
     }
 
     inline float end() const { return m_End; }
@@ -87,8 +77,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(endPropertyKey, &m_End, &value);
         m_End = value;
-        endChanged();
+        RIVE_EDITOR_CHANGED(endChanged());
+        notifyPropertyChanged(endPropertyKey);
     }
 
     inline float strength() const { return m_Strength; }
@@ -98,8 +90,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(strengthPropertyKey, &m_Strength, &value);
         m_Strength = value;
-        strengthChanged();
+        RIVE_EDITOR_CHANGED(strengthChanged());
+        notifyPropertyChanged(strengthPropertyKey);
     }
 
     inline float offset() const { return m_Offset; }
@@ -109,8 +103,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     Core* clone() const override;
@@ -158,6 +154,9 @@ protected:
     virtual void endChanged() {}
     virtual void strengthChanged() {}
     virtual void offsetChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/text/text_follow_path_modifier_ext.inl"
+#endif
 };
 } // namespace rive
 

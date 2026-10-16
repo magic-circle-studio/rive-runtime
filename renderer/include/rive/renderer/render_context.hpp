@@ -7,14 +7,22 @@
 #include "rive/math/vec2d.hpp"
 #include "rive/renderer/gpu.hpp"
 #include "rive/renderer/rive_render_factory.hpp"
+#ifdef RIVE_CANVAS
+#include "rive/renderer/render_canvas.hpp"
+#include "rive/renderer/ore/ore_context.hpp"
+#endif
 #include "rive/renderer/render_target.hpp"
+#include "rive/renderer/shader_compilation_mode.hpp"
 #include "rive/renderer/sk_rectanizer_skyline.hpp"
 #include "rive/renderer/trivial_block_allocator.hpp"
+#include "rive/renderer/triangulation_controller.hpp"
 #include "rive/shapes/paint/color.hpp"
+#include <algorithm>
+#include <atomic>
 #include <array>
 #include <unordered_map>
 
-class PushRetrofittedTrianglesGMDraw;
+class PushRetrofitTriStripsGMDraw;
 class RenderContextTest;
 
 namespace rive
@@ -29,22 +37,13 @@ namespace rive::gpu
 class GradientLibrary;
 class IntersectionBoard;
 class ImageMeshDraw;
+class ImageMeshInstancedDraw;
 class ImageRectDraw;
-class StencilClipReset;
+class ClipReset;
 class Draw;
 class Gradient;
 class RenderContextImpl;
 class PathDraw;
-
-enum class ShaderCompilationMode
-{
-    allowAsynchronous,
-    alwaysSynchronous,
-    onlyUbershaders,
-
-    // The default mode is to allow asynchronous compilation where available.
-    standard = allowAsynchronous,
-};
 
 // Various types of ordered dithering we can add to reduce banding
 // https://en.wikipedia.org/wiki/Ordered_dithering
@@ -108,19 +107,24 @@ public:
         uint32_t renderTargetHeight = 0;
         LoadAction loadAction = LoadAction::clear;
         ColorInt clearColor = 0;
-        // If nonzero, the number of MSAA samples to use.
-        // Setting this to a nonzero value forces msaa mode.
+        // If nonzero, this forces depthStencil mode and specifies the number of
+        // samples to use:
+        //    0 => RenderContext chooses its preferred interlockMode
+        //    1 => depthStencil without MSAA
+        //   >1 => MSAA via depthStencil
         uint32_t msaaSampleCount = 0;
-        // Use atomic mode (preferred) or msaa instead of rasterOrdering.
+        // Use atomic mode (preferred) or depthStencil instead of
+        // rasterOrdering.
         bool disableRasterOrdering = false;
         DitherMode ditherMode = DitherMode::interleavedGradientNoise;
+        TriangulationThresholds triangulationThresholds;
 
         // If nonzero, frames are split up into virtual tiles of this size.
         //
         // As of now, each tile gets drawn in a separate render pass. The
         // purpose of these virtual tiles, for now, is to break the frame up
         // into smaller chunks so that Rive can be pre-empted by other rendering
-        // processes. This is only supported on Vulkan/non-msaa.
+        // processes. This is only supported on Vulkan/non-depthStencil.
         //
         // TODO: We could also explore a different type of virtual tiling that
         // reduces barriers in atomic mode, but that is not how this feature
@@ -135,6 +139,10 @@ public:
         // Override all paths' fill rules (winding or even/odd) to emulate
         // clockwiseAtomic mode.
         bool clockwiseFillOverride = false;
+        // When msaaSampleCount == 1 (depthStencil w/o MSAA), strokes get
+        // analytic antialiasing by bleeding out 1/2 pixel, regardless of the
+        // view matrix. (Fills are not antialiased yet.) Ignored otherwise.
+        bool inkbleedOverride = false;
 #ifdef WITH_RIVE_TOOLS
         // Synthesize compilation failures to make sure the device handles them
         // gracefully. (e.g., by falling back on an uber shader or at least not
@@ -151,6 +159,14 @@ public:
     // All rendering related calls must be made between beginFrame() and
     // flush().
     void beginFrame(const FrameDescriptor&);
+
+    // Decides which filled paths get an interior triangulation, under the
+    // budget in FrameDescriptor::triangulationThresholds. It is live-tuned
+    // across frames.
+    TriangulationController& triangulationController()
+    {
+        return m_triangulationController;
+    }
 
     const FrameDescriptor& frameDescriptor() const
     {
@@ -173,6 +189,27 @@ public:
     // image paint.
     bool frameSupportsImagePaintForPaths() const;
 
+    // Whether this frame can apply a layer mask in-shader. The op replaces
+    // src-over with "multiply the destination by a factor" at each interlock
+    // mode's blend step, and only rasterOrdering's is taught it so far -- there
+    // the destination is already read for every draw, so it costs nothing.
+    // A frame that says no composites the layer unmasked, which is visible but
+    // not wrong; drawing the coverage texture over the content would be.
+    bool frameSupportsLayerMask() const;
+
+    // The device's answer, and the one a recording session asks of the context
+    // it will replay against -- it reads only state settled at construction, so
+    // it is safe from the producer thread while the render thread is in a
+    // frame. Strictly weaker than frameSupportsLayerMask(): that one knows the
+    // frame.
+    //
+    // A Factory override rather than a plain method: DeferredSession holds only
+    // a Factory*, and in a Canvas-2D build that is not a RenderContext at all,
+    // so it has to dispatch rather than cast. Out of line is fine for the same
+    // reason -- a build that never instantiates a RenderContext emits no vtable
+    // and needs no definition.
+    bool supportsLayerMask() const override;
+
     const gpu::InterlockMode frameInterlockMode() const
     {
         return m_frameInterlockMode;
@@ -180,35 +217,32 @@ public:
 
     // Generates a unique clip ID that is guaranteed to not exist in the current
     // clip buffer, and assigns a contentBounds to it.
+    // `tightenedBounds` is the contentBounds, clipped against the render
+    // target area as well as any parent clips.
     //
     // Returns 0 if a unique ID could not be generated, at which point the
     // caller must issue a logical flush and try again.
-    uint32_t generateClipID(const IAABB& contentBounds);
+
+    uint32_t generateClipID(IAABB contentBounds,
+                            uint32_t parentClipID,
+                            AABBu16 tightenedBounds);
 
     // Screen-space bounding box of the region inside the given clip.
-    const IAABB& getClipContentBounds(uint32_t clipID)
+    const IAABB& getClipContentBounds(uint32_t clipID) const
     {
         assert(m_didBeginFrame);
         assert(!m_logicalFlushes.empty());
         return m_logicalFlushes.back()->getClipInfo(clipID).contentBounds;
     }
 
-    // Mark the given clip as being read from within a screen-space bounding
-    // box.
-    void addClipReadBounds(uint32_t clipID, const IAABB& bounds)
+    // Screen-space bounding box of the area that covers all of the reads of the
+    // given clip, clipped to the area of its parent (if there is one) and the
+    // screen edges.
+    const AABBu16& getTightenedClipBounds(uint32_t clipID) const
     {
         assert(m_didBeginFrame);
         assert(!m_logicalFlushes.empty());
-        return m_logicalFlushes.back()->addClipReadBounds(clipID, bounds);
-    }
-
-    // Union of screen-space bounding boxes from all draws that read the given
-    // clip element.
-    const IAABB& getClipReadBounds(uint32_t clipID)
-    {
-        assert(m_didBeginFrame);
-        assert(!m_logicalFlushes.empty());
-        return m_logicalFlushes.back()->getClipInfo(clipID).readBounds;
+        return m_logicalFlushes.back()->getClipInfo(clipID).tightenedBounds;
     }
 
     // Get/set a "clip content ID" that uniquely identifies the current contents
@@ -219,7 +253,7 @@ public:
         m_clipContentID = clipID;
     }
 
-    uint32_t getClipContentID()
+    uint32_t getClipContentID() const
     {
         assert(m_didBeginFrame);
         return m_clipContentID;
@@ -309,24 +343,41 @@ public:
                                        size_t) override;
     rcp<RenderImage> decodeImage(Span<const uint8_t>) override;
 
+#ifdef RIVE_CANVAS
+    // Creates a RenderCanvas: a GPU texture usable as both a render target
+    // (for rendering into) and a render image (for compositing into draws).
+    rcp<RenderCanvas> makeRenderCanvas(uint32_t width, uint32_t height);
+
+    // Like makeRenderCanvas, but allocates nothing: whichever context ends up
+    // replaying the recording owns the pixels and backs it there.
+    rcp<RenderCanvas> makeDeferredRenderCanvas(uint32_t width, uint32_t height);
+
+    rive::ore::Context* ore() override;
+    rive::ore::Context* getOreContext() { return ore(); }
+#endif
+
+    // Importing straight through a render context routes scripts to it.
+    Factory* renderContext() override { return this; }
+
 private:
     friend class Draw;
     friend class PathDraw;
     friend class ImageRectDraw;
     friend class ImageMeshDraw;
-    friend class StencilClipReset;
-    friend class ::PushRetrofittedTrianglesGMDraw; // For testing.
-    friend class ::RenderContextTest;              // For testing.
+    friend class ImageMeshInstancedDraw;
+    friend class ClipReset;
+    friend class ::PushRetrofitTriStripsGMDraw; // For testing.
+    friend class ::RenderContextTest;           // For testing.
 
     // Resets the CPU-side STL containers so they don't have unbounded growth.
     void resetContainers();
 
     // Throttled width/height of the atlas texture. If drawing to a render
     // target larger than this, we may create a larger atlas anyway.
-    uint32_t atlasMaxSize() const
+    uint32_t featherAtlasMaxSize() const
     {
-        constexpr static uint32_t MAX_ATLAS_MAX_SIZE = 4096;
-        return std::min(platformFeatures().maxTextureSize, MAX_ATLAS_MAX_SIZE);
+        constexpr static uint32_t FeatherAtlasMaxSize = 4096;
+        return std::min(platformFeatures().maxTextureSize, FeatherAtlasMaxSize);
     }
 
     // Defines the exact size of each of our GPU resources. Computed during
@@ -334,7 +385,7 @@ private:
     // LogicalFlush::LayoutCounters.
     struct ResourceAllocationCounts
     {
-        constexpr static int NUM_ELEMENTS = 19;
+        constexpr static int NUM_ELEMENTS = 20;
         using VecType = simd::gvec<size_t, NUM_ELEMENTS>;
 
         RIVE_ALWAYS_INLINE VecType toVec() const
@@ -357,7 +408,6 @@ private:
         }
 
         size_t flushUniformBufferCount = 0;
-        size_t imageDrawUniformBufferCount = 0;
         size_t pathBufferCount = 0;
         size_t paintBufferCount = 0;
         size_t paintAuxBufferCount = 0;
@@ -365,10 +415,12 @@ private:
         size_t gradSpanBufferCount = 0;
         size_t tessSpanBufferCount = 0;
         size_t triangleVertexBufferCount = 0;
+        size_t imageRectInstanceBufferCount = 0;
+        size_t imageMeshInstanceBufferCount = 0;
         size_t gradTextureHeight = 0;
         size_t tessTextureHeight = 0;
-        size_t atlasTextureWidth = 0;
-        size_t atlasTextureHeight = 0;
+        size_t featherAtlasTextureWidth = 0;
+        size_t featherAtlasTextureHeight = 0;
         size_t plsTransientBackingWidth = 0;
         size_t plsTransientBackingHeight = 0;
         size_t plsTransientBackingPlaneCount = 0;
@@ -390,17 +442,37 @@ private:
     // order to support the returned coverage buffer prefix.
     // (clockwiseAtomic mode only.)
     uint32_t incrementCoverageBufferPrefix(bool* needsCoverageBufferClear);
-
     const std::unique_ptr<RenderContextImpl> m_impl;
     const size_t m_maxPathID;
+
+#ifdef RIVE_CANVAS
+    std::unique_ptr<rive::ore::Context> m_oreContext = nullptr;
+#endif
 
     ResourceAllocationCounts m_currentResourceAllocations;
     ResourceAllocationCounts m_maxRecentResourceRequirements;
     double m_lastResourceTrimTimeInSeconds;
 
+    TriangulationController m_triangulationController;
+
     // Per-frame state.
     FrameDescriptor m_frameDescriptor;
-    gpu::InterlockMode m_frameInterlockMode;
+    // Initialized rather than left indeterminate. Only ever touched on the
+    // thread that opened the frame; a recording thread reads the atomic below
+    // instead.
+    gpu::InterlockMode m_frameInterlockMode =
+        gpu::InterlockMode::rasterOrdering;
+
+    // Whether the frame most recently opened can apply the layer-mask op,
+    // republished as an atomic because supportsLayerMask() is asked by a
+    // recording session on the producer thread while the render thread may be
+    // inside beginFrame. Reading m_frameInterlockMode from there was a data
+    // race; this is the same value, read safely.
+    //
+    // True until the first beginFrame so a recording made before any frame
+    // exists is not vetoed by a mode that has not been chosen yet -- the device
+    // check in supportsLayerMask() still applies.
+    std::atomic<bool> m_frameCanApplyLayerMask{true};
     gpu::ShaderFeatures m_frameShaderFeaturesMask;
     RIVE_DEBUG_CODE(bool m_didBeginFrame = false;)
 
@@ -417,9 +489,28 @@ private:
     // (clockwiseAtomic mode only.)
     uint32_t m_coverageBufferPrefix = 0;
 
+    struct DrawSortEntry
+    {
+        int64_t sortKey;
+        int16_t drawIndex;
+    };
+
+    // A simple class to allow std::unordered_map to use the scissor AABB as a
+    // key.
+    struct ScissorAABBHasher
+    {
+        size_t operator()(AABBu16 aabb) const
+        {
+            // Hash the AABB as a single 64-bit int value.
+            return std::hash<uint64_t>{}(math::bit_cast<uint64_t>(aabb));
+        }
+    };
+
     // Used by LogicalFlushes for re-ordering high level draws.
-    std::vector<int64_t> m_indirectDrawList;
+    std::vector<DrawSortEntry> m_indirectDrawList;
     std::unique_ptr<IntersectionBoard> m_intersectionBoard;
+    std::unordered_map<AABBu16, int16_t, ScissorAABBHasher> m_scissorIDLookup;
+    int16_t m_prevScissorID = 0;
 
     WriteOnlyMappedMemory<gpu::FlushUniforms> m_flushUniformData;
     WriteOnlyMappedMemory<gpu::PathData> m_pathData;
@@ -429,7 +520,8 @@ private:
     WriteOnlyMappedMemory<gpu::GradientSpan> m_gradSpanData;
     WriteOnlyMappedMemory<gpu::TessVertexSpan> m_tessSpanData;
     WriteOnlyMappedMemory<gpu::TriangleVertex> m_triangleVertexData;
-    WriteOnlyMappedMemory<gpu::ImageDrawUniforms> m_imageDrawUniformData;
+    WriteOnlyMappedMemory<gpu::ImageRectInstance> m_imageRectInstanceData;
+    WriteOnlyMappedMemory<gpu::ImageMeshInstance> m_imageMeshInstanceData;
 
     // Simple allocator for trivially-destructible data that needs to persist
     // until the current frame has completed. All memory in this allocator is
@@ -487,6 +579,10 @@ private:
         {
             return m_ctx->frameInterlockMode();
         }
+        const gpu::PlatformFeatures& platformFeatures() const
+        {
+            return m_ctx->platformFeatures();
+        }
 
         // Access this flush's gpu::FlushDescriptor (which is not valid until
         // layoutResources()). NOTE: Some fields in the FlushDescriptor
@@ -504,36 +600,42 @@ private:
         //
         // Returns 0 if a unique ID could not be generated, at which point the
         // caller must issue a logical flush and try again.
-        uint32_t generateClipID(const IAABB& contentBounds);
+        uint32_t generateClipID(IAABB contentBounds,
+                                uint32_t parentClipID,
+                                AABBu16 tightenedBounds);
 
         struct ClipInfo
         {
-            ClipInfo(const IAABB& contentBounds_) :
-                contentBounds(contentBounds_)
+            ClipInfo(IAABB contentBounds_,
+                     uint32_t parentClipID_,
+                     AABBu16 tightenedBounds_) :
+                parentClipID(parentClipID_),
+                contentBounds(contentBounds_),
+                tightenedBounds(tightenedBounds_)
             {}
 
-            // Screen-space bounding box of the region inside the clip.
+            const uint32_t parentClipID = 0;
+
+            // Screen-space bounding box of the region inside the clip
             const IAABB contentBounds;
+
+            // The minimally necessary write bounds, which will ultimately take
+            // into account the content bounds, the screen dimensions, any
+            // parent clips, and where all of the reads of this clip are.
+            AABBu16 tightenedBounds;
 
             // Union of screen-space bounding boxes from all draws that read the
             // clip.
             //
             // (Initialized with a maximally negative rectangle whose union with
             // any other rectangle will be equal to that same rectangle.)
-            IAABB readBounds = {std::numeric_limits<int32_t>::max(),
-                                std::numeric_limits<int32_t>::max(),
-                                std::numeric_limits<int32_t>::min(),
-                                std::numeric_limits<int32_t>::min()};
+            AABBu16 readBounds = AABBu16::makeMaximallyNegative();
         };
 
         const ClipInfo& getClipInfo(uint32_t clipID)
         {
             return getWritableClipInfo(clipID);
         }
-
-        // Mark the given clip as being read from within a screen-space bounding
-        // box.
-        void addClipReadBounds(uint32_t clipID, const IAABB& bounds);
 
         // Appends a list of high-level Draws to the flush.
         // Returns false if the draws don't fit within the current resource
@@ -545,7 +647,7 @@ private:
         // allocated in the render context's various GPU buffers.
         struct ResourceCounters
         {
-            constexpr static int NUM_ELEMENTS = 7;
+            constexpr static int NUM_ELEMENTS = 8;
             using VecType = simd::gvec<size_t, NUM_ELEMENTS>;
 
             VecType toVec() const
@@ -573,7 +675,8 @@ private:
             // lines, curves, lone joins, emulated caps, etc.
             size_t maxTessellatedSegmentCount = 0;
             size_t maxTriangleVertexCount = 0;
-            size_t imageDrawCount = 0; // imageRect or imageMesh.
+            size_t imageRectCount = 0;
+            size_t imageMeshCount = 0;
         };
 
         // Additional counters for layout state that don't need to be tracked by
@@ -588,8 +691,8 @@ private:
             uint32_t gradSpanPaddingCount = 0;
             uint32_t maxGradTextureHeight = 0;
             uint32_t maxTessTextureHeight = 0;
-            uint32_t maxAtlasWidth = 0;
-            uint32_t maxAtlasHeight = 0;
+            uint32_t maxFeatherAtlasWidth = 0;
+            uint32_t maxFeatherAtlasHeight = 0;
             uint32_t maxPLSTransientBackingPlaneCount = 0;
             size_t maxCoverageBufferLength = 0;
         };
@@ -607,26 +710,27 @@ private:
                                             gpu::ColorRampLocation*);
 
         // Allocates a rectangular region in the atlas for this draw to use, and
-        // registers a future callback to PathDraw::pushAtlasTessellation()
-        // where it will render its coverage data to this same region in the
-        // atlas.
+        // registers a future callback to
+        // PathDraw::pushFeatherAtlasTessellation() where it will render its
+        // coverage data to this same region in the atlas.
         //
         // Attempts to leave a border of "desiredPadding" pixels surrounding the
         // rectangular region, but the allocation may not be padded if the path
         // is up against an edge.
-        bool allocateAtlasDraw(PathDraw*,
-                               uint16_t drawWidth,
-                               uint16_t drawHeight,
-                               uint16_t desiredPadding,
-                               uint16_t* x,
-                               uint16_t* y,
-                               TAABB<uint16_t>* paddedRegion);
+        bool allocateFeatherAtlasDraw(PathDraw*,
+                                      uint16_t drawWidth,
+                                      uint16_t drawHeight,
+                                      uint16_t desiredPadding,
+                                      uint16_t* x,
+                                      uint16_t* y,
+                                      AABBu16* paddedRegion);
 
         // Reserves a range within the coverage buffer for a path to use in
         // clockwiseAtomic mode.
         //
         // "length" is the length in pixels of this allocation and must be a
-        // multiple of 32*32, in order to support 32x32 tiling.
+        // multiple of BUFFER_IMAGE_TILE_SIZE^2, in order to support internal
+        // tiling.
         //
         // Returns the offset of the allocated range within the coverage buffer,
         // or -1 if there was not room.
@@ -675,7 +779,9 @@ private:
         // This method does not add the path to the draw list. The caller must
         // define that draw specifically with a separate call to
         // pushMidpointFanDraw() or pushOuterCubicsDraw().
-        [[nodiscard]] uint32_t pushPath(const PathDraw* draw);
+        [[nodiscard]] uint32_t pushPath(const PathDraw* draw,
+                                        gpu::DrawContents,
+                                        uint32_t zIndex);
 
         // Pushes a contour record to the GPU that references the given path.
         //
@@ -695,14 +801,19 @@ private:
         // contour ID that is guaranteed to not be the same ID as any neighbors.
         void pushPaddingVertices(uint32_t count, uint32_t tessLocation);
 
+        // Schedules barriers that will be issued immediately before the next
+        // draw.
+        void pushBarriers(BarrierFlags);
+
         // Pushes a "midpointFanPatches" draw to the list. Path, contour, and
         // cubic data are pushed separately.
         //
         // Also adds the PathDraw to a dstRead list if one is
         // required, and if this is the path's first subpass.
-        void pushMidpointFanDraw(
+        gpu::DrawBatch& pushMidpointFanDraw(
             const PathDraw*,
             gpu::DrawType,
+            gpu::DrawContents,
             uint32_t tessVertexCount,
             uint32_t tessLocation,
             gpu::ShaderMiscFlags = gpu::ShaderMiscFlags::none);
@@ -712,9 +823,10 @@ private:
         //
         // Also adds the PathDraw to a dstRead list if one is
         // required, and if this is the path's first subpass.
-        void pushOuterCubicsDraw(
+        gpu::DrawBatch& pushOuterCubicsDraw(
             const PathDraw*,
             gpu::DrawType,
+            gpu::DrawContents,
             uint32_t tessVertexCount,
             uint32_t tessLocation,
             gpu::ShaderMiscFlags = gpu::ShaderMiscFlags::none);
@@ -722,27 +834,42 @@ private:
         // Writes out triangle verties for the desired WindingFaces and pushes
         // an "interiorTriangulation" draw to the list.
         // Returns the number of vertices actually written.
-        size_t pushInteriorTriangulationDraw(
+        gpu::DrawBatch* pushInteriorTriangulationDraw(
             const PathDraw*,
+            gpu::DrawContents,
             uint32_t pathID,
             gpu::WindingFaces,
-            gpu::ShaderMiscFlags = gpu::ShaderMiscFlags::none);
+            gpu::ShaderMiscFlags RIVE_DEBUG_CODE(, size_t* vertexCounter));
 
         // Pushes a screen-space rectangle to the draw list, whose pixel
-        // coverage is determined by the atlas region associated with the given
-        // pathID.
-        void pushAtlasBlit(PathDraw*, uint32_t pathID);
+        // coverage is determined by the feather atlas region associated with
+        // the given pathID.
+        gpu::DrawBatch& pushFeatherAtlasBlit(PathDraw*,
+                                             gpu::DrawContents,
+                                             uint32_t pathID);
 
         // Pushes an "imageRect" to the draw list.
         // This should only be used when we in atomic mode. Otherwise, images
         // should be drawn as rectangular paths with an image paint.
-        void pushImageRectDraw(ImageRectDraw*);
+        gpu::DrawBatch& pushImageRectDraw(ImageRectDraw*,
+                                          gpu::DrawContents,
+                                          uint32_t zIndex);
 
         // Pushes an "imageMesh" draw to the list.
-        void pushImageMeshDraw(ImageMeshDraw*);
+        gpu::DrawBatch& pushImageMeshDraw(ImageMeshDraw*,
+                                          gpu::DrawContents,
+                                          uint32_t zIndex);
 
-        // Pushes a "stencilClipReset" draw to the list.
-        void pushStencilClipResetDraw(StencilClipReset*);
+        // Pushes an "imageMesh" draw with one instance per entry in the
+        // draw's ImageMeshInstances.
+        gpu::DrawBatch& pushImageMeshInstancedDraw(ImageMeshInstancedDraw*,
+                                                   gpu::DrawContents,
+                                                   uint32_t zIndex);
+
+        // Pushes a "clipReset" draw to the list.
+        gpu::DrawBatch& pushClipResetDraw(ClipReset*,
+                                          gpu::DrawContents,
+                                          uint32_t zIndex);
 
     private:
         friend class TessellationWriter;
@@ -754,15 +881,33 @@ private:
         // the passed parameters.
         DrawBatch& pushPathDraw(const PathDraw*,
                                 DrawType,
+                                gpu::DrawContents,
                                 gpu::ShaderMiscFlags,
                                 uint32_t vertexCount,
                                 uint32_t baseVertex);
         DrawBatch& pushDraw(const Draw*,
                             DrawType,
+                            gpu::DrawContents,
                             gpu::ShaderMiscFlags,
                             gpu::PaintType,
                             uint32_t elementCount,
                             uint32_t baseElement);
+
+        // Do a bottom-up pass on the draws in the list, computing bounds for
+        // each clip update to be the intersection of the clip update itself and
+        // any reads that use it.
+        void tightenClipBounds();
+
+        // Adds a batch to the list of draws that use a dstBarrier.
+        void addBatchToDstBarrierList(DrawBatch* batch)
+        {
+            assert(m_dstBlendBarrierListTail != nullptr);
+            assert(*m_dstBlendBarrierListTail == nullptr);
+            assert(batch->nextDstBlendBarrier == nullptr);
+            assert(enums::is_flag_set(batch->barriers, BarrierFlags::dstBlend));
+            *m_dstBlendBarrierListTail = batch;
+            m_dstBlendBarrierListTail = &batch->nextDstBlendBarrier;
+        }
 
         // Instance pointer to the outer parent class.
         RenderContext* const m_ctx;
@@ -829,10 +974,10 @@ private:
         uint32_t m_currentContourID;
 
         // Atlas for offscreen feathering.
-        std::unique_ptr<rive::RectanizerSkyline> m_atlasRectanizer;
-        uint32_t m_atlasMaxX = 0;
-        uint32_t m_atlasMaxY = 0;
-        std::vector<PathDraw*> m_pendingAtlasDraws;
+        std::unique_ptr<rive::RectanizerSkyline> m_featherAtlasRectanizer;
+        uint32_t m_featherAtlasMaxX = 0;
+        uint32_t m_featherAtlasMaxY = 0;
+        std::vector<PathDraw*> m_pendingFeatherAtlasDraws;
 
         // Total coverage allocated via allocateCoverageBufferRange().
         // (clockwiseAtomic mode only.)
@@ -842,10 +987,6 @@ private:
         // (pushPathDraw()/pushDraw()). If any barriers are pending, this also
         // prevents DrawBatches from being combined with the existing drawList.
         BarrierFlags m_pendingBarriers;
-
-        // Stateful Z index of the current draw being pushed. Used by msaa mode
-        // to avoid double hits and to reverse-sort opaque paths front to back.
-        uint32_t m_currentZIndex;
 
         RIVE_DEBUG_CODE(bool m_hasDoneLayout = false;)
     };
@@ -930,6 +1071,11 @@ private:
                        uint32_t polarSegmentCount,
                        uint32_t joinSegmentCount,
                        uint32_t contourIDWithFlags);
+
+        void pushRetrofitCubicTriStrip(const Vec2D[],
+                                       size_t numPts,
+                                       gpu::ContourDirections,
+                                       uint32_t contourIDWithFlags);
 
         // pushCubic() impl for forward tessellations.
         RIVE_ALWAYS_INLINE void pushTessellationSpans(

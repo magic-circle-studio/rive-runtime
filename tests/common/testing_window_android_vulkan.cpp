@@ -85,10 +85,10 @@ public:
             m_instance->loadInstanceFunc<PFN_vkCreateAndroidSurfaceKHR>(
                 "vkCreateAndroidSurfaceKHR");
         assert(pfnvkCreateAndroidSurfaceKHR != nullptr);
-        VK_CHECK(pfnvkCreateAndroidSurfaceKHR(m_instance->vkInstance(),
-                                              &androidSurfaceCreateInfo,
-                                              nullptr,
-                                              &m_windowSurface));
+        VK_ABORT_ON_FAIL(pfnvkCreateAndroidSurfaceKHR(m_instance->vkInstance(),
+                                                      &androidSurfaceCreateInfo,
+                                                      nullptr,
+                                                      &m_windowSurface));
     }
 
     ~TestingWindowAndroidVulkan()
@@ -126,6 +126,61 @@ public:
     {
         assert(m_renderTarget != nullptr);
         return m_renderTarget.get();
+    }
+
+    void* vulkanGraphicsQueue() const override
+    {
+        if (!vk() || !m_device)
+            return VK_NULL_HANDLE;
+        auto pfnGetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+            vk()->GetDeviceProcAddr(vk()->device, "vkGetDeviceQueue"));
+        if (!pfnGetDeviceQueue)
+            return VK_NULL_HANDLE;
+        VkQueue queue = VK_NULL_HANDLE;
+        pfnGetDeviceQueue(vk()->device,
+                          m_device->graphicsQueueFamilyIndex(),
+                          0,
+                          &queue);
+        return queue;
+    }
+    uint32_t vulkanGraphicsQueueFamilyIndex() const override
+    {
+        return m_device ? m_device->graphicsQueueFamilyIndex() : 0;
+    }
+    void* vulkanGetInstanceProcAddr() const override
+    {
+        return m_instance ? reinterpret_cast<void*>(
+                                m_instance->getVkGetInstanceProcAddrPtr())
+                          : nullptr;
+    }
+    void* getCurrentCommandBuffer() const override
+    {
+        if (m_swapchain == nullptr || !m_swapchain->isFrameStarted())
+            return nullptr;
+        return m_swapchain->currentCommandBuffer();
+    }
+
+    void* getOreContext() const override
+    {
+        return m_renderContext->getOreContext();
+    }
+
+    void beginOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+        beginSwapchainFrame();
+        oreContext->beginFrame(
+            {.externalCommandBuffer = m_swapchain->currentCommandBuffer(),
+             .safeFrameNumber = m_swapchain->safeFrameNumber(),
+             .currentFrameNumber = m_swapchain->currentFrameNumber()});
+    }
+    // The Ore frame runs inside the screen frame, which endFrame() submits.
+    void endOreFrame() override
+    {
+        auto oreContext =
+            static_cast<rive::ore::Context*>(m_renderContext->getOreContext());
+        oreContext->endFrame();
     }
 
     void resize(int width, int height) override
@@ -188,6 +243,7 @@ public:
             makeDeviceAndRenderContext();
         }
 
+        FrameMode mode = frameMode(options);
         m_renderContext->beginFrame(RenderContext::FrameDescriptor{
             .renderTargetWidth = m_width,
             .renderTargetHeight = m_height,
@@ -195,40 +251,63 @@ public:
                               ? gpu::LoadAction::clear
                               : gpu::LoadAction::preserveRenderTarget,
             .clearColor = options.clearColor,
-            .msaaSampleCount = m_backendParams.msaa ? 4u : 0u,
-            .disableRasterOrdering = options.disableRasterOrdering,
+            .msaaSampleCount = mode.msaaSampleCount,
+            .disableRasterOrdering = mode.disableRasterOrdering,
+            .triangulationThresholds = options.triangulationThresholds,
             .wireframe = options.wireframe,
             .fillsDisabled = options.fillsDisabled,
             .strokesDisabled = options.strokesDisabled,
-            .clockwiseFillOverride =
-                m_backendParams.clockwise || options.clockwiseFillOverride,
+            .clockwiseFillOverride = mode.clockwiseFillOverride,
+            .inkbleedOverride = mode.inkbleed,
             .synthesizedFailureType = options.synthesizedFailureType,
         });
 
         return std::make_unique<RiveRenderer>(m_renderContext.get());
     }
 
+    FrameMode frameMode(const FrameOptions& options) const override
+    {
+        return {m_backendParams.msaaSampleCount,
+                options.disableRasterOrdering,
+                m_backendParams.clockwise || options.clockwiseFillOverride,
+                m_backendParams.inkbleed};
+    }
+
+    // Ore and Rive must bind the same image, since scripts draw into it too.
+    void beginSwapchainFrame()
+    {
+        if (m_swapchain->isFrameStarted())
+        {
+            return;
+        }
+        VK_ABORT_ON_FAIL(m_swapchain->beginFrame());
+        if (m_overflowTexture != nullptr)
+        {
+            m_renderTarget->setTargetImageView(m_overflowTexture->vkImageView(),
+                                               m_overflowTexture->vkImage(),
+                                               m_overflowTexture->lastAccess());
+        }
+        else
+        {
+            m_renderTarget->setTargetImageView(
+                m_swapchain->currentVkImageView(),
+                m_swapchain->currentVkImage(),
+                m_swapchain->currentLastAccess());
+        }
+    }
+
+    // An srgb swapchain would not match the unorm format Ore reports.
+    OreTarget oreTarget() const override
+    {
+        VkFormat format = m_swapchain->imageFormat();
+        return {format == VK_FORMAT_R8G8B8A8_UNORM ||
+                    format == VK_FORMAT_B8G8R8A8_UNORM,
+                format == VK_FORMAT_B8G8R8A8_UNORM};
+    }
+
     void flushPLSContext(RenderTarget* offscreenRenderTarget) override
     {
-        if (!m_swapchain->isFrameStarted())
-        {
-            VK_CHECK(m_swapchain->beginFrame());
-
-            if (m_overflowTexture != nullptr)
-            {
-                m_renderTarget->setTargetImageView(
-                    m_overflowTexture->vkImageView(),
-                    m_overflowTexture->vkImage(),
-                    m_overflowTexture->lastAccess());
-            }
-            else
-            {
-                m_renderTarget->setTargetImageView(
-                    m_swapchain->currentVkImageView(),
-                    m_swapchain->currentVkImage(),
-                    m_swapchain->currentLastAccess());
-            }
-        }
+        beginSwapchainFrame();
         m_renderContext->flush({
             .renderTarget = offscreenRenderTarget != nullptr
                                 ? offscreenRenderTarget
@@ -312,24 +391,23 @@ public:
             }
         }
 
-        VK_CHECK(m_swapchain->endFrame(swapchainLastAccess));
+        VK_ABORT_ON_FAIL(m_swapchain->endFrame(swapchainLastAccess));
         if (pixelData != nullptr)
         {
-            VK_CHECK(m_swapchain->getPixelsFromLastImageCopy(pixelData));
+            VK_ABORT_ON_FAIL(
+                m_swapchain->getPixelsFromLastImageCopy(pixelData));
         }
     }
 
     void onceAfterGM() override
     {
-        // Mali devices with a driver version before 50 have been known to run
-        // out of memory, so for these devices, tear down the device between
-        // GMs.
+        // Mali drivers appear to have an internal memory leak, so for these
+        // devices, tear down the device between tests.
         // Adreno devices pre 1.3 (specifically Galaxy A11, Adreno 506, running
         // Vulkan 1.1) also have sporadic crashes, and tearing down the device
         // appears to help.
         if (m_device != nullptr &&
-            ((strstr(m_device->name().c_str(), "Mali") != nullptr &&
-              m_device->driverVersion().major < 50) ||
+            (strstr(m_device->name().c_str(), "Mali") != nullptr ||
              (strstr(m_device->name().c_str(), "Adreno (TM) 5") != nullptr &&
               m_device->vulkanFeatures().apiVersion < VK_API_VERSION_1_3)))
         {
@@ -360,11 +438,14 @@ private:
             m_device->vkDevice(),
             m_device->vulkanFeatures(),
             m_instance->getVkGetInstanceProcAddrPtr(),
-            {.forceAtomicMode = m_backendParams.atomic});
+            {
+                .forceAtomicMode = m_backendParams.atomic,
+                .shaderCompilationMode = m_backendParams.shaderCompilationMode,
+            });
 
         VkSurfaceCapabilitiesKHR windowCapabilities;
-        VK_CHECK(m_device->getSurfaceCapabilities(m_windowSurface,
-                                                  &windowCapabilities));
+        VK_ABORT_ON_FAIL(m_device->getSurfaceCapabilities(m_windowSurface,
+                                                          &windowCapabilities));
 
         auto swapOpts = VulkanSwapchain::Options{
             .formatPreferences =
@@ -388,6 +469,7 @@ private:
             .presentModePreferences =
                 {
                     VK_PRESENT_MODE_IMMEDIATE_KHR,
+                    VK_PRESENT_MODE_MAILBOX_KHR,
                     VK_PRESENT_MODE_FIFO_KHR,
                 },
             .imageUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -407,6 +489,12 @@ private:
                                                         m_windowSurface,
                                                         swapOpts);
         assert(m_swapchain != nullptr);
+
+        // Enable canvas pre-pass support
+        // (makeCommandBuffer/commitCommandBuffer) by providing a command queue
+        // for canvas rendering.
+        impl()->setCanvasQueue(m_swapchain->graphicsQueue(),
+                               m_device->graphicsQueueFamilyIndex());
 
         m_androidWindowWidth = m_swapchain->width();
         m_androidWindowHeight = m_swapchain->height();

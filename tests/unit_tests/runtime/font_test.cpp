@@ -24,7 +24,7 @@ static rive::TextRun append(std::vector<rive::Unichar>* unichars,
     return {std::move(font), size, -1.0f, 0.0f, n, 0};
 }
 
-static rcp<Font> loadFont(const char* filename)
+static std::vector<uint8_t> readBytes(const char* filename)
 {
     FILE* fp = fopen(filename, "rb");
     REQUIRE(fp != nullptr);
@@ -35,7 +35,12 @@ static rcp<Font> loadFont(const char* filename)
     std::vector<uint8_t> bytes(length);
     REQUIRE(fread(bytes.data(), 1, length, fp) == length);
     fclose(fp);
+    return bytes;
+}
 
+static rcp<Font> loadFont(const char* filename)
+{
+    auto bytes = readBytes(filename);
     return HBFont::Decode(bytes);
 }
 
@@ -86,6 +91,36 @@ TEST_CASE("Inspect Font Styles", "[text_styles]")
 
             REQUIRE(hbFont->getWeight() == testCase.expectedWeight);
             REQUIRE(hbFont->isItalic() == testCase.expectedItalic);
+        }
+    }
+}
+
+TEST_CASE("font exposes cap and x height for vertical trim", "[text_styles]")
+{
+    // Latin text fonts have an 'H' and 'x'; their tops must sit between the
+    // baseline and the ascent, with the x-height below the cap-height. All of
+    // capHeight/xHeight/ascent are stored negative (up is -Y).
+    std::vector<const char*> fontPaths = {
+        "assets/fonts/Inter_18pt-Regular.ttf",
+        "assets/Montserrat.ttf",
+    };
+    for (const char* path : fontPaths)
+    {
+        SECTION(path)
+        {
+            rive::rcp<Font> font = loadFont(path);
+            const Font::LineMetrics& metrics = font->lineMetrics();
+
+            REQUIRE(metrics.capHeight < 0.0f);
+            REQUIRE(metrics.capHeight >= metrics.ascent);
+            // x-height is below the cap-height (less far above the baseline).
+            REQUIRE(metrics.xHeight > metrics.capHeight);
+            REQUIRE(metrics.xHeight < 0.0f);
+
+            // The size-scaled accessors scale linearly.
+            REQUIRE(font->capHeight(20.0f) ==
+                    Approx(metrics.capHeight * 20.0f));
+            REQUIRE(font->xHeight(20.0f) == Approx(metrics.xHeight * 20.0f));
         }
     }
 }
@@ -191,4 +226,190 @@ TEST_CASE("font features load as expected", "[text]")
     REQUIRE(hasTag(featureStrings, "locl"));
     REQUIRE(hasTag(featureStrings, "pnum"));
     REQUIRE(hasTag(featureStrings, "liga"));
+}
+
+// DecodeFile maps the file instead of copying it. The mapping is invisible to
+// callers, so these assert that it is equivalent to Decode and that every
+// failure path degrades to null rather than crashing (callers fall back).
+TEST_CASE("mapped font decodes equivalently to a copied one", "[text]")
+{
+    const char* path = "assets/fonts/Inter_18pt-Regular.ttf";
+#ifndef RIVE_HB_FILE_MAPPING
+    // No file mapping here (Windows): callers fall back to Decode.
+    REQUIRE(HBFont::DecodeFile(path) == nullptr);
+    return;
+#else
+    auto copied = loadFont(path);
+    auto mapped = HBFont::DecodeFile(path);
+    REQUIRE(copied != nullptr);
+    REQUIRE(mapped != nullptr);
+
+    // Same metrics.
+    REQUIRE(mapped->getWeight() == copied->getWeight());
+    REQUIRE(mapped->isItalic() == copied->isItalic());
+    REQUIRE(mapped->getAxisCount() == copied->getAxisCount());
+
+    // Same shaping: identical glyphs and advances for the same text.
+    std::vector<rive::Unichar> mappedText, copiedText;
+    std::vector<rive::TextRun> mappedRuns, copiedRuns;
+    copiedRuns.push_back(append(&copiedText, copied, 32.0f, "Shaping parity"));
+    mappedRuns.push_back(append(&mappedText, mapped, 32.0f, "Shaping parity"));
+
+    auto copiedShape = copied->shapeText(copiedText, copiedRuns);
+    auto mappedShape = mapped->shapeText(mappedText, mappedRuns);
+    REQUIRE(mappedShape.size() == copiedShape.size());
+    for (size_t p = 0; p < copiedShape.size(); p++)
+    {
+        const auto& a = copiedShape[p];
+        const auto& b = mappedShape[p];
+        REQUIRE(b.runs.size() == a.runs.size());
+        for (size_t r = 0; r < a.runs.size(); r++)
+        {
+            REQUIRE(b.runs[r].glyphs.size() == a.runs[r].glyphs.size());
+            for (size_t g = 0; g < a.runs[r].glyphs.size(); g++)
+            {
+                REQUIRE(b.runs[r].glyphs[g] == a.runs[r].glyphs[g]);
+                REQUIRE(b.runs[r].advances[g] == a.runs[r].advances[g]);
+            }
+        }
+    }
+#endif
+}
+
+TEST_CASE("mapped font outlives the call that created it", "[text]")
+{
+    const char* path = "assets/fonts/Inter_18pt-Regular.ttf";
+#ifndef RIVE_HB_FILE_MAPPING
+    REQUIRE(HBFont::DecodeFile(path) == nullptr);
+    return;
+#else
+    // The mapping is owned by harfbuzz's blob, not by any local: glyph data
+    // must still be readable once DecodeFile's scope is long gone.
+    rcp<Font> font;
+    {
+        font = HBFont::DecodeFile(path);
+    }
+    REQUIRE(font != nullptr);
+    REQUIRE(font->hasGlyph('A'));
+
+    // Shaping reads the mapped tables, so this would fault or return nothing
+    // if the mapping had been released with the local scope.
+    std::vector<rive::Unichar> text;
+    std::vector<rive::TextRun> runs;
+    runs.push_back(append(&text, font, 32.0f, "A"));
+    auto shape = font->shapeText(text, runs);
+    REQUIRE(shape.size() == 1);
+    REQUIRE(shape[0].runs.size() == 1);
+    REQUIRE(shape[0].runs[0].glyphs.size() == 1);
+    REQUIRE(font->getPath(shape[0].runs[0].glyphs[0]).verbs().size() > 0);
+#endif
+}
+
+TEST_CASE("mapped font opens the requested collection face", "[text]")
+{
+    const char* path = "assets/fonts/two_faces.ttc";
+#ifndef RIVE_HB_FILE_MAPPING
+    REQUIRE(HBFont::DecodeFile(path, 1) == nullptr);
+    return;
+#else
+    // Face 0 covers a-f at weight 400, face 1 covers only a at weight 250.
+    auto first = HBFont::DecodeFile(path, 0);
+    auto second = HBFont::DecodeFile(path, 1);
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(first->hasGlyph('b'));
+    REQUIRE(second->hasGlyph('a'));
+    REQUIRE_FALSE(second->hasGlyph('b'));
+    REQUIRE(first->getWeight() != second->getWeight());
+    REQUIRE(HBFont::DecodeFile(path, 2) == nullptr);
+#endif
+}
+
+TEST_CASE("mapped coverage probes respect collection faces and promote safely",
+          "[text]")
+{
+    const char* path = "assets/fonts/two_faces.ttc";
+#ifndef RIVE_HB_FILE_MAPPING
+    REQUIRE(HBFont::ProbeFile(path) == nullptr);
+#else
+    auto first = HBFont::ProbeFile(path, 0);
+    auto second = HBFont::ProbeFile(path, 1);
+    REQUIRE(first != nullptr);
+    REQUIRE(second != nullptr);
+    REQUIRE(first->hasGlyph('b'));
+    REQUIRE(second->hasGlyph('a'));
+    REQUIRE_FALSE(second->hasGlyph('b'));
+    REQUIRE_FALSE(first->hasGlyph(0x10FFFF));
+    REQUIRE(HBFont::ProbeFile(path, 2) == nullptr);
+
+    auto font = first->makeFont();
+    REQUIRE(font != nullptr);
+    REQUIRE_FALSE(first->hasGlyph('b'));
+    REQUIRE(first->makeFont() == nullptr);
+    first.reset();
+    second.reset();
+    REQUIRE(font->hasGlyph('b'));
+    REQUIRE(font->getWeight() == 400);
+
+    // Shaping and drawing must still work after the probes release their
+    // references.
+    std::vector<rive::Unichar> text;
+    std::vector<rive::TextRun> runs;
+    runs.push_back(append(&text, font, 32.0f, "b"));
+    auto shape = font->shapeText(text, runs);
+    REQUIRE(shape.size() == 1);
+    REQUIRE(shape[0].runs[0].glyphs.size() == 1);
+    REQUIRE(font->getPath(shape[0].runs[0].glyphs[0]).verbs().size() > 0);
+#endif
+}
+
+TEST_CASE("owned font bytes are adopted rather than copied", "[text]")
+{
+    rcp<Font> font;
+    const uint8_t* data;
+    {
+        auto bytes = readBytes("assets/fonts/Inter_18pt-Regular.ttf");
+        data = bytes.data();
+        font = HBFont::Decode(std::move(bytes));
+    }
+    REQUIRE(font != nullptr);
+
+    hb_blob_t* blob = hb_face_reference_blob(
+        hb_font_get_face(static_cast<HBFont*>(font.get())->font()));
+    REQUIRE(reinterpret_cast<const uint8_t*>(hb_blob_get_data(blob, nullptr)) ==
+            data);
+    hb_blob_destroy(blob);
+
+    // Shaping reads the adopted bytes after the caller's scope is gone.
+    std::vector<rive::Unichar> text;
+    std::vector<rive::TextRun> runs;
+    runs.push_back(append(&text, font, 32.0f, "A"));
+    auto shape = font->shapeText(text, runs);
+    REQUIRE(shape.size() == 1);
+    REQUIRE(shape[0].runs[0].glyphs.size() == 1);
+    REQUIRE(font->getPath(shape[0].runs[0].glyphs[0]).verbs().size() > 0);
+
+    REQUIRE(HBFont::Decode(std::vector<uint8_t>()) == nullptr);
+}
+
+TEST_CASE("DecodeFile returns null rather than failing hard", "[text]")
+{
+    // Callers treat null as "use Decode instead", so every failure this call
+    // can detect must return null rather than throw or crash. Note these are
+    // only the failures detectable here: arbitrary non-font data is NOT one of
+    // them, since hb_face_create_or_fail does not validate that a non-empty
+    // blob is a font -- the byte-based Decode has the same behaviour.
+    REQUIRE(HBFont::DecodeFile(nullptr) == nullptr);
+    REQUIRE(HBFont::DecodeFile("assets/does_not_exist.ttf") == nullptr);
+    REQUIRE(HBFont::ProbeFile(nullptr) == nullptr);
+    REQUIRE(HBFont::ProbeFile("assets/does_not_exist.ttf") == nullptr);
+
+    // An empty file: rejected on size before anything is mapped.
+    const char* emptyPath = "assets/empty_font_test_file.tmp";
+    FILE* fp = fopen(emptyPath, "wb");
+    REQUIRE(fp != nullptr);
+    fclose(fp);
+    REQUIRE(HBFont::DecodeFile(emptyPath) == nullptr);
+    REQUIRE(HBFont::ProbeFile(emptyPath) == nullptr);
+    remove(emptyPath);
 }

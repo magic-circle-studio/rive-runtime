@@ -2,7 +2,9 @@
 #define _RIVE_MAT2D_HPP_
 
 #include "rive/math/aabb.hpp"
+#include "rive/math/math_types.hpp"
 #include "rive/math/vec2d.hpp"
+#include "rive/span.hpp"
 #include <array>
 #include <cstddef>
 
@@ -59,6 +61,11 @@ public:
     AABB mapBoundingBox(const Vec2D pts[], size_t n) const;
     AABB mapBoundingBox(const AABB&) const;
 
+    AABB mapBoundingBox(Span<const Vec2D> pts) const
+    {
+        return mapBoundingBox(pts.data(), pts.count());
+    }
+
     // If returns true, result holds the inverse.
     // If returns false, result is unchnaged.
     bool invert(Mat2D* result) const;
@@ -73,6 +80,7 @@ public:
     TransformComponents decompose() const;
     static Mat2D compose(const TransformComponents&);
     float findMaxScale() const;
+    bool hasUniformScale(float tolerance = math::EPSILON) const;
     Mat2D scale(Vec2D) const;
     Mat2D translate(Vec2D) const;
 

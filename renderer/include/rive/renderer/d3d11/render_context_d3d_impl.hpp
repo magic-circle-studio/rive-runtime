@@ -124,20 +124,20 @@ public:
         m_context->PSSetShader(m_tessellatePixelShader.Get(), NULL, 0);
     }
 
-    void setAtlasVertexState() const
+    void setFeatherAtlasVertexState() const
     {
-        m_context->IASetInputLayout(m_atlasLayout.Get());
-        m_context->VSSetShader(m_atlasVertexShader.Get(), NULL, 0);
+        m_context->IASetInputLayout(m_featherAtlasLayout.Get());
+        m_context->VSSetShader(m_featherAtlasVertexShader.Get(), NULL, 0);
     }
 
-    void setAtlasFillState() const
+    void setFeatherAtlasFillState() const
     {
-        m_context->PSSetShader(m_atlasFillPixelShader.Get(), NULL, 0);
+        m_context->PSSetShader(m_featherAtlasFillPixelShader.Get(), NULL, 0);
     }
 
-    void setAtlasStrokeState() const
+    void setFeatherAtlasStrokeState() const
     {
-        m_context->PSSetShader(m_atlasStrokePixelShader.Get(), NULL, 0);
+        m_context->PSSetShader(m_featherAtlasStrokePixelShader.Get(), NULL, 0);
     }
 
 protected:
@@ -163,10 +163,10 @@ private:
     ComPtr<ID3D11VertexShader> m_tessellateVertexShader;
     ComPtr<ID3D11PixelShader> m_tessellatePixelShader;
 
-    ComPtr<ID3D11InputLayout> m_atlasLayout;
-    ComPtr<ID3D11VertexShader> m_atlasVertexShader;
-    ComPtr<ID3D11PixelShader> m_atlasFillPixelShader;
-    ComPtr<ID3D11PixelShader> m_atlasStrokePixelShader;
+    ComPtr<ID3D11InputLayout> m_featherAtlasLayout;
+    ComPtr<ID3D11VertexShader> m_featherAtlasVertexShader;
+    ComPtr<ID3D11PixelShader> m_featherAtlasFillPixelShader;
+    ComPtr<ID3D11PixelShader> m_featherAtlasStrokePixelShader;
 };
 
 // D3D backend implementation of RenderContextImpl.
@@ -183,9 +183,19 @@ public:
         return make_rcp<RenderTargetD3D>(this, width, height);
     }
 
-    rcp<Texture> adoptImageTexture(ComPtr<ID3D11Texture2D> image,
-                                   uint32_t width,
-                                   uint32_t height);
+    // viewFormat lets callers force an SRV view format (e.g. picking the
+    // sRGB variant of a TYPELESS or UNORM source); UNKNOWN auto-infers.
+    rcp<Texture> adoptImageTexture(
+        ComPtr<ID3D11Texture2D> image,
+        uint32_t width,
+        uint32_t height,
+        DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN);
+
+#ifdef RIVE_CANVAS
+    void ensureCanvasBacking(gpu::RenderCanvas* canvas) override;
+
+    std::unique_ptr<rive::ore::Context> makeOreContext() override;
+#endif
 
     const D3DCapabilities& d3dCapabilities() const { return m_d3dCapabilities; }
     ID3D11Device* gpu() const { return m_gpu.Get(); }
@@ -217,7 +227,12 @@ private:
     rcp<Texture> makeImageTexture(uint32_t width,
                                   uint32_t height,
                                   uint32_t mipLevelCount,
-                                  const uint8_t imageDataRGBAPremul[]) override;
+                                  GPUTextureFormat,
+                                  const uint8_t imageData[],
+                                  uint8_t blockWidth = 1,
+                                  uint8_t blockHeight = 1,
+                                  bool srgb = false,
+                                  bool generateRemainingMips = false) override;
 
     std::unique_ptr<BufferRing> makeUniformBufferRing(
         size_t capacityInBytes) override;
@@ -229,11 +244,19 @@ private:
 
     void resizeGradientTexture(uint32_t width, uint32_t height) override;
     void resizeTessellationTexture(uint32_t width, uint32_t height) override;
-    void resizeAtlasTexture(uint32_t width, uint32_t height) override;
+    void resizeFeatherAtlasTexture(uint32_t width, uint32_t height) override;
 
     void flush(const FlushDescriptor&) override;
 
     D3D11PipelineManager m_pipelineManager;
+
+#ifdef WITH_RIVE_TOOLS
+    ShaderCompilationMode testingOnly_setShaderCompilationMode(
+        ShaderCompilationMode mode) override
+    {
+        return m_pipelineManager.testingOnly_setShaderCompilationMode(mode);
+    }
+#endif
 
     const D3DCapabilities m_d3dCapabilities;
 
@@ -245,17 +268,17 @@ private:
     ComPtr<ID3D11RenderTargetView> m_gradTextureRTV;
 
     // Gaussian integral table for feathering.
-    ComPtr<ID3D11Texture1D> m_featherTexture;
-    ComPtr<ID3D11ShaderResourceView> m_featherTextureSRV;
+    ComPtr<ID3D11Texture1D> m_gaussianIntegralTexture;
+    ComPtr<ID3D11ShaderResourceView> m_gaussianIntegralTextureSRV;
 
     ComPtr<ID3D11Texture2D> m_tessTexture;
     ComPtr<ID3D11ShaderResourceView> m_tessTextureSRV;
     ComPtr<ID3D11RenderTargetView> m_tessTextureRTV;
     ComPtr<ID3D11Buffer> m_tessSpanIndexBuffer;
 
-    ComPtr<ID3D11Texture2D> m_atlasTexture;
-    ComPtr<ID3D11ShaderResourceView> m_atlasTextureSRV;
-    ComPtr<ID3D11RenderTargetView> m_atlasTextureRTV;
+    ComPtr<ID3D11Texture2D> m_featherAtlasTexture;
+    ComPtr<ID3D11ShaderResourceView> m_featherAtlasTextureSRV;
+    ComPtr<ID3D11RenderTargetView> m_featherAtlasTextureRTV;
 
     // Vertex/index buffers for drawing path patches.
     ComPtr<ID3D11Buffer> m_patchVertexBuffer;
@@ -278,14 +301,12 @@ private:
 
     ComPtr<ID3D11Buffer> m_flushUniforms;
     ComPtr<ID3D11Buffer> m_drawUniforms;
-    ComPtr<ID3D11Buffer> m_imageDrawUniforms;
 
-    ComPtr<ID3D11SamplerState> m_linearSampler;
     ComPtr<ID3D11SamplerState>
         m_samplerStates[rive::ImageSampler::MAX_SAMPLER_PERMUTATIONS];
 
-    ComPtr<ID3D11RasterizerState> m_atlasFillRasterState;
-    ComPtr<ID3D11RasterizerState> m_atlasStrokeRasterState;
+    ComPtr<ID3D11RasterizerState> m_featherAtlasFillRasterState;
+    ComPtr<ID3D11RasterizerState> m_featherAtlasStrokeRasterState;
     ComPtr<ID3D11RasterizerState> m_backCulledRasterState[2];
     ComPtr<ID3D11RasterizerState> m_doubleSidedRasterState[2];
 

@@ -1,8 +1,19 @@
 #include "rive/text_engine.hpp"
 #include "rive/text/utf.hpp"
 #include "rive/text/glyph_lookup.hpp"
-#ifdef WITH_RIVE_TEXT
+#include "rive/text/line_break.hpp"
 using namespace rive;
+
+bool rive::isWhiteSpace(Unichar c)
+{
+    // Zs spaces, line and paragraph separators, NEL and zero width space.
+    // The no-break spaces U+00A0, U+2007 and U+202F are deliberately not.
+    return c <= ' ' || c == 0x0085 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200B && c != 0x2007) || c == 0x2028 ||
+           c == 0x2029 || c == 0x205F || c == 0x3000;
+}
+
+#ifdef WITH_RIVE_TEXT
 
 static void appendUnicode(std::vector<rive::Unichar>& unichars,
                           const char text[])
@@ -100,11 +111,11 @@ uint32_t OrderedLine::firstCodePointIndex(const GlyphLookup& glyphLookup) const
     if (run->dir() == TextDirection::rtl)
     {
         // If the final run is RTL we want to add the length of the final glyph
-        // to get the actual last available code unit in the line.
+        // to get the actual last available codepoint in the line.
         firstCodePointIndex += glyphLookup.count(run->textIndices[glyphIndex]);
     }
     // Clamp ignoring last zero width space for editing.
-    return std::min(firstCodePointIndex, glyphLookup.lastCodeUnitIndex() - 1);
+    return std::min(firstCodePointIndex, glyphLookup.lastCodePointIndex() - 1);
 }
 
 uint32_t OrderedLine::lastCodePointIndex(const GlyphLookup& glyphLookup) const
@@ -127,7 +138,7 @@ uint32_t OrderedLine::lastCodePointIndex(const GlyphLookup& glyphLookup) const
         lastCodePointIndex += glyphLookup.count(run->textIndices[glyphIndex]);
     }
     // Clamp ignoring last zero width space for editing.
-    return std::min(lastCodePointIndex, glyphLookup.lastCodeUnitIndex() - 1);
+    return std::min(lastCodePointIndex, glyphLookup.lastCodePointIndex() - 1);
 }
 
 bool OrderedLine::containsCodePointIndex(const GlyphLookup& glyphLookup,
@@ -307,4 +318,130 @@ float OrderedLine::bottom() const
     return m_y - m_glyphLine->baseline + m_glyphLine->bottom;
 }
 
+SimpleArray<Paragraph> Font::shapeText(Span<const Unichar> text,
+                                       Span<const TextRun> runs,
+                                       int textDirectionFlag) const
+{
+#ifdef DEBUG
+    size_t count = 0;
+    for (const TextRun& tr : runs)
+    {
+        assert(tr.unicharCount > 0);
+        count += tr.unicharCount;
+    }
+    assert(count <= text.size());
+#endif
+
+    SimpleArray<Paragraph> paragraphs =
+        onShapeText(text, runs, textDirectionFlag);
+    // Boundaries live on the stack for typical UI strings.
+    constexpr size_t kInlineBreaks = 257;
+    LineBreak inlineBreaks[kInlineBreaks];
+    std::vector<LineBreak> heapBreaks;
+    size_t breakCount = text.size() + 1;
+    if (breakCount > kInlineBreaks)
+    {
+        heapBreaks.resize(breakCount);
+    }
+    Span<LineBreak> lineBreaks(heapBreaks.empty() ? inlineBreaks
+                                                  : heapBreaks.data(),
+                               breakCount);
+    computeLineBreaks(text, lineBreaks);
+    bool inWord = false;
+    GlyphRun* lastRun = nullptr;
+    size_t reserveSize = text.size() / 4;
+    SimpleArrayBuilder<uint32_t> breakBuilder(reserveSize);
+    SimpleArrayBuilder<uint32_t> joinerBuilder(reserveSize);
+    for (const Paragraph& para : paragraphs)
+    {
+        for (GlyphRun& gr : para.runs)
+        {
+            if (lastRun != nullptr)
+            {
+                lastRun->breaks = std::move(breakBuilder);
+                lastRun->joiners = std::move(joinerBuilder);
+                // Reset the builder.
+                breakBuilder = SimpleArrayBuilder<uint32_t>(reserveSize);
+                joinerBuilder = SimpleArrayBuilder<uint32_t>(reserveSize);
+            }
+            uint32_t glyphIndex = 0;
+            uint32_t lastOffset = (uint32_t)-1;
+            for (uint32_t offset : gr.textIndices)
+            {
+                // Only the first glyph of a cluster can start or end a word.
+                if (offset == lastOffset)
+                {
+                    glyphIndex++;
+                    continue;
+                }
+                lastOffset = offset;
+                Unichar unicode = text[offset];
+                if (lineBreaks[offset + 1] == LineBreak::mandatory)
+                {
+                    breakBuilder.add(glyphIndex);
+                    breakBuilder.add(glyphIndex);
+                }
+                // Only U+2060 and U+FEFF are word joiners, skip the lookup
+                // for everything below them.
+                if (unicode >= 0x2060 &&
+                    lineBreakProps(unicode).cls == LineBreakClass::WJ)
+                {
+                    joinerBuilder.add(offset);
+                }
+                if (inWord)
+                {
+                    if (isWhiteSpace(unicode))
+                    {
+                        breakBuilder.add(glyphIndex);
+                        inWord = false;
+                    }
+                    // Soft hyphens stay unbreakable until we can draw the
+                    // hyphen at the line end.
+                    else if (lineBreaks[offset] == LineBreak::allowed &&
+                             text[offset - 1] != 0x00AD)
+                    {
+                        breakBuilder.add(glyphIndex);
+                        breakBuilder.add(glyphIndex);
+                    }
+                }
+                else if (!isWhiteSpace(unicode))
+                {
+                    breakBuilder.add(glyphIndex);
+                    inWord = true;
+                }
+                glyphIndex++;
+            }
+
+            lastRun = &gr;
+        }
+    }
+    if (lastRun != nullptr)
+    {
+        if (inWord)
+        {
+            breakBuilder.add((uint32_t)lastRun->glyphs.size());
+        }
+        else
+        {
+            // Consume the rest of the run.
+            breakBuilder.add(breakBuilder.empty() ? 0 : breakBuilder.back());
+            breakBuilder.add((uint32_t)lastRun->glyphs.size());
+        }
+        lastRun->breaks = std::move(breakBuilder);
+        lastRun->joiners = std::move(joinerBuilder);
+    }
+
+#ifdef DEBUG
+    for (const Paragraph& para : paragraphs)
+    {
+        for (const GlyphRun& gr : para.runs)
+        {
+            assert(gr.glyphs.size() > 0);
+            assert(gr.glyphs.size() == gr.textIndices.size());
+            assert(gr.glyphs.size() + 1 == gr.xpos.size());
+        }
+    }
+#endif
+    return paragraphs;
+}
 #endif

@@ -10,6 +10,18 @@
 
 using namespace rive;
 
+#ifdef WITH_RIVE_EDITOR
+Component::OnParentIdChangedCallback Component::s_onParentIdChanged = nullptr;
+
+void Component::parentIdChanged()
+{
+    if (s_onParentIdChanged != nullptr)
+    {
+        s_onParentIdChanged(this);
+    }
+}
+#endif
+
 bool Component::validate(CoreContext* context)
 {
     auto coreObject = context->resolve(parentId());
@@ -18,8 +30,69 @@ bool Component::validate(CoreContext* context)
 
 StatusCode Component::onAddedDirty(CoreContext* context)
 {
+#ifdef WITH_RIVE_EDITOR
+    // editor_native's coop-apply passes an EditorFile as the
+    // CoreContext — NOT an Artboard. The runtime's `static_cast` below
+    // is invalid in that case (produces garbage). Mirror Dart's
+    // `resolveArtboard()` in `packages/rive_core/lib/component.dart:175`:
+    // walk up the parent chain by id to find the Artboard. Uses
+    // `parentId()` (populated in Pass 2 of the coop-apply ordering)
+    // rather than `parent()` pointers, so result is independent of
+    // whether the parent's own `onAddedDirty` has run yet.
+    if (this->is<Artboard>())
+    {
+        m_Artboard = this->as<Artboard>();
+        return StatusCode::Ok;
+    }
+    auto* resolved = context->resolve(parentId());
+    if (resolved == nullptr || !resolved->is<ContainerComponent>())
+    {
+        // Parent not in the file (typeKey unknown to this build,
+        // or coop hasn't delivered it yet). Tell subclass
+        // `onAddedDirty` to bail too — propagating MissingObject
+        // means the subclass's `Super::onAddedDirty()` check at
+        // the top of every override returns early without
+        // calling typed setup like `initPaintMutator` /
+        // `parent()->as<X>()->addY(this)`. This mirrors Dart's
+        // `validate()` cull (rive_core/lib/component.dart:409 +
+        // rive_file.dart:750-764): orphan Cores are simply not
+        // wired into the live graph.
+        return StatusCode::MissingObject;
+    }
+    auto* parentContainer = resolved->as<ContainerComponent>();
+    setParentForEditor(parentContainer);
+    for (Core* curr = resolved; curr != nullptr;)
+    {
+        if (curr->is<Artboard>())
+        {
+            m_Artboard = curr->as<Artboard>();
+            break;
+        }
+        if (!curr->is<Component>())
+        {
+            break;
+        }
+        curr = context->resolve(curr->as<Component>()->parentId());
+    }
+    if (m_Artboard == nullptr)
+    {
+        // Parent chain broken before reaching the Artboard.
+        // Same propagation as no-parent: subclass `onAddedDirty`
+        // overrides bail on MissingObject from Super, so
+        // typed setup like `initPaintMutator(this)` (which derefs
+        // `artboard()->factory()`) never runs and never crashes.
+        // Pass G in `EditorFile::finalizeBatch` re-resolves the
+        // chain on every batch; if a subsequent coop batch fills
+        // the missing ancestor, `m_Artboard` gets populated and
+        // a re-validation pass (Slice 6 follow-up) can re-run
+        // the typed setup.
+        setParentForEditor(nullptr);
+        return StatusCode::MissingObject;
+    }
+    parentContainer->addChild(this);
+    return StatusCode::Ok;
+#else
     m_Artboard = static_cast<Artboard*>(context);
-    m_DependencyHelper.dependecyRoot(m_Artboard);
     if (this == m_Artboard)
     {
         // We're the artboard, don't parent to ourselves.
@@ -28,11 +101,7 @@ StatusCode Component::onAddedDirty(CoreContext* context)
     m_Parent = context->resolve(parentId())->as<ContainerComponent>();
     m_Parent->addChild(this);
     return StatusCode::Ok;
-}
-
-void Component::addDependent(Component* component)
-{
-    m_DependencyHelper.addDependent(component);
+#endif
 }
 
 bool Component::addDirt(ComponentDirt value, bool recurse)
@@ -48,14 +117,14 @@ bool Component::addDirt(ComponentDirt value, bool recurse)
 
     onDirty(m_Dirt);
 
-    m_DependencyHelper.onComponentDirty(this);
+    onComponentDirty(this);
 
     if (!recurse)
     {
         return true;
     }
 
-    m_DependencyHelper.addDirt(value);
+    addDirtToDependents(value);
     return true;
 }
 
@@ -69,13 +138,14 @@ StatusCode Component::import(ImportStack& importStack)
         return Super::import(importStack);
     }
 
+    // File::readObjects already put this in the artboard's object list (see
+    // claimsArtboardSlot); a component still needs an artboard to belong to.
     auto artboardImporter =
         importStack.latest<ArtboardImporter>(ArtboardBase::typeKey);
     if (artboardImporter == nullptr)
     {
         return StatusCode::MissingObject;
     }
-    artboardImporter->addComponent(this);
     return Super::import(importStack);
 }
 
@@ -95,7 +165,7 @@ bool Component::collapse(bool value)
         m_Dirt &= ~ComponentDirt::Collapsed;
     }
     onDirty(m_Dirt);
-    m_DependencyHelper.onComponentDirty(this);
+    onComponentDirty(this);
     updateCollapsables();
     return true;
 }
@@ -113,11 +183,12 @@ bool Component::hitTestPoint(const Vec2D& position,
 
 void Component::addCollapsable(DataBind* collapsable)
 {
-    auto itr =
-        std::find(m_collapsables.begin(), m_collapsables.end(), collapsable);
-    if (itr == m_collapsables.end())
+    // pushUnique gives set semantics; the collapse side-effect should only
+    // fire on first add, so detect that via size delta.
+    auto sizeBefore = m_collapsables.size();
+    m_collapsables.pushUnique(collapsable);
+    if (m_collapsables.size() != sizeBefore)
     {
-        m_collapsables.push_back(collapsable);
         collapsable->collapse(isCollapsed());
     }
 }
@@ -125,7 +196,7 @@ void Component::addCollapsable(DataBind* collapsable)
 void Component::updateCollapsables()
 {
     auto collapsed = isCollapsed();
-    for (auto& collapsable : m_collapsables)
+    for (auto* collapsable : m_collapsables)
     {
         collapsable->collapse(collapsed);
     }

@@ -99,6 +99,52 @@ int ScriptedAudioSource::playFrame(lua_State* L, AudioEngine* engine)
     return playFrame(L, engine, 0, true);
 }
 
+static void audio_source_direct_duration(void* udata, void* result)
+{
+    auto* self = (ScriptedAudioSource*)udata;
+    auto src = self->source();
+    if (src == nullptr)
+    {
+        lua_userdatadirectfield_setnil(result);
+        return;
+    }
+    lua_userdatadirectfield_setnumber(result, (double)src->duration());
+}
+
+static int audio_source_index(lua_State* L)
+{
+    int atom;
+    const char* key = lua_tostringatom(L, 2, &atom);
+    if (!key)
+    {
+        luaL_typeerrorL(L, 2, lua_typename(L, LUA_TSTRING));
+        return 0;
+    }
+
+    auto* scriptedAudioSource = lua_torive<ScriptedAudioSource>(L, 1);
+    if (scriptedAudioSource == nullptr ||
+        scriptedAudioSource->source() == nullptr)
+    {
+        return 0;
+    }
+    switch (atom)
+    {
+        case (int)LuaAtoms::duration:
+            lua_pushnumber(
+                L,
+                (lua_Number)scriptedAudioSource->source()->duration());
+            return 1;
+        default:
+            break;
+    }
+
+    luaL_error(L,
+               "'%s' is not a valid index of %s",
+               key,
+               ScriptedAudioSource::luaName);
+    return 0;
+}
+
 static int audio_sound_namecall(lua_State* L)
 {
     int atom;
@@ -213,6 +259,14 @@ static int audio_sound_newindex(lua_State* L)
                ScriptedAudioSound::luaName);
 
     return 0;
+}
+
+static void audio_sound_direct_volume(void* udata, void* result)
+{
+    auto* self = (ScriptedAudioSound*)udata;
+    lua_userdatadirectfield_setnumber(
+        result,
+        self->sound ? (double)self->sound->volume() : 0.0);
 }
 
 static int audio_sound_index(lua_State* L)
@@ -413,8 +467,16 @@ int luaopen_rive_audio(lua_State* L)
     {
         lua_register_rive<ScriptedAudioSource>(L);
 
+        lua_pushcfunction(L, audio_source_index, nullptr);
+        lua_setfield(L, -2, "__index");
+
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedAudioSource::luaTag,
+                                           "duration",
+                                           audio_source_direct_duration);
     }
     {
         lua_register_rive<ScriptedAudioSound>(L);
@@ -430,6 +492,11 @@ int luaopen_rive_audio(lua_State* L)
 
         lua_setreadonly(L, -1, true);
         lua_pop(L, 1); // pop the metatable
+
+        lua_registeruserdatadirectfieldget(L,
+                                           ScriptedAudioSound::luaTag,
+                                           "volume",
+                                           audio_sound_direct_volume);
     }
     luaL_register(L, ScriptedAudio::luaName, audioStaticMethods);
 #endif

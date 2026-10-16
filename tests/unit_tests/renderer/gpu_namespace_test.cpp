@@ -6,6 +6,8 @@
 #include "rive/renderer/gpu.hpp"
 #include "shaders/constants.glsl"
 #include <catch.hpp>
+#include <map>
+#include <set>
 
 namespace rive
 {
@@ -155,4 +157,125 @@ TEST_CASE("inverse_gaussian_integral_table", "[gpu]")
     CHECK(inverseGaussianIntegral(std::numeric_limits<float>::quiet_NaN()) ==
           0);
 }
+// ForEachUbershaderPermutation() has to enumerate every DrawType a backend can
+// actually bind. The dynamic-state DrawTypes were missing from msaa's
+// list, so no ubershader ever got built for them and a draw that fell back to
+// the async path had nothing to fall back to.
+TEST_CASE("ForEachUbershaderPermutation", "[gpu]")
+{
+    auto enumerateDrawTypes = [](bool supportsPipelineDynamicState) {
+        gpu::PlatformFeatures platformFeatures;
+        platformFeatures.supportsPipelineDynamicState =
+            supportsPipelineDynamicState;
+        std::set<gpu::DrawType> drawTypes;
+        gpu::ForEachUbershaderPermutation(gpu::InterlockMode::depthStencil,
+                                          platformFeatures,
+                                          [&drawTypes](gpu::DrawType drawType,
+                                                       gpu::ShaderFeatures,
+                                                       gpu::ShaderMiscFlags) {
+                                              drawTypes.insert(drawType);
+                                              return true; // Keep iterating.
+                                          });
+        return drawTypes;
+    };
+
+    const std::set<gpu::DrawType> withDynamicState = enumerateDrawTypes(true);
+    CHECK(withDynamicState.count(gpu::DrawType::stencilDynamicMidpointFans) ==
+          1);
+    CHECK(withDynamicState.count(gpu::DrawType::stencilDynamicOuterCubics) ==
+          1);
+
+    // Backends that can't switch depth/stencil/cull/color-write without
+    // rebinding a pipeline never bind these, so they don't precompile them.
+    const std::set<gpu::DrawType> withoutDynamicState =
+        enumerateDrawTypes(false);
+    CHECK(withoutDynamicState.count(
+              gpu::DrawType::stencilDynamicMidpointFans) == 0);
+    CHECK(withoutDynamicState.count(gpu::DrawType::stencilDynamicOuterCubics) ==
+          0);
+
+    // The passes they collapse are enumerated either way.
+    for (auto drawType : {gpu::DrawType::stencilMidpointFanBorrowedCoverage,
+                          gpu::DrawType::stencilMidpointFans,
+                          gpu::DrawType::stencilMidpointFanReset})
+    {
+        CHECK(withDynamicState.count(drawType) == 1);
+        CHECK(withoutDynamicState.count(drawType) == 1);
+    }
+}
+
+// ShaderUniqueKey() packs shaderMiscFlags densely, using only the bits that are
+// relevant to the interlockMode. Draw types that share a drawTypeKey therefore
+// have to agree on that layout -- otherwise the same packed value means
+// different flags for each, and two different shaders land on one key.
+TEST_CASE("shader_unique_keys_do_not_collide", "[gpu]")
+{
+    gpu::PlatformFeatures platformFeatures;
+    platformFeatures.supportsPipelineDynamicState = true;
+
+    for (auto interlockMode : {gpu::InterlockMode::rasterOrdering,
+                               gpu::InterlockMode::atomics,
+                               gpu::InterlockMode::clockwise,
+                               gpu::InterlockMode::clockwiseAtomic,
+                               gpu::InterlockMode::depthStencil})
+    {
+        // Two draws may share a key only if they compile to the same shader,
+        // which requires identical shaderMiscFlags.
+        std::map<uint32_t, gpu::ShaderMiscFlags> keyToMiscFlags;
+        gpu::ForEachUbershaderPermutation(
+            interlockMode,
+            platformFeatures,
+            [&](gpu::DrawType drawType,
+                gpu::ShaderFeatures shaderFeatures,
+                gpu::ShaderMiscFlags shaderMiscFlags) {
+                uint32_t key = gpu::ShaderUniqueKey(drawType,
+                                                    shaderFeatures,
+                                                    interlockMode,
+                                                    shaderMiscFlags);
+                auto [it, inserted] =
+                    keyToMiscFlags.insert({key, shaderMiscFlags});
+                if (!inserted)
+                {
+                    INFO("interlockMode "
+                         << static_cast<uint32_t>(interlockMode)
+                         << ", drawType " << static_cast<uint32_t>(drawType)
+                         << ", key " << key);
+                    CHECK(it->second == shaderMiscFlags);
+                }
+                return true; // Keep iterating.
+            });
+    }
+}
+
+TEST_CASE("layer_mask_mode_stays_out_of_the_clip_id", "[gpu]")
+{
+    auto params = [](LayerMaskMode mode) {
+        gpu::PaintData data;
+        data.set(gpu::DrawContents::none,
+                 gpu::PaintType::solidColor,
+                 gpu::SimplePaintValue{},
+                 /*clipID=*/2,
+                 /*hasClipRect=*/false,
+                 /*hasImage=*/true,
+                 BlendMode::srcOver,
+                 /*solidUnmultiplied=*/false,
+                 /*additiveness=*/0.f,
+                 /*isLayerMask=*/true,
+                 mode);
+        uint32_t out;
+        memcpy(&out, &data, sizeof(out));
+        return out;
+    };
+
+    uint32_t valid = params(LayerMaskMode::invertedLuminance);
+    CHECK((valid >> 16) == 2);
+    CHECK(((valid & PAINT_LAYER_MASK_MODE_MASK) >>
+           PAINT_LAYER_MASK_MODE_SHIFT) == LAYER_MASK_MODE_INVERTED_LUMINANCE);
+
+    // A number bound to the mode can carry any value. 8 used to land on the
+    // low bit of the clipID.
+    uint32_t outOfRange = params(static_cast<LayerMaskMode>(8));
+    CHECK((outOfRange >> 16) == 2);
+}
+
 } // namespace rive

@@ -8,9 +8,56 @@ filter({ 'options:with_rive_text' })
 do
     defines({ 'WITH_RIVE_TEXT' })
 end
+filter({ 'options:with_rive_canvas' })
+do
+    defines({ 'RIVE_CANVAS' })
+end
 filter({ 'options:with_rive_scripting' })
 do
     defines({ 'WITH_RIVE_SCRIPTING' })
+end
+-- The wasm backend carries no Luau in any capacity; every other backend
+-- keeps it, and 'both' runs the two side by side for differential tools.
+if _OPTIONS['scripting_vm'] ~= 'wasm' then
+    filter({ 'options:with_rive_scripting' })
+    do
+        defines({ 'WITH_RIVE_SCRIPTING_LUAU' })
+    end
+    filter({})
+end
+-- WAMR has no emscripten platform layer. On the web script modules run on
+-- the browser's own wasm engine, so the backend stays on and only WAMR is out.
+local wamrBuildable = _OPTIONS['arch'] ~= 'wasm' and _OPTIONS['arch'] ~= 'js'
+-- Workspace scope: gated members change class layout, so every project
+-- must agree on the define.
+if _OPTIONS['scripting_vm'] == 'wasm' or _OPTIONS['scripting_vm'] == 'both'
+then
+    filter({ 'options:with_rive_scripting' })
+    do
+        defines({ 'WITH_RIVE_SCRIPTING_WASM' })
+    end
+    filter({})
+    if _OPTIONS['wasm_hw_bounds'] then
+        filter({ 'options:with_rive_scripting' })
+        do
+            defines({ 'RIVE_WASM_HW_BOUNDS' })
+        end
+        filter({})
+    end
+end
+filter({ 'options:with_rive_test_signature' })
+do
+    -- Swaps `g_scriptVerificationPublicKey` for the public key that
+    -- corresponds to `SampleSigningContext._samplePrivateKey` in Dart,
+    -- so .riv files signed locally via the sample keypair verify.
+    -- NEVER enable on shipping builds — it accepts .rivs any attacker
+    -- could produce.
+    defines({ 'WITH_RIVE_TEST_SIGNATURE' })
+end
+filter({ 'options:track_rive_shader_id' })
+do
+    -- Stores ShaderAsset::assetId() on each ore::ShaderModule.
+    defines({ 'TRACK_RIVE_SHADER_ID' })
 end
 filter({ 'options:with_rive_audio=system' })
 do
@@ -29,6 +76,20 @@ end
 filter({ 'options:with_rive_layout' })
 do
     defines({ 'WITH_RIVE_LAYOUT' })
+end
+-- Script networking (fetch). Hosts still choose the transport at runtime;
+-- without one every request is denied.
+filter({ 'options:with_rive_scriptnet' })
+do
+    defines({ 'WITH_RIVE_SCRIPTNET' })
+end
+filter({ 'options:with_rive_editor' })
+do
+    defines({ 'WITH_RIVE_EDITOR' })
+    -- Generated runtime bases include their editor extension `.inl` from the
+    -- kernel tree, so every project that sees a generated header needs the
+    -- kernel include root, not just the `rive` library.
+    includedirs({ path.getabsolute('../editor_native/kernel/include') })
 end
 filter({})
 
@@ -50,6 +111,15 @@ if _OPTIONS['with_rive_scripting'] then
     local scripting = require(path.join(path.getabsolute('scripting/'), 'premake5'))
     luau = scripting.luau
     libhydrogen = scripting.libhydrogen
+    if (_OPTIONS['scripting_vm'] == 'wasm' or _OPTIONS['scripting_vm'] == 'both')
+        and wamrBuildable
+    then
+        local wamrLib =
+            require(path.join(path.getabsolute('scripting/'), 'premake5_wamr'))
+        wamr = wamrLib.wamr
+        wamrConfigDefines = wamrLib.configDefines
+        wamrInternalIncludes = wamrLib.internalIncludes
+    end
 else
     project('luau_vm')
     do
@@ -70,6 +140,19 @@ do
         miniaudio,
         yoga,
     })
+
+    -- ORE headers conditionally include <vulkan/vulkan.h> when
+    -- ORE_BACKEND_VK is defined; the rive base library transitively pulls
+    -- those headers in, so the Vulkan SDK paths need to be visible here too.
+    if _OPTIONS['with_vulkan'] and _OPTIONS['with_rive_canvas'] then
+        local dependency = require('dependency')
+        local vh = dependency.github('KhronosGroup/Vulkan-Headers',
+                                     'vulkan-sdk-1.4.321')
+        local vma = dependency.github(
+            'GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator',
+            'v3.3.0')
+        externalincludedirs({ vh .. '/include', vma .. '/include' })
+    end
 
     if _OPTIONS['with_microprofile'] then
       includedirs({microprofile})
@@ -95,15 +178,20 @@ do
         files({ 'runtime.natvis' })
     end
 
+    -- TODO: remove once simple_array.hpp migrates off std::is_pod.
+    -- Console toolchains OOM on the ~18k deprecation warnings otherwise.
+    filter({ 'options:_console_only_ore_vk' })
+    do
+        buildoptions({ '-Wno-deprecated-declarations' })
+    end
+
     filter('options:not for_unreal')
     do
-        cppdialect('C++11')
         fatalwarnings({ 'All' })
     end
 
-    filter({ 'options:for_unreal' })
+    filter({'options:for_unreal'})
     do
-        cppdialect('C++17')
         defines({ '_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR' })
     end
 
@@ -138,7 +226,7 @@ do
     end
 
     filter({})
-    
+
     if _OPTIONS['with_optick'] then
         includedirs({ optick .. '/src' })
     end
@@ -147,7 +235,11 @@ do
 
     filter('system:macosx or system:ios')
     do
-        files({ 'src/text/font_hb_apple.mm' })
+        files({
+            'src/text/font_hb_apple.mm',
+            -- Gated inside on WITH_RIVE_SCRIPTNET.
+            'src/scriptnet/net_provider_apple.mm',
+        })
     end
 
     if TESTING == true then
@@ -156,20 +248,108 @@ do
             buildoptions({ '-Wshorten-64-to-32', '-fprofile-instr-generate', '-fcoverage-mapping' })
         end
     end
+    filter({ 'options:with_rive_scripting', 'options:not no-rive-decoders' })
+    do
+        defines({ 'RIVE_DECODERS' })
+        includedirs({ 'decoders/include' })
+    end
     filter({ 'options:with_rive_scripting' })
     do
         includedirs({
-            luau .. '/VM/include',
             libhydrogen,
         })
         files({
             libhydrogen .. '/libhydrogen.c',
         })
     end
+    if _OPTIONS['scripting_vm'] ~= 'wasm' then
+        filter({ 'options:with_rive_scripting' })
+        do
+            includedirs({ luau .. '/VM/include' })
+        end
+    end
+    if wamr then
+        filter({ 'options:with_rive_scripting' })
+        do
+            includedirs({ wamr .. '/core/iwasm/include' })
+            defines(wamrConfigDefines)
+            -- Tools builds may read wamr internals, whose layouts hinge on
+            -- the config defines above.
+            filter({
+                'options:with_rive_scripting',
+                'options:with_rive_tools',
+            })
+            includedirs(wamrInternalIncludes)
+            filter({ 'options:with_rive_scripting', 'system:macosx' })
+            defines({ 'BH_PLATFORM_DARWIN' })
+            filter({ 'options:with_rive_scripting', 'system:linux' })
+            defines({ 'BH_PLATFORM_LINUX' })
+            filter({ 'options:with_rive_scripting', 'system:windows' })
+            defines({ 'BH_PLATFORM_WINDOWS', 'HAVE_STRUCT_TIMESPEC' })
+            filter({ 'options:with_rive_scripting' })
+        end
+        filter({})
+    end
+    filter({ 'options:with_rive_canvas' })
+    do
+        -- lua_gpu.cpp and lua_scripted_context.cpp include renderer (C++17) headers.
+        includedirs({ 'renderer/include' })
+    end
+    filter({ 'options:with_rive_canvas', 'options:not cpp20' })
+    do
+        -- We need to also set the dialect to C++17 when building with Rive
+        -- canvas, unless we're also setting it to C++20 (in which case we
+        -- want to keep that preference)
+        cppdialect('C++17')
+    end
+    -- On Apple, ore_context.hpp imports Metal.h (ORE_BACKEND_METAL is globally
+    -- defined), which requires ObjC++ compilation. Swap .cpp files for .mm
+    -- wrappers so they are compiled as ObjC++.
+    -- Also undefine the GL globals that bleed in from pls_renderer.lua —
+    -- the runtime rive project only uses Metal on macOS/iOS.
+    filter({ 'system:macosx or system:ios', 'options:with_rive_canvas' })
+    do
+        -- Swap .cpp for .mm wrappers: ore_context.hpp imports <Metal/Metal.h>
+        -- (via ORE_BACKEND_METAL) which is only valid in ObjC++ files.
+        removefiles({ 'src/lua/lua_scripted_context.cpp' })
+        removefiles({ 'src/lua/renderer/lua_gpu.cpp' })
+        files({ 'src/lua/lua_scripted_context_apple.mm' })
+        files({ 'src/lua/renderer/lua_gpu_apple.mm' })
+    end
     filter({ 'options:with_rive_scripting', 'options:not with_rive_tools' })
     do
-        -- at runtime we only need signature verification
-        defines({ 'HYDRO_SIGN_VERIFY_ONLY' })
+        -- =1 required; an empty define evaluates to 0 on strict preprocessors.
+        defines({ 'HYDRO_SIGN_VERIFY_ONLY=1' })
+    end
+    if _OPTIONS['scripting_vm'] == 'wasm' then
+        filter({})
+        removefiles({ 'src/lua/**' })
+    end
+    filter({ 'system:emscripten' })
+    do
+        removefiles({
+            'src/wasm/module_tier_ladder.cpp',
+            'src/wasm/prelinked_aot.cpp',
+        })
+    end
+    filter({})
+    filter({
+        'options:with_rive_scripting',
+        'options:config=release',
+        'system:android',
+        'options:arch=arm',
+        'files:**/libhydrogen.c'
+    })
+    do
+        -- Android ARMv7 devices running API < 29 cannot load ELF TLS relocations
+        -- (e.g. R_ARM_TLS_*). In release builds with scripting, libhydrogen.c can
+        -- introduce these TLS relocations (through `__thread` for RNG) when LTO
+        -- is enabled, which then fails to link at runtime (`unknown reloc type 17`).
+
+        -- We want to keep global LTO for performance, but compile only this
+        -- translation unit without LTO, forcing emulated TLS so that the final
+        -- ARMv7 librive-android.so does not include unsupported ELF TLS relocations.
+        buildoptions({'-fno-lto', '-femulated-tls'})
     end
 end
 
@@ -181,6 +361,38 @@ newoption({
 newoption({
     trigger = 'with_rive_scripting',
     description = 'Enables scripting for the runtime.',
+})
+
+-- Internal capability flag opted into by platform packages.
+newoption({
+    trigger = '_nx_platform',
+    description = 'internal: Nintendo build (set by platform packages)',
+})
+
+newoption({
+    trigger = 'scripting_vm',
+    value = 'VM',
+    description = 'Scripting execution backend.',
+    allowed = {
+        { 'luau', 'Native Luau VM (default)' },
+        { 'wasm', 'WAMR executing wasm script modules, no Luau in the build' },
+        { 'both', 'Both backends, for differential tools' },
+    },
+    default = 'luau',
+})
+
+newoption({
+    trigger = 'wasm_hw_bounds',
+    description = 'WAMR hardware bounds checks for wasm modules compiled '
+        .. 'without sw bounds (AnimaScript); Luau artifacts stay sw. '
+        .. '64-bit desktop/mobile only: reserves 8GB address space per '
+        .. 'module memory and installs a SIGSEGV/SIGBUS handler.',
+})
+
+newoption({
+    trigger = 'with_rive_test_signature',
+    description = 'Test-only: accept .riv files signed by the Dart '
+        .. 'SampleSigningContext keypair. Do not enable on shipping builds.',
 })
 
 newoption({
@@ -201,6 +413,27 @@ newoption({
 })
 
 newoption({
+    trigger = 'with_rive_canvas',
+    description = 'Compiles in RenderCanvas and Ore GPU abstraction layer.',
+})
+
+newoption({
+    trigger = 'with_rive_scriptnet',
+    description = 'Compiles in script networking (fetch). Requires scripting.',
+})
+
+newoption({
+    trigger = 'with_rive_editor',
+    description = 'Enables editor-mode hooks (onPropertyChanging, applyChange, arena). '
+        .. 'Defined only by editor_native — never by runtime SDK consumers.',
+})
+
+newoption({
     trigger = 'with_rive_docs',
     description = 'Indicates building for use with the docs generator.',
+})
+
+newoption({
+    trigger = 'track_rive_shader_id',
+    description = 'Stores ShaderAsset::assetId() on each ore::ShaderModule.',
 })

@@ -13,20 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 47;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TrimPathBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t startPropertyKey = 114;
@@ -48,8 +34,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(startPropertyKey, &m_Start, &value);
         m_Start = value;
-        startChanged();
+        RIVE_EDITOR_CHANGED(startChanged());
+        notifyPropertyChanged(startPropertyKey);
     }
 
     inline float end() const { return m_End; }
@@ -59,8 +47,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(endPropertyKey, &m_End, &value);
         m_End = value;
-        endChanged();
+        RIVE_EDITOR_CHANGED(endChanged());
+        notifyPropertyChanged(endPropertyKey);
     }
 
     inline float offset() const { return m_Offset; }
@@ -70,8 +60,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(offsetPropertyKey, &m_Offset, &value);
         m_Offset = value;
-        offsetChanged();
+        RIVE_EDITOR_CHANGED(offsetChanged());
+        notifyPropertyChanged(offsetPropertyKey);
     }
 
     inline uint32_t modeValue() const { return m_ModeValue; }
@@ -81,8 +73,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(modeValuePropertyKey, &m_ModeValue, &value);
         m_ModeValue = value;
-        modeValueChanged();
+        RIVE_EDITOR_CHANGED(modeValueChanged());
+        notifyPropertyChanged(modeValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -120,6 +114,9 @@ protected:
     virtual void endChanged() {}
     virtual void offsetChanged() {}
     virtual void modeValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/shapes/paint/trim_path_ext.inl"
+#endif
 };
 } // namespace rive
 

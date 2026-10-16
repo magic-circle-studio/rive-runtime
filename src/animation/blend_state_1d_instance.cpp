@@ -68,7 +68,7 @@ void BlendState1DInstance::apply(ArtboardInstance* instance, float mix)
 {
     if (m_AnimationReset != nullptr)
     {
-        m_AnimationReset->apply(instance);
+        m_AnimationReset->seed(instance, m_accumulator);
     }
     BlendStateInstance::apply(instance, mix);
 }
@@ -100,7 +100,8 @@ void BlendState1DInstance::advance(float seconds,
         auto bindablePropertyInstance =
             stateMachineInstance->bindablePropertyInstance(
                 blendState->bindableProperty());
-        if (bindablePropertyInstance->is<BindablePropertyNumber>())
+        if (bindablePropertyInstance &&
+            bindablePropertyInstance->is<BindablePropertyNumber>())
         {
             value = bindablePropertyInstance->as<BindablePropertyNumber>()
                         ->propertyValue();

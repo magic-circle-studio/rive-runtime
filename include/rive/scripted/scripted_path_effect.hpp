@@ -25,7 +25,7 @@ class ScriptedPathEffect : public ScriptedPathEffectBase,
 {
 public:
 #ifdef WITH_RIVE_SCRIPTING
-    bool scriptInit(ScriptingVM* vm) override;
+    void didHydrateScriptInputs() override;
 #endif
     void addProperty(CustomProperty* prop) override;
     StatusCode onAddedClean(CoreContext* context) override;
@@ -60,6 +60,9 @@ public:
 
 protected:
     virtual EffectPath* createEffectPath() override;
+
+private:
+    bool m_isAdvanceActive = true;
 };
 } // namespace rive
 

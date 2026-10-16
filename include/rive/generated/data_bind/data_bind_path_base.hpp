@@ -14,19 +14,6 @@ protected:
 public:
     static const uint16_t typeKey = 643;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case DataBindPathBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t pathPropertyKey = 920;
@@ -46,8 +33,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(isRelativePropertyKey, &m_IsRelative, &value);
         m_IsRelative = value;
-        isRelativeChanged();
+        notifyPropertyChanged(isRelativePropertyKey);
     }
 
     Core* clone() const override;
@@ -55,6 +43,7 @@ public:
     {
         copyPath(object);
         m_IsRelative = object.m_IsRelative;
+        RIVE_EDITOR_COPY_VALIDATED(object);
     }
 
     bool deserialize(uint16_t propertyKey, BinaryReader& reader) override
@@ -73,7 +62,9 @@ public:
 
 protected:
     virtual void pathChanged() {}
-    virtual void isRelativeChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/data_bind/data_bind_path_ext.inl"
+#endif
 };
 } // namespace rive
 

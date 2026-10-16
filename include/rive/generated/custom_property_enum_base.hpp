@@ -1,6 +1,7 @@
 #ifndef _RIVE_CUSTOM_PROPERTY_ENUM_BASE_HPP_
 #define _RIVE_CUSTOM_PROPERTY_ENUM_BASE_HPP_
-#include "rive/core/field_types/core_uint_type.hpp"
+#include "rive/core/field_types/core_id_type.hpp"
+#include "rive/core/id.hpp"
 #include "rive/custom_property.hpp"
 namespace rive
 {
@@ -12,51 +13,41 @@ protected:
 public:
     static const uint16_t typeKey = 616;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case CustomPropertyEnumBase::typeKey:
-            case CustomPropertyBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t propertyValuePropertyKey = 872;
     static const uint16_t enumIdPropertyKey = 873;
 
 protected:
-    uint32_t m_PropertyValue = -1;
-    uint32_t m_EnumId = -1;
+    Id m_PropertyValue = kEmptyId;
+    Id m_EnumId = kEmptyId;
 
 public:
-    inline uint32_t propertyValue() const { return m_PropertyValue; }
-    void propertyValue(uint32_t value)
+    inline Id propertyValue() const { return m_PropertyValue; }
+    void propertyValue(Id value)
     {
         if (m_PropertyValue == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(propertyValuePropertyKey,
+                             &m_PropertyValue,
+                             &value);
         m_PropertyValue = value;
-        propertyValueChanged();
+        RIVE_EDITOR_CHANGED(propertyValueChanged());
+        notifyPropertyChanged(propertyValuePropertyKey);
     }
 
-    inline uint32_t enumId() const { return m_EnumId; }
-    void enumId(uint32_t value)
+    inline Id enumId() const { return m_EnumId; }
+    void enumId(Id value)
     {
         if (m_EnumId == value)
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(enumIdPropertyKey, &m_EnumId, &value);
         m_EnumId = value;
-        enumIdChanged();
+        notifyPropertyChanged(enumIdPropertyKey);
     }
 
     Core* clone() const override;
@@ -72,10 +63,10 @@ public:
         switch (propertyKey)
         {
             case propertyValuePropertyKey:
-                m_PropertyValue = CoreUintType::deserialize(reader);
+                m_PropertyValue = CoreIdType::runtimeDeserialize(reader);
                 return true;
             case enumIdPropertyKey:
-                m_EnumId = CoreUintType::deserialize(reader);
+                m_EnumId = CoreIdType::runtimeDeserialize(reader);
                 return true;
         }
         return CustomProperty::deserialize(propertyKey, reader);
@@ -83,7 +74,9 @@ public:
 
 protected:
     virtual void propertyValueChanged() {}
-    virtual void enumIdChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/custom_property_enum_ext.inl"
+#endif
 };
 } // namespace rive
 

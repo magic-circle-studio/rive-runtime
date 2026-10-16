@@ -13,22 +13,6 @@ protected:
 public:
     static const uint16_t typeKey = 162;
 
-    /// Helper to quickly determine if a core object extends another without
-    /// RTTI at runtime.
-    bool isTypeOf(uint16_t typeKey) const override
-    {
-        switch (typeKey)
-        {
-            case TextVariationModifierBase::typeKey:
-            case TextShapeModifierBase::typeKey:
-            case TextModifierBase::typeKey:
-            case ComponentBase::typeKey:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     uint16_t coreType() const override { return typeKey; }
 
     static const uint16_t axisTagPropertyKey = 320;
@@ -46,8 +30,9 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(axisTagPropertyKey, &m_AxisTag, &value);
         m_AxisTag = value;
-        axisTagChanged();
+        notifyPropertyChanged(axisTagPropertyKey);
     }
 
     inline float axisValue() const { return m_AxisValue; }
@@ -57,8 +42,10 @@ public:
         {
             return;
         }
+        RIVE_EDITOR_CHANGING(axisValuePropertyKey, &m_AxisValue, &value);
         m_AxisValue = value;
-        axisValueChanged();
+        RIVE_EDITOR_CHANGED(axisValueChanged());
+        notifyPropertyChanged(axisValuePropertyKey);
     }
 
     Core* clone() const override;
@@ -84,8 +71,10 @@ public:
     }
 
 protected:
-    virtual void axisTagChanged() {}
     virtual void axisValueChanged() {}
+#ifdef WITH_RIVE_EDITOR
+#include "editor_native/generated/text/text_variation_modifier_ext.inl"
+#endif
 };
 } // namespace rive
 

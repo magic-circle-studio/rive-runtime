@@ -23,7 +23,14 @@ public:
         const ScriptInputViewModelPropertyBase& object) override;
     void initScriptedValue() override;
     bool validateForScriptInit() override;
+    bool validateForColdScriptInit() override;
+    bool hydrateScriptInput() override;
+    bool validateHydrationPrerequisites() override;
     StatusCode import(ImportStack& importStack) override;
+    bool claimsArtboardSlot(ImportStack& importStack) const override
+    {
+        return ScriptInput::takesArtboardSlot(this);
+    }
     StatusCode onAddedClean(CoreContext* context) override;
 };
 } // namespace rive

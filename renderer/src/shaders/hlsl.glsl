@@ -129,12 +129,13 @@ $typedef float3 packed_float3;
 #define TEXTURE_R16F_1D_ARRAY(SET, IDX, NAME)                                  \
     uniform $Texture1DArray<half> NAME : $register($t##IDX)
 
-// SAMPLER_LINEAR and SAMPLER_MIPMAP are the same because in d3d11, sampler
+// SAMPLER_LINEAR is the same as SAMPLER because in d3d11, sampler
 // parameters are defined at the API level.
 #define SAMPLER(IDX, NAME) $SamplerState NAME : $register($s##IDX);
 #define SAMPLER_LINEAR SAMPLER
-#define SAMPLER_MIPMAP SAMPLER
+#define SAMPLER_LINEAR_WRAP SAMPLER
 #define SAMPLER_DYNAMIC(SET, IDX, NAME) SAMPLER(IDX, NAME)
+#define SAMPLER_DYNAMIC_IMAGE(NAME) SAMPLER(IMAGE_TEXTURE_IDX, NAME)
 
 #define TEXEL_FETCH(NAME, COORD) NAME[COORD]
 #define TEXTURE_SAMPLE(NAME, SAMPLER_NAME, COORD)                              \
@@ -179,9 +180,9 @@ $typedef float3 packed_float3;
 #endif
 #define PLS_DECL4F_READONLY PLS_DECL4F
 #define PLS_DECLUI(IDX, NAME) uniform PLS_TEX2D<uint> NAME : $register($u##IDX)
-#define PLS_DECLUI_ATOMIC PLS_DECLUI
-#define PLS_LOADUI_ATOMIC PLS_LOADUI
-#define PLS_STOREUI_ATOMIC PLS_STOREUI
+#define PLS_DECLUI_UAV PLS_DECLUI
+#define PLS_LOADUI_UAV PLS_LOADUI
+#define PLS_STOREUI_UAV PLS_STOREUI
 #define PLS_BLOCK_END
 
 #ifdef @ENABLE_TYPED_UAV_LOAD_STORE
@@ -243,8 +244,16 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
         uint _instanceID = _instanceIDWithoutBase + baseInstance;              \
         Varyings _varyings;
 
-#define IMAGE_RECT_VERTEX_MAIN(NAME, Attrs, attrs, _vertexID, _instanceID)     \
-    Varyings main(Attrs attrs, uint _vertexID : $SV_VertexID)                  \
+#define IMAGE_RECT_VERTEX_MAIN(NAME,                                           \
+                               Attrs,                                          \
+                               attrs,                                          \
+                               ImageDrawAttrs,                                 \
+                               imageDrawAttrs,                                 \
+                               _vertexID,                                      \
+                               _instanceID)                                    \
+    Varyings main(Attrs attrs,                                                 \
+                  ImageDrawAttrs imageDrawAttrs,                               \
+                  uint _vertexID : $SV_VertexID)                               \
     {                                                                          \
         Varyings _varyings;                                                    \
         float4 _pos;
@@ -254,9 +263,12 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
                                position,                                       \
                                UVAttr,                                         \
                                uv,                                             \
+                               ImageDrawAttrs,                                 \
+                               imageDrawAttrs,                                 \
                                _vertexID)                                      \
     Varyings main(PositionAttr position,                                       \
                   UVAttr uv,                                                   \
+                  ImageDrawAttrs imageDrawAttrs,                               \
                   uint _vertexID : $SV_VertexID)                               \
     {                                                                          \
         Varyings _varyings;                                                    \
@@ -290,8 +302,6 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
         float2 _fragCoord = _varyings._pos.xy;\
         int2 _plsCoord = int2(floor(_fragCoord));
 
-#define PLS_MAIN_WITH_IMAGE_UNIFORMS(NAME) PLS_MAIN(NAME)
-
 #define EMIT_PLS }
 
 #define PLS_FRAG_COLOR_MAIN(NAME)                                              \
@@ -300,8 +310,6 @@ INLINE uint pls_atomic_add(PLS_TEX2D<uint> plane, int2 _plsCoord, uint x)
         float2 _fragCoord = _varyings._pos.xy;                                 \
         int2 _plsCoord = int2(floor(_fragCoord));                              \
         half4 _fragColor;
-
-#define PLS_FRAG_COLOR_MAIN_WITH_IMAGE_UNIFORMS(NAME) PLS_FRAG_COLOR_MAIN(NAME)
 
 #define EMIT_PLS_AND_FRAG_COLOR                                                \
     }                                                                          \
@@ -360,9 +368,16 @@ INLINE half4 unpackUnorm4x8(uint u)
     return half4(vals) * (1. / 255.);
 }
 
+INLINE float2 unpackUnorm2x16(uint u)
+{
+    uint2 vals = uint2(u & 0xffffu, u >> 16);
+    return float2(vals) * (1. / 65535.);
+}
+
 INLINE uint packUnorm4x8(half4 color)
 {
-    uint4 vals = (uint4(color * 255.) & 0xff) << uint4(0, 8, 16, 24);
+    // Clamp before quantizing: additive blending produces channel values > 1,
+    uint4 vals = (uint4($saturate(color) * 255.) & 0xff) << uint4(0, 8, 16, 24);
     vals.rg |= vals.ba;
     vals.r |= vals.g;
     return vals.r;

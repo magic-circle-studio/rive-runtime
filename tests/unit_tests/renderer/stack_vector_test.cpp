@@ -249,3 +249,127 @@ TEST_CASE("data()", "[stack_vector]")
         CHECK(constVec.data()[i] == i);
     }
 }
+
+TEST_CASE("range iter", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    CHECK(vec.dataOrNull() == nullptr);
+    CHECK(constify(vec).dataOrNull() == nullptr);
+
+    vec.push_back_n(NUM_TEST_VALUES, nullptr);
+    CHECK(vec.dataOrNull() != nullptr);
+    CHECK(constify(vec).dataOrNull() != nullptr);
+    CHECK(vec.size() == NUM_TEST_VALUES);
+    CHECK(constify(vec).size() == NUM_TEST_VALUES);
+
+    std::iota(vec.dataOrNull(), vec.dataOrNull() + NUM_TEST_VALUES, 0);
+    int i = 0;
+    for (uint32_t val : vec)
+    {
+        CHECK(val == i++);
+    }
+    CHECK(i == NUM_TEST_VALUES);
+
+    i = 0;
+    for (uint32_t val : constify(vec))
+    {
+        CHECK(val == i++);
+    }
+    CHECK(i == NUM_TEST_VALUES);
+}
+
+TEST_CASE("insert - into empty", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    // insert() returns a reference to the newly inserted element.
+    CHECK(test_values[0] == vec.insert(0, test_values[0]));
+    CHECK(&vec.insert(1, test_values[1]) == &vec[1]);
+    CHECK(vec.size() == 2);
+    CHECK(vec[0] == test_values[0]);
+    CHECK(vec[1] == test_values[1]);
+}
+
+TEST_CASE("insert - at end matches push_back", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    for (uint32_t i = 0; i < NUM_TEST_VALUES; ++i)
+    {
+        // index == size() appends.
+        CHECK(test_values[i] == vec.insert(vec.size(), test_values[i]));
+        CHECK(&vec.back() == &vec[i]);
+        CHECK(vec.size() == i + 1);
+    }
+    for (uint32_t i = 0; i < NUM_TEST_VALUES; ++i)
+    {
+        CHECK(vec[i] == test_values[i]);
+    }
+}
+
+TEST_CASE("insert - at front shifts up", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    // Inserting each value at the front reverses the input order.
+    for (uint32_t i = 0; i < NUM_TEST_VALUES; ++i)
+    {
+        CHECK(test_values[i] == vec.insert(0, test_values[i]));
+        CHECK(vec.front() == test_values[i]);
+        CHECK(vec.size() == i + 1);
+    }
+    for (uint32_t i = 0; i < NUM_TEST_VALUES; ++i)
+    {
+        CHECK(vec[i] == test_values[NUM_TEST_VALUES - 1 - i]);
+    }
+}
+
+TEST_CASE("insert - in middle", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    vec.push_back(test_values[0]);
+    vec.push_back(test_values[1]);
+    vec.push_back(test_values[2]);
+
+    // Insert between indices 1 and 2, shifting [2..) up.
+    CHECK(test_values[3] == vec.insert(2, test_values[3]));
+    CHECK(vec.size() == 4);
+    CHECK(vec[0] == test_values[0]);
+    CHECK(vec[1] == test_values[1]);
+    CHECK(vec[2] == test_values[3]);
+    CHECK(vec[3] == test_values[2]);
+
+    // Insert again earlier; only later elements shift.
+    CHECK(test_values[4] == vec.insert(1, test_values[4]));
+    CHECK(vec.size() == 5);
+    CHECK(vec[0] == test_values[0]);
+    CHECK(vec[1] == test_values[4]);
+    CHECK(vec[2] == test_values[1]);
+    CHECK(vec[3] == test_values[3]);
+    CHECK(vec[4] == test_values[2]);
+}
+
+TEST_CASE("empty()", "[stack_vector]")
+{
+    StackVector<uint32_t, NUM_TEST_VALUES> vec;
+    CHECK(vec.empty());
+    CHECK(constify(vec).empty());
+
+    vec.push_back(test_values[0]);
+    CHECK(!vec.empty());
+    CHECK(!constify(vec).empty());
+
+    // Still empty after clearing, and after filling to capacity in between.
+    vec.clear();
+    CHECK(vec.empty());
+    vec.push_back_n(NUM_TEST_VALUES, &test_values[0]);
+    CHECK(!vec.empty());
+    vec.clear();
+    CHECK(vec.empty());
+
+    // empty() agrees with size().
+    for (uint32_t i = 0; i < NUM_TEST_VALUES; ++i)
+    {
+        CHECK(vec.empty() == (vec.size() == 0));
+        vec.push_back(test_values[i]);
+        CHECK(vec.empty() == (vec.size() == 0));
+        CHECK(!vec.empty());
+    }
+}

@@ -41,6 +41,7 @@ const char* string_from_vk_result(VkResult result)
         STR_CASE(ERROR_INCOMPATIBLE_DISPLAY_KHR);
         STR_CASE(ERROR_NATIVE_WINDOW_IN_USE_KHR);
         STR_CASE(ERROR_VALIDATION_FAILED_EXT);
+        STR_CASE(ERROR_OUT_OF_POOL_MEMORY);
         default:
             return "<unknown>";
     }
@@ -96,6 +97,12 @@ VmaAllocationCreateFlags vma_flags_for_mappability(Mappability mappability)
 
 void Buffer::init()
 {
+    // Cleared up front so a failed allocation leaves nothing for ~Buffer() to
+    // free; vmaCreateBuffer() doesn't define its outputs when it fails.
+    m_vkBuffer = VK_NULL_HANDLE;
+    m_vmaAllocation = VK_NULL_HANDLE;
+    m_contents = nullptr;
+
     if (m_info.size > 0)
     {
         VmaAllocationCreateInfo allocInfo = {
@@ -103,30 +110,44 @@ void Buffer::init()
             .usage = VMA_MEMORY_USAGE_AUTO,
         };
 
-        VK_CHECK(vmaCreateBuffer(vk()->allocator(),
-                                 &m_info,
-                                 &allocInfo,
-                                 &m_vkBuffer,
-                                 &m_vmaAllocation,
-                                 nullptr));
+        VkBuffer buffer;
+        VmaAllocation allocation;
+        if (!VK_SUCCEEDED(vmaCreateBuffer(vk()->allocator(),
+                                          &m_info,
+                                          &allocInfo,
+                                          &buffer,
+                                          &allocation,
+                                          nullptr),
+                          "a buffer"))
+        {
+            vk()->reportAllocationFailure();
+            return;
+        }
+        m_vkBuffer = buffer;
+        m_vmaAllocation = allocation;
 
         if (m_mappability != Mappability::none)
         {
             // Leave the buffer constantly mapped and let the OS/drivers handle
             // the rest.
-            VK_CHECK(
-                vmaMapMemory(vk()->allocator(), m_vmaAllocation, &m_contents));
+            void* contents;
+            if (!VK_SUCCEEDED(
+                    vmaMapMemory(vk()->allocator(), m_vmaAllocation, &contents),
+                    "a buffer mapping"))
+            {
+                // Throw the buffer away too. A mappable buffer we can't map is
+                // useless, and callers test the handle to decide whether we
+                // allocated anything at all.
+                vmaDestroyBuffer(vk()->allocator(),
+                                 m_vkBuffer,
+                                 m_vmaAllocation);
+                m_vkBuffer = VK_NULL_HANDLE;
+                m_vmaAllocation = VK_NULL_HANDLE;
+                vk()->reportAllocationFailure();
+                return;
+            }
+            m_contents = contents;
         }
-        else
-        {
-            m_contents = nullptr;
-        }
-    }
-    else
-    {
-        m_vkBuffer = VK_NULL_HANDLE;
-        m_vmaAllocation = VK_NULL_HANDLE;
-        m_contents = nullptr;
     }
 }
 
@@ -248,12 +269,34 @@ Image::Image(rcp<VulkanContext> vulkanContext,
         .usage = VMA_MEMORY_USAGE_AUTO,
     };
 
-    VK_CHECK(vmaCreateImage(vk()->allocator(),
-                            &m_info,
-                            &allocInfo,
-                            &m_vkImage,
-                            &m_vmaAllocation,
-                            nullptr));
+    VkImage image;
+    VmaAllocation allocation;
+    if (!VK_SUCCEEDED(vmaCreateImage(vk()->allocator(),
+                                     &m_info,
+                                     &allocInfo,
+                                     &image,
+                                     &allocation,
+                                     nullptr),
+                      name))
+    {
+        vk()->reportAllocationFailure();
+        return;
+    }
+    m_vkImage = image;
+    m_vmaAllocation = allocation;
+    vk()->setDebugNameIfEnabled(uint64_t(m_vkImage),
+                                VK_OBJECT_TYPE_IMAGE,
+                                name);
+}
+
+Image::Image(rcp<VulkanContext> vulkanContext,
+             VkImage externalImage,
+             const VkImageCreateInfo& info,
+             const char* name) :
+    Resource(std::move(vulkanContext)), m_info(info)
+{
+    m_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    m_vkImage = externalImage;
     vk()->setDebugNameIfEnabled(uint64_t(m_vkImage),
                                 VK_OBJECT_TYPE_IMAGE,
                                 name);
@@ -285,9 +328,14 @@ ImageView::ImageView(rcp<VulkanContext> vulkanContext,
         assert(m_textureRefOrNull == nullptr ||
                m_info.image == *m_textureRefOrNull);
     }
+    if (m_info.image == VK_NULL_HANDLE)
+    {
+        // The image we're viewing failed to allocate. Stay null as well.
+        return;
+    }
+
     m_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    VK_CHECK(
-        vk()->CreateImageView(vk()->device, &m_info, nullptr, &m_vkImageView));
+    m_vkImageView = VK_CREATE_HANDLE(vk(), CreateImageView, &m_info);
     vk()->setDebugNameIfEnabled(uint64_t(m_vkImageView),
                                 VK_OBJECT_TYPE_IMAGE_VIEW,
                                 name);
@@ -326,6 +374,21 @@ Texture2D::Texture2D(rcp<VulkanContext> vk,
     m_imageView = vk->makeImageView(m_image, name);
 }
 
+Texture2D::Texture2D(rcp<VulkanContext> vk,
+                     rcp<Image> existingImage,
+                     const char* name) :
+    rive::gpu::Texture(existingImage->info().extent.width,
+                       existingImage->info().extent.height),
+    m_image(std::move(existingImage)),
+    m_lastAccess({
+        .pipelineStages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        .accessMask = VK_ACCESS_NONE,
+        .layout = VK_IMAGE_LAYOUT_UNDEFINED,
+    })
+{
+    m_imageView = vk->makeImageView(m_image, name);
+}
+
 void Texture2D::scheduleUpload(const void* imageDataRGBAPremul,
                                size_t imageDataSizeInBytes)
 {
@@ -335,6 +398,11 @@ void Texture2D::scheduleUpload(const void* imageDataRGBAPremul,
             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         },
         vkutil::Mappability::writeOnly);
+    if (!imageBufferRGBAPremul->hasContents())
+    {
+        // Nothing to upload into; the init path that owns us will bail shortly.
+        return;
+    }
     memcpy(imageBufferRGBAPremul->contents(),
            imageDataRGBAPremul,
            imageDataSizeInBytes);
@@ -345,20 +413,19 @@ void Texture2D::scheduleUpload(const void* imageDataRGBAPremul,
 void Texture2D::scheduleUpload(rcp<vkutil::Buffer> imageBufferRGBAPremul)
 {
     m_imageUploadBuffer = std::move(imageBufferRGBAPremul);
+    m_imageUploadRegions.clear();
+}
+
+void Texture2D::scheduleUpload(rcp<vkutil::Buffer> stagingBuffer,
+                               std::vector<VkBufferImageCopy> regions)
+{
+    m_imageUploadBuffer = std::move(stagingBuffer);
+    m_imageUploadRegions = std::move(regions);
 }
 
 void Texture2D::applyImageUploadBuffer(VkCommandBuffer commandBuffer)
 {
     assert(m_imageUploadBuffer != nullptr);
-
-    VkBufferImageCopy bufferImageCopy = {
-        .imageSubresource =
-            {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .layerCount = 1,
-            },
-        .imageExtent = {width(), height(), 1},
-    };
 
     barrier(commandBuffer,
             {
@@ -368,19 +435,53 @@ void Texture2D::applyImageUploadBuffer(VkCommandBuffer commandBuffer)
             },
             vkutil::ImageAccessAction::invalidateContents);
 
-    m_image->vk()->CmdCopyBufferToImage(commandBuffer,
-                                        *m_imageUploadBuffer,
-                                        *m_image,
-                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                        1,
-                                        &bufferImageCopy);
-
-    generateMipmaps(commandBuffer,
-                    {
-                        .pipelineStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                        .accessMask = VK_ACCESS_SHADER_READ_BIT,
-                        .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                    });
+    if (!m_imageUploadRegions.empty())
+    {
+        // Caller-supplied per-level regions. No automatic mip generation —
+        // every level present in the texture must have a region.
+        m_image->vk()->CmdCopyBufferToImage(
+            commandBuffer,
+            *m_imageUploadBuffer,
+            *m_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            static_cast<uint32_t>(m_imageUploadRegions.size()),
+            m_imageUploadRegions.data());
+        // All mips already written — transition straight to shader-read.
+        barrier(commandBuffer,
+                {
+                    .pipelineStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    .accessMask = VK_ACCESS_SHADER_READ_BIT,
+                    .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                });
+        m_imageUploadRegions.clear();
+    }
+    else
+    {
+        // Single-region upload (mip 0 full extent). Caller relies on
+        // generateMipmaps to fill remaining levels.
+        VkBufferImageCopy bufferImageCopy = {
+            .imageSubresource =
+                {
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .layerCount = 1,
+                },
+            .imageExtent = {width(), height(), 1},
+        };
+        m_image->vk()->CmdCopyBufferToImage(
+            commandBuffer,
+            *m_imageUploadBuffer,
+            *m_image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &bufferImageCopy);
+        generateMipmaps(
+            commandBuffer,
+            {
+                .pipelineStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                .accessMask = VK_ACCESS_SHADER_READ_BIT,
+                .layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            });
+    }
 
     m_imageUploadBuffer = nullptr;
 }
@@ -518,10 +619,7 @@ Framebuffer::Framebuffer(rcp<VulkanContext> vulkanContext,
     Resource(std::move(vulkanContext)), m_info(info)
 {
     m_info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    VK_CHECK(vk()->CreateFramebuffer(vk()->device,
-                                     &m_info,
-                                     nullptr,
-                                     &m_vkFramebuffer));
+    m_vkFramebuffer = VK_CREATE_HANDLE(vk(), CreateFramebuffer, &m_info);
 }
 
 Framebuffer::~Framebuffer()
