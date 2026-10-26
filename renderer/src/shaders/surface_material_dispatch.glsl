@@ -31,6 +31,10 @@ INLINE half4 apply_surface_material_to_paint(half4 paintColor,
                                              float4 materialData,
                                              bool paintIsPremultiplied)
 {
+    // MSAA and raster-ordering draws interpolate the mode as a varying, which
+    // need not reproduce the per-vertex constant exactly; comparing it raw
+    // left ~14% of pixels unmaterialized on SwiftShader WebGL2.
+    materialData.z = floor(materialData.z + 0.5);
     if (materialData.z == SURFACE_MATERIAL_NONE)
     {
         return paintColor;

@@ -27,7 +27,7 @@
 #include "generated/shaders/advanced_blend.glsl.hpp"
 #include "generated/shaders/bezier_utils.glsl.hpp"
 #include "generated/shaders/blit_texture_as_draw.glsl.hpp"
-#ifdef RIVE_WEBGL
+#ifdef RIVE_SURFACE_MATERIAL
 #include "generated/shaders/surface_material.glsl.hpp"
 #include "generated/shaders/surface_material_dispatch.glsl.hpp"
 #endif
@@ -1440,7 +1440,7 @@ RenderContextGLImpl::DrawShader::DrawShader(
 #endif
 
     std::vector<const char*> defines;
-#ifdef RIVE_WEBGL
+#ifdef RIVE_SURFACE_MATERIAL
     defines.push_back(GLSL_RIVE_SURFACE_MATERIAL);
 #endif
     if (renderContextImpl->m_plsImpl != nullptr &&
@@ -1581,7 +1581,7 @@ RenderContextGLImpl::DrawShader::DrawShader(
     sources.push_back(glsl::common);
     if (shaderType == GL_FRAGMENT_SHADER)
     {
-#ifdef RIVE_WEBGL
+#ifdef RIVE_SURFACE_MATERIAL
         if (enums::is_flag_set(shaderFeatures,
                                ShaderFeatures::ENABLE_HSL_BLEND_MODES))
         {

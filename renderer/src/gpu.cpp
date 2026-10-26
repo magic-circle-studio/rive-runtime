@@ -1551,7 +1551,14 @@ ImageRectInstance::ImageRectInstance(
     uint32_t gradientType,
     int32_t gradTextureX,
     uint32_t gradTextureY,
-    float additiveness) :
+    float additiveness
+#ifdef RIVE_SURFACE_MATERIAL
+    ,
+    const SurfaceMaterialData* surfaceMaterialData,
+    const RenderTarget* renderTarget,
+    const PlatformFeatures& platformFeatures
+#endif
+    ) :
     m_commons{matrix,
               color,
               clipRectInverseMatrix,
@@ -1599,6 +1606,36 @@ ImageRectInstance::ImageRectInstance(
     m_gradTextureX = float(gradTextureX);
     m_gradTextureY = float(gradTextureY);
     m_gradientType = gradientType;
+
+#ifdef RIVE_SURFACE_MATERIAL
+    STATIC_ASSERT_ATTRIB(ImageRectInstance,
+                         m_surfaceMaterialMatrix,
+                         IMAGE_RECT_SURFACE_MATERIAL_MATRIX_ATTRIB_IDX);
+    STATIC_ASSERT_ATTRIB(ImageRectInstance,
+                         m_surfaceMaterialTranslate,
+                         IMAGE_RECT_SURFACE_MATERIAL_DATA_ATTRIB_IDX);
+    static_assert(offsetof(ImageRectInstance, m_surfaceMaterialTimeSeconds) ==
+                  offsetof(ImageRectInstance, m_surfaceMaterialTranslate) +
+                      3 * sizeof(float));
+    if (surfaceMaterialData != nullptr &&
+        surfaceMaterialData->material != SurfaceMaterial::none)
+    {
+        // Same as PaintAuxData: the shader maps _fragCoord, which counts from
+        // memory row 0.
+        Mat2D screenToUV = orient_for_framebuffer(
+            surfaceMaterialData->screenToUV, renderTarget, platformFeatures);
+        write2x2(m_surfaceMaterialMatrix, screenToUV);
+        writeTranslate(m_surfaceMaterialTranslate, screenToUV);
+        m_surfaceMaterialMode =
+            static_cast<float>(surfaceMaterialData->material);
+        m_surfaceMaterialTimeSeconds = surfaceMaterialData->timeSeconds;
+    }
+    else
+    {
+        m_surfaceMaterialMode = static_cast<float>(SurfaceMaterial::none);
+        m_surfaceMaterialTimeSeconds = 0;
+    }
+#endif
 }
 
 const std::array<VertexAttribute, ImageRectInstance::AttributeCount>&

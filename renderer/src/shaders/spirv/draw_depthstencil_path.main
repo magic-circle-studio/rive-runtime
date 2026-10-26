@@ -11,5 +11,9 @@
 #include "common.minified.glsl"
 #include "draw_path_common.minified.glsl"
 #include "advanced_blend.minified.glsl"
+#ifdef RIVE_SURFACE_MATERIAL
+#include "surface_material.minified.glsl"
+#include "surface_material_dispatch.minified.glsl"
+#endif
 #include "gradient_packing_common.minified.glsl"
 #include "draw_depthstencil_path.minified.glsl"

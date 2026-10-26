@@ -1083,8 +1083,8 @@ enum class ShaderFeatures
     ENABLE_ADVANCED_BLEND = 1 << 2,
     ENABLE_FEATHER = 1 << 3,
 
-    // Fragment-only features. The WebGL surface-material fork also reuses the
-    // HSL bit to gate its vertex varying without adding a pipeline permutation.
+    // Fragment-only features. The surface-material fork also reuses the HSL
+    // bit to gate its vertex varying without adding a pipeline permutation.
     ENABLE_EVEN_ODD = 1 << 4,
     ENABLE_NESTED_CLIPPING = 1 << 5,
     ENABLE_HSL_BLEND_MODES = 1 << 6,
@@ -1096,9 +1096,9 @@ constexpr static size_t ShaderFeatureCount = 9;
 constexpr static ShaderFeatures kAllShaderFeatures =
     static_cast<gpu::ShaderFeatures>((1 << ShaderFeatureCount) - 1);
 constexpr static ShaderFeatures kSurfaceMaterialVertexShaderFeatures =
-#ifdef RIVE_WEBGL
-    // Reuse an existing WebGL feature bit so the fork does not widen every
-    // backend's shader key for a package that only ships WebGL2 materials.
+#ifdef RIVE_SURFACE_MATERIAL
+    // Reuse an existing feature bit so the fork does not widen every backend's
+    // shader key for packages that only ship WebGL2/WebGPU materials.
     ShaderFeatures::ENABLE_HSL_BLEND_MODES;
 #else
     ShaderFeatures::NONE;
@@ -2117,7 +2117,14 @@ class ImageRectInstance
 public:
     constexpr static size_t FirstAttribIdx =
         ImageDrawInstanceBase::FirstAttribIdx;
-    static constexpr size_t AttributeCount = 11;
+#ifdef RIVE_SURFACE_MATERIAL
+    // Atomic mode draws images as imageRects, so the surface material rides on
+    // two extra instance attributes there.
+    static constexpr size_t SurfaceMaterialAttributeCount = 2;
+#else
+    static constexpr size_t SurfaceMaterialAttributeCount = 0;
+#endif
+    static constexpr size_t AttributeCount = 11 + SurfaceMaterialAttributeCount;
     static constexpr size_t LastAttribIdx = FirstAttribIdx + AttributeCount - 1;
 
     static const std::array<VertexAttribute, AttributeCount>& getAttributes();
@@ -2136,7 +2143,15 @@ public:
         uint32_t gradientType,
         int32_t gradTextureX, // sign used to indicate complex gradient
         uint32_t gradTextureY,
-        float additiveness);
+        float additiveness
+#ifdef RIVE_SURFACE_MATERIAL
+                      ,
+                      const SurfaceMaterialData*,
+                      const RenderTarget*,
+                      const gpu::PlatformFeatures&
+#endif
+    );
+
 
 private:
     ImageDrawInstanceBase m_commons;
@@ -2148,6 +2163,13 @@ private:
     WRITEONLY float m_gradTextureY;
     WRITEONLY uint32_t m_gradientType;
     WRITEONLY float m_padding;
+#ifdef RIVE_SURFACE_MATERIAL
+    // Same encoding as PaintAuxData's material entries.
+    WRITEONLY float m_surfaceMaterialMatrix[4];
+    WRITEONLY float m_surfaceMaterialTranslate[2];
+    WRITEONLY float m_surfaceMaterialMode;
+    WRITEONLY float m_surfaceMaterialTimeSeconds;
+#endif
 };
 
 class ImageMeshInstance

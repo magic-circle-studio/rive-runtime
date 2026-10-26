@@ -88,18 +88,36 @@ static constexpr auto ImageRectInstanceAttributes = std::apply(
                 24 * sizeof(float),
                 GLSL_a_imageRectImageAndGradientTranslates,
             },
-            VertexAttribute{// packed: m_gradTextureHorizontalSpan,
-                            // m_gradTextureY, m_gradientType
+            VertexAttribute{// packed: m_gradTextureX, m_gradTextureY,
+                            // m_gradientType, m_padding
                             VertexElementFormat::float4,
                             BaseIndex + 3,
                             28 * sizeof(float),
                             GLSL_a_imageRectPackedGradientData},
+#ifdef RIVE_SURFACE_MATERIAL
+            VertexAttribute{
+                // m_surfaceMaterialMatrix
+                VertexElementFormat::float4,
+                BaseIndex + 4,
+                32 * sizeof(float),
+                GLSL_a_imageRectSurfaceMaterialMatrix,
+            },
+            VertexAttribute{
+                // packed: m_surfaceMaterialTranslate, m_surfaceMaterialMode,
+                // m_surfaceMaterialTimeSeconds
+                VertexElementFormat::float4,
+                BaseIndex + 5,
+                36 * sizeof(float),
+                GLSL_a_imageRectSurfaceMaterialData,
+            },
+#endif
         };
     },
     ImageDrawInstanceBaseAttributes);
 
 static_assert(std::size(ImageRectInstanceAttributes) ==
-              IMAGE_RECT_ATTRIB_COUNT);
+              IMAGE_RECT_ATTRIB_COUNT +
+                  ImageRectInstance::SurfaceMaterialAttributeCount);
 
 static constexpr auto ImageMeshInstanceAttributes = std::apply(
     [](auto... baseAttribs) {

@@ -82,7 +82,10 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
             v_surfaceMaterialData,
             
 #ifdef @ENABLE_ADVANCED_BLEND
-            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+            // Negate the whole condition: "!@ENABLE_ADVANCED_BLEND" folds to
+            // OpSpecConstantOp, which naga cannot translate to WGSL.
+            !(@ENABLE_ADVANCED_BLEND &&
+              cast_half_to_ushort(v_blendMode) != BLEND_SRC_OVER)
 #else
             true
 #endif

@@ -2012,6 +2012,15 @@ RenderContextWebGPUImpl::RenderContextWebGPUImpl(
         printf(
             "WARNING: atomic mode disabled because deviceLimits.maxStorageBuffersPerShaderStage is not at least 3.");
     }
+#ifndef RIVE_WAGYU
+    // The WGSL atomic draws read path data from vertex-stage storage buffers
+    // and have no polyfilled variants, so compatibility-mode devices without
+    // those buffers fall back to MSAA.
+    if (m_capabilities.polyfillVertexStorageBuffers)
+    {
+        m_platformFeatures.supportsAtomicMode = false;
+    }
+#endif
     m_platformFeatures.atomicPLSInitNeedsDraw = true;
 
 #ifdef RIVE_WAGYU
@@ -3388,8 +3397,9 @@ wgpu::RenderPipeline RenderContextWebGPUImpl::makeDrawPipeline(
             vertexBufferLayouts[0].arrayStride = sizeof(gpu::ImageRectVertex);
             vertexBufferLayouts[0].stepMode = WGPUVertexStepMode_Vertex;
 
-            assert(attrs.size() == 1 + IMAGE_RECT_ATTRIB_COUNT);
-            vertexBufferLayouts[1].attributeCount = IMAGE_RECT_ATTRIB_COUNT;
+            assert(attrs.size() == 1 + ImageRectInstance::AttributeCount);
+            vertexBufferLayouts[1].attributeCount =
+                ImageRectInstance::AttributeCount;
             vertexBufferLayouts[1].attributes = &attrs[1];
             vertexBufferLayouts[1].arrayStride = sizeof(gpu::ImageRectInstance);
             vertexBufferLayouts[1].stepMode = WGPUVertexStepMode_Instance;

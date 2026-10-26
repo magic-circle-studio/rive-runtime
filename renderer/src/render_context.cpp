@@ -3762,7 +3762,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushImageRectDraw(
                                                 gradientType,
                                                 gradientX,
                                                 gradientY,
-                                                draw->additiveness());
+                                                draw->additiveness()
+#ifdef RIVE_SURFACE_MATERIAL
+                                                    ,
+                                                draw->surfaceMaterialData(),
+                                                m_flushDesc.renderTarget,
+                                                m_ctx->platformFeatures()
+#endif
+    );
 
     DrawBatch& batch = pushDraw(draw,
                                 DrawType::imageRect,
@@ -3771,6 +3778,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushImageRectDraw(
                                 PaintType::solidColor,
                                 1,
                                 imageRectBaseInstance);
+#ifdef RIVE_SURFACE_MATERIAL
+    if (draw->hasSurfaceMaterial())
+    {
+        // Same HSL permutation as material path draws (see pushPathDraw).
+        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+        m_combinedShaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    }
+#endif
     return batch;
 }
 
@@ -3918,7 +3933,7 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
                                 draw->paintType(),
                                 vertexCount,
                                 baseVertex);
-#ifdef RIVE_WEBGL
+#ifdef RIVE_SURFACE_MATERIAL
     if (draw->hasSurfaceMaterial())
     {
         // Materials share the existing HSL helper permutation but do not need

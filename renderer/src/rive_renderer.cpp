@@ -474,6 +474,42 @@ void RiveRenderer::captureSurfaceMaterialBinding(RiveRenderPath* path)
     path->captureSurfaceMaterialBinding(screenToUV * state.matrix);
 }
 
+bool RiveRenderer::surfaceMaterialScreenToUV(Mat2D* screenToUV) const
+{
+    const auto& state = m_renderStateStack.back();
+    if (state.surfaceMaterial == gpu::SurfaceMaterial::none ||
+        state.surfaceMaterialBounds.isEmptyOrNaN())
+    {
+        return false;
+    }
+    const AABB& bounds = state.surfaceMaterialBounds;
+    const float width = bounds.width();
+    const float height = bounds.height();
+    *screenToUV = Mat2D::fromScaleAndTranslation(1.f / width,
+                                                 1.f / height,
+                                                 -bounds.left() / width,
+                                                 -bounds.top() / height);
+    return true;
+}
+
+gpu::SurfaceMaterialData RiveRenderer::surfaceMaterialData(
+    Mat2D screenToMaterial) const
+{
+    const auto& state = m_renderStateStack.back();
+    if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
+    {
+        const AABB& bounds = state.surfaceMaterialBounds;
+        screenToMaterial =
+            rainbowUVProjection(bounds.width() / bounds.height()) *
+            screenToMaterial;
+    }
+    return {
+        .screenToUV = screenToMaterial,
+        .material = state.surfaceMaterial,
+        .timeSeconds = state.surfaceMaterialTimeSeconds,
+    };
+}
+
 void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
                                         RiveRenderPath* path)
 {
@@ -494,9 +530,11 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
         return;
     }
 
-    const AABB& bounds = state.surfaceMaterialBounds;
-    const float width = bounds.width();
-    const float height = bounds.height();
+    Mat2D screenToUV;
+    if (!surfaceMaterialScreenToUV(&screenToUV))
+    {
+        return;
+    }
     const Mat2D& localToScreen = state.matrix;
     Mat2D screenToMaterial;
     if (draw.imageTexture() != nullptr)
@@ -504,10 +542,7 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
         // drawImage() reuses one unit-rectangle path for every image. Keep
         // image material coordinates in artboard space rather than caching
         // the first image's transform on that shared path.
-        screenToMaterial = Mat2D::fromScaleAndTranslation(1.f / width,
-                                                          1.f / height,
-                                                          -bounds.left() / width,
-                                                          -bounds.top() / height);
+        screenToMaterial = screenToUV;
     }
     else
     {
@@ -522,18 +557,7 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
             path->surfaceMaterialLocalToUV() * screenToLocal;
     }
 
-    if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
-    {
-        screenToMaterial = rainbowUVProjection(width / height) *
-                           screenToMaterial;
-    }
-
-    gpu::SurfaceMaterialData materialData = {
-        .screenToUV = screenToMaterial,
-        .material = state.surfaceMaterial,
-        .timeSeconds = state.surfaceMaterialTimeSeconds,
-    };
-    draw.setSurfaceMaterial(materialData);
+    draw.setSurfaceMaterial(surfaceMaterialData(screenToMaterial));
 }
 
 void RiveRenderer::clipPath(RenderPath* renderPath)
@@ -851,20 +875,29 @@ void RiveRenderer::drawImage(const RenderImage* renderImage,
         if (!m_renderStateStack.back().overallClipPixelBounds.empty())
         {
             const Mat2D& m = m_renderStateStack.back().matrix;
-            clipAndPushDraw(
-                gpu::DrawUniquePtr(m_context->make<gpu::ImageRectDraw>(
-                    m_context,
-                    m.mapBoundingBox(AABB{0, 0, 1, 1}).roundOut(),
-                    m,
-                    blendMode,
-                    additiveness,
-                    std::move(imageTexture),
-                    nullptr, // gradient
-                    imageSampler,
-                    modulated(0xFFFFFFFF, finalOpacity),
-                    Mat2D{},    // imageMatrix
-                    Mat2D{},    // gradientMatrix
-                    Mat2D{}))); // inverseGradientTransform
+            auto* imageRect = m_context->make<gpu::ImageRectDraw>(
+                m_context,
+                m.mapBoundingBox(AABB{0, 0, 1, 1}).roundOut(),
+                m,
+                blendMode,
+                additiveness,
+                std::move(imageTexture),
+                nullptr, // gradient
+                imageSampler,
+                modulated(0xFFFFFFFF, finalOpacity),
+                Mat2D{},  // imageMatrix
+                Mat2D{},  // gradientMatrix
+                Mat2D{}); // inverseGradientTransform
+#ifdef RIVE_SURFACE_MATERIAL
+            // Same mapping as the image-paint path below: artboard space.
+            Mat2D screenToUV;
+            if (!(additiveness > 0 && blendMode == BlendMode::srcOver) &&
+                surfaceMaterialScreenToUV(&screenToUV))
+            {
+                imageRect->setSurfaceMaterial(surfaceMaterialData(screenToUV));
+            }
+#endif
+            clipAndPushDraw(gpu::DrawUniquePtr(imageRect));
         }
     }
     else

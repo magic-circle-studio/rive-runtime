@@ -376,7 +376,10 @@ endef
 ## All .main/vert/frag files should build
 $(eval $(call make_spirv_rules, $(SPIRV_STANDARD_INPUTS), vert frag))
 
-SPIRV_COMMON_WEBGPU_PARAMS = -DTARGET_WGSL -DUSE_WEBGPU_SAMPLERS
+# WebGPU builds always carry the fork's surface materials. They stay inert
+# until the C++ side flags a material draw (RIVE_SURFACE_MATERIAL).
+SPIRV_COMMON_WEBGPU_PARAMS = -DTARGET_WGSL -DUSE_WEBGPU_SAMPLERS \
+                             -DRIVE_SURFACE_MATERIAL
 
 ## Each of the specialized SPIRV lists have their own associated rules
 $(eval $(call make_spirv_rules, $(SPIRV_DRAW_MSAA_INPUTS), noclipdistance_vert, -DDISABLE_CLIP_DISTANCE_FOR_UBERSHADERS))

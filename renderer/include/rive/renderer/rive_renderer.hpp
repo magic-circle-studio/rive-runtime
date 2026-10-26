@@ -143,6 +143,10 @@ private:
     };
 
     void captureSurfaceMaterialBinding(RiveRenderPath*);
+    // Maps the state's material bounds to UVs; false if the state draws
+    // without a material.
+    bool surfaceMaterialScreenToUV(Mat2D* screenToUV) const;
+    gpu::SurfaceMaterialData surfaceMaterialData(Mat2D screenToMaterial) const;
     void applySurfaceMaterial(gpu::PathDraw&, RiveRenderPath*);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);

@@ -145,6 +145,14 @@ ATTR(IMAGE_RECT_IMAGE_AND_GRADIENT_TRANSLATES_ATTRIB_IDX,
      float4,
      @a_imageRectImageAndGradientTranslates);
 ATTR(IMAGE_RECT_PACKED_GRADIENT_DATA, float4, @a_imageRectPackedGradientData);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+ATTR(IMAGE_RECT_SURFACE_MATERIAL_MATRIX_ATTRIB_IDX,
+     float4,
+     @a_imageRectSurfaceMaterialMatrix);
+ATTR(IMAGE_RECT_SURFACE_MATERIAL_DATA_ATTRIB_IDX,
+     float4,
+     @a_imageRectSurfaceMaterialData);
+#endif
 
 ATTR_BLOCK_END
 #endif
@@ -162,6 +170,9 @@ FLAT VARYING(5, ushort, v_imageClipID);
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
 FLAT VARYING(6, ushort, v_imageBlendMode);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(7, float4, v_surfaceMaterialData);
 #endif
 VARYING_BLOCK_END
 
@@ -198,6 +209,16 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain,
                 imageDrawAttrs,
                 @a_imageRectPackedGradientData,
                 float4);
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageRectSurfaceMaterialMatrix,
+                float4);
+    ATTR_UNPACK(_instanceID,
+                imageDrawAttrs,
+                @a_imageRectSurfaceMaterialData,
+                float4);
+#endif
 
     VARYING_INIT(v_texCoord, float2);
     VARYING_INIT(v_edgeCoverage, half);
@@ -211,6 +232,9 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain,
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_INIT(v_imageBlendMode, ushort);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_INIT(v_surfaceMaterialData, float4);
 #endif
 
     bool isOuterVertex =
@@ -320,6 +344,17 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain,
         // present, which makes the image flicker.
         v_gradient = float4(.0, .0, .0, .0);
     }
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    // Same mapping as draw_path.vert: material UVs from fragCoord.
+    v_surfaceMaterialData =
+        float4(.0, .0, @a_imageRectSurfaceMaterialData.zw);
+    if (@ENABLE_HSL_BLEND_MODES && @a_imageRectSurfaceMaterialData.z > .5)
+    {
+        v_surfaceMaterialData.xy =
+            MUL(make_float2x2(@a_imageRectSurfaceMaterialMatrix), fragCoord) +
+            @a_imageRectSurfaceMaterialData.xy;
+    }
+#endif
     VARYING_PACK(v_texCoord);
     VARYING_PACK(v_edgeCoverage);
     VARYING_PACK(v_gradient);
@@ -332,6 +367,9 @@ IMAGE_RECT_VERTEX_MAIN(@drawVertexMain,
 #endif
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_PACK(v_imageBlendMode);
+#endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_PACK(v_surfaceMaterialData);
 #endif
     EMIT_VERTEX(pos);
 }
@@ -1004,6 +1042,10 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
 #ifdef @ENABLE_ADVANCED_BLEND
     VARYING_UNPACK(v_imageBlendMode, ushort);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@DRAW_IMAGE_RECT) &&           \
+    defined(@ENABLE_HSL_BLEND_MODES)
+    VARYING_UNPACK(v_surfaceMaterialData, float4);
+#endif
 
     // Start by finding the image color. We have to do this immediately instead
     // of allowing it to get resolved later like other draws because the
@@ -1086,6 +1128,19 @@ ATOMIC_PLS_MAIN(@drawFragmentMain)
         imageColor *= gradColor;
     }
 #endif // DRAW_IMAGE_RECT
+
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@DRAW_IMAGE_RECT) &&           \
+    defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+        // The sampled image is premultiplied; advanced blend unmultiplies it
+        // again below.
+        imageColor =
+            apply_surface_material_to_paint(imageColor,
+                                            v_surfaceMaterialData,
+                                            true);
+    }
+#endif // RIVE_SURFACE_MATERIAL && DRAW_IMAGE_RECT && ENABLE_HSL_BLEND_MODES
 
     imageColor *= v_imageModulatedColor;
 

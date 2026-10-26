@@ -280,6 +280,10 @@
 #define IMAGE_RECT_LAST_ATTRIB_IDX IMAGE_RECT_PACKED_GRADIENT_DATA
 #define IMAGE_RECT_ATTRIB_COUNT                                                \
     (IMAGE_RECT_LAST_ATTRIB_IDX + 1 - IMAGE_FIRST_ATTRIB_IDX)
+// Surface-material builds append these after the imageRect attributes (see
+// ImageRectInstance::SurfaceMaterialAttributeCount).
+#define IMAGE_RECT_SURFACE_MATERIAL_MATRIX_ATTRIB_IDX 13
+#define IMAGE_RECT_SURFACE_MATERIAL_DATA_ATTRIB_IDX 14
 
 #define IMAGE_MESH_UV_TRANSFORM_ATTRIB_IDX 9
 #define IMAGE_MESH_LAST_ATTRIB_IDX IMAGE_MESH_UV_TRANSFORM_ATTRIB_IDX

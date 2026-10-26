@@ -166,6 +166,11 @@ end
 filter('system:emscripten')
 do
     defines({ 'RIVE_WEBGL' })
+    -- Gold/Rainbow surface materials. Both web backends implement them: GL
+    -- compiles the material GLSL at runtime and WebGPU's generated WGSL always
+    -- carries it (SPIRV_COMMON_WEBGPU_PARAMS in src/shaders/Makefile). Native
+    -- backends do not, so their shader keys stay unchanged.
+    defines({ 'RIVE_SURFACE_MATERIAL' })
 end
 
 -- Emscripten + wagyu: Ore routes through the WebGPU/wagyu device.

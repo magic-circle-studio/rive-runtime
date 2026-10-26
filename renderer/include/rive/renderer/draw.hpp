@@ -602,6 +602,21 @@ public:
     const Gradient* gradient() const { return m_gradientRef; }
     const ColorRampLocation& rampLocation() const { return m_rampLocation; }
 
+#ifdef RIVE_SURFACE_MATERIAL
+    const gpu::SurfaceMaterialData* surfaceMaterialData() const
+    {
+        return hasSurfaceMaterial() ? &m_surfaceMaterialData : nullptr;
+    }
+    bool hasSurfaceMaterial() const
+    {
+        return m_surfaceMaterialData.material != gpu::SurfaceMaterial::none;
+    }
+    void setSurfaceMaterial(const gpu::SurfaceMaterialData& data)
+    {
+        m_surfaceMaterialData = data;
+    }
+#endif
+
 protected:
     const ColorInt m_modulatedColor;
     const Mat2D m_imageMatrix;
@@ -609,6 +624,9 @@ protected:
     const Mat2D m_inverseGradientTransform;
     const Gradient* m_gradientRef;
     ColorRampLocation m_rampLocation;
+#ifdef RIVE_SURFACE_MATERIAL
+    gpu::SurfaceMaterialData m_surfaceMaterialData;
+#endif
 };
 
 // Pushes an imageMesh to the render context.
