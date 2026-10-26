@@ -4742,8 +4742,26 @@ void RenderContextWebGPUImpl::flush(const FlushDescriptor& desc)
     // valid.
     bool needsPerFlushBindings = true;
 
+    // A barrier restarts the encoder and requires rebinding the image group,
+    // but its immutable descriptor usually hasn't changed (most draws use the
+    // null image). Cache by the complete descriptor's resource identity. These
+    // two bindings contain no buffers or dynamic offsets.
+    struct CachedImageBindings
+    {
+        WGPUBindGroupLayout layout = nullptr;
+        WGPUTextureView textureView = nullptr;
+        WGPUSampler sampler = nullptr;
+        wgpu::BindGroup bindings;
+    };
+    // Flush-local ownership prevents stale resources across ring rotations,
+    // buffer growth, target changes and device loss. Evict round-robin if a
+    // flush uses more images, keeping memory bounded regardless of draw count.
+    std::array<CachedImageBindings, 32> imageBindingsCache;
+    size_t imageBindingsCount = 0;
+    size_t nextImageBindingsEviction = 0;
+
     wgpu::TextureView boundImageTextureView = {};
-    const ImageSampler* boundImageSampler;
+    const ImageSampler* boundImageSampler = nullptr;
 
     // Execute the DrawList.
     for (const DrawBatch& batch : *desc.drawList)
@@ -4803,28 +4821,59 @@ void RenderContextWebGPUImpl::flush(const FlushDescriptor& desc)
         if (boundImageTextureView.Get() != imageTextureView.Get() ||
             *boundImageSampler != batch.imageSampler)
         {
-            wgpu::BindGroupEntry perDrawBindingEntries[] = {
+            const auto& layout =
+                drawPipelineLayout.bindGroupLayout(PER_DRAW_BINDINGS_SET);
+            const auto& sampler = m_imageSamplers[batch.imageSampler.asKey()];
+            const wgpu::BindGroup* perDrawBindings = nullptr;
+            for (size_t i = 0; i < imageBindingsCount; ++i)
+            {
+                const auto& cached = imageBindingsCache[i];
+                if (cached.layout == layout.Get() &&
+                    cached.textureView == imageTextureView.Get() &&
+                    cached.sampler == sampler.Get())
                 {
-                    .binding = IMAGE_TEXTURE_IDX,
-                    .textureView = imageTextureView,
-                },
+                    perDrawBindings = &cached.bindings;
+                    break;
+                }
+            }
+            if (perDrawBindings == nullptr)
+            {
+                wgpu::BindGroupEntry perDrawBindingEntries[] = {
+                    {
+                        .binding = IMAGE_TEXTURE_IDX,
+                        .textureView = imageTextureView,
+                    },
+                    {
+                        .binding = WEBGPU_IMAGE_SAMPLER_IDX,
+                        .sampler = sampler,
+                    },
+                };
+                wgpu::BindGroupDescriptor perDrawBindGroupDesc = {
+                    .layout = layout,
+                    .entryCount = std::size(perDrawBindingEntries),
+                    .entries = perDrawBindingEntries,
+                };
+                size_t index;
+                if (imageBindingsCount < imageBindingsCache.size())
                 {
-                    .binding = WEBGPU_IMAGE_SAMPLER_IDX,
-                    .sampler = m_imageSamplers[batch.imageSampler.asKey()],
-                },
-            };
-
-            wgpu::BindGroupDescriptor perDrawBindGroupDesc = {
-                .layout =
-                    drawPipelineLayout.bindGroupLayout(PER_DRAW_BINDINGS_SET),
-                .entryCount = std::size(perDrawBindingEntries),
-                .entries = perDrawBindingEntries,
-            };
-
-            wgpu::BindGroup perDrawBindings =
-                m_device.CreateBindGroup(&perDrawBindGroupDesc);
+                    index = imageBindingsCount++;
+                }
+                else
+                {
+                    index = nextImageBindingsEviction;
+                    nextImageBindingsEviction =
+                        (nextImageBindingsEviction + 1) %
+                        imageBindingsCache.size();
+                }
+                imageBindingsCache[index] = {layout.Get(),
+                                             imageTextureView.Get(),
+                                             sampler.Get(),
+                                             m_device.CreateBindGroup(
+                                                 &perDrawBindGroupDesc)};
+                perDrawBindings = &imageBindingsCache[index].bindings;
+            }
             drawEncoder.SetBindGroup(PER_DRAW_BINDINGS_SET,
-                                     perDrawBindings,
+                                     *perDrawBindings,
                                      0,
                                      nullptr);
 
