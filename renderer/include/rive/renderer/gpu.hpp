@@ -1391,6 +1391,7 @@ struct FlushDescriptor
 
     IAABB renderTargetUpdateBounds; // drawBounds, or renderTargetBounds if
                                     // loadAction == LoadAction::clear.
+    Span<const IAABB> clearRects;
 
     // If nonzero, frames are split up into virtual tiles of this size.
     //

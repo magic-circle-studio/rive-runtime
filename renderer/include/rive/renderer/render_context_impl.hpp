@@ -233,6 +233,14 @@ public:
     // multiple times).
     virtual void flush(const gpu::FlushDescriptor&) = 0;
 
+    // Resolve all programs before issuing any logical flush. Backends without
+    // non-blocking program creation retain their normal flush behavior.
+    virtual size_t prepareFlushPrograms(
+        Span<const gpu::FlushDescriptor* const>)
+    {
+        return 0;
+    }
+
     // Called after all logical flushes in a frame have completed.
     virtual void postFlush(const RenderContext::FlushResources&) {}
 

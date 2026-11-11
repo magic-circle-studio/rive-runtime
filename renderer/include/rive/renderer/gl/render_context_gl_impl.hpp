@@ -10,6 +10,7 @@
 #include "rive/renderer/render_context_helper_impl.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rive
@@ -92,6 +93,11 @@ public:
                                         bool bottomUp);
 
     GLState* state() const { return m_state.get(); }
+
+    void setExactProgramsEnabled(bool enabled)
+    {
+        m_pipelineManager.setExactProgramsEnabled(enabled);
+    }
 
     // Storage type and rendering method for the feather atlas.
     //
@@ -232,6 +238,13 @@ private:
                         ShaderCompilationMode);
 
     void buildFeatherAtlasRenderPipelines();
+    bool isProgramLinkComplete(GLuint, PipelineCreateType) const;
+    bool advanceAuxiliaryProgram(GLuint, PipelineStatus*, PipelineCreateType);
+    void startBlitAsDrawProgram();
+    void finishBlitAsDrawProgram(PipelineCreateType);
+    void finishFeatherAtlasPrograms(PipelineCreateType);
+    bool featherAtlasProgramsReady(const FlushDescriptor&) const;
+    bool needsBlitAsDraw(const FlushDescriptor&) const;
 
     std::unique_ptr<BufferRing> makeUniformBufferRing(
         size_t capacityInBytes) override;
@@ -252,6 +265,11 @@ private:
     void preBeginFrame(RenderContext*) override;
 
     void flush(const FlushDescriptor&) override;
+    size_t prepareFlushPrograms(Span<const FlushDescriptor* const>) override;
+    void postFlush(const RenderContext::FlushResources&) override;
+    StandardPipelineProps drawProgramProps(const FlushDescriptor&,
+                                          const DrawBatch&) const;
+    void clearRenderTargetRects(const FlushDescriptor&);
 
     // We have observed Adreno 308 crash when drawing too many instances spread
     // across any number of draw calls. This class breaks them up with glFlush
@@ -325,8 +343,9 @@ private:
                      size_t numDefines,
                      const char* sources[],
                      size_t numSources,
-                     const GLCapabilities&,
-                     GLState* state);
+                     const GLCapabilities&);
+        void finish(const GLCapabilities&, GLState*);
+        PipelineStatus status = PipelineStatus::notReady;
 
         operator GLuint() const { return m_program; }
 
@@ -352,6 +371,8 @@ private:
     glutils::Shader m_featherAtlasResolveVertexShader;
     glutils::Program m_featherAtlasClearProgram = glutils::Program::Zero();
     glutils::Program m_featherAtlasResolveProgram = glutils::Program::Zero();
+    PipelineStatus m_featherAtlasClearStatus = PipelineStatus::notReady;
+    PipelineStatus m_featherAtlasResolveStatus = PipelineStatus::notReady;
     glutils::VAO m_featherAtlasResolveVAO;
     glutils::Texture m_featherAtlasRenderTexture = glutils::Texture::Zero();
     glutils::Texture m_featherAtlasTexture = glutils::Texture::Zero();
@@ -445,8 +466,16 @@ private:
 
     public:
         GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
+        void pollPendingPrograms();
+        const DrawProgram* resolvePipeline(const PipelineProps&,
+                                          const PlatformFeatures&,
+                                          std::unordered_set<uint32_t>*);
+        void startExactPrograms(const PlatformFeatures&);
 
     protected:
+        bool deferExactPipelineCreation() const override;
+        void requestExactPipeline(const PipelineProps&) override;
+
         virtual std::unique_ptr<DrawShader> createVertexShader(
             DrawType,
             ShaderFeatures,
@@ -467,11 +496,21 @@ private:
         virtual PipelineStatus getPipelineStatus(
             const DrawProgram& state) const override;
 
-        virtual bool advanceCreation(DrawProgram&,
+        virtual bool advanceCreation(PipelineCreateType,
+                                     DrawProgram&,
                                      const PipelineProps&) override;
+        void clearCacheInternal() override;
 
     private:
         RenderContextGLImpl* m_context;
+        struct PendingProgram
+        {
+            DrawProgram* program;
+            PipelineProps props;
+            bool isUbershader;
+        };
+        std::unordered_map<uint32_t, PendingProgram> m_pendingPrograms;
+        std::vector<PipelineProps> m_exactRequests;
     };
 
     GLPipelineManager m_pipelineManager;
@@ -501,6 +540,16 @@ private:
     // Used for blitting non-MSAA -> MSAA, which isn't supported by
     // glBlitFramebuffer().
     glutils::Program m_blitAsDrawProgram = glutils::Program::Zero();
+    PipelineStatus m_blitAsDrawStatus = PipelineStatus::notReady;
+
+    struct ResolvedDrawProgram
+    {
+        StandardPipelineProps props;
+        const DrawProgram* program;
+    };
+    std::vector<ResolvedDrawProgram> m_resolvedDrawPrograms;
+    size_t m_resolvedDrawProgramIndex = 0;
+    bool m_programsPrepared = false;
 
     const rcp<GLState> m_state;
 

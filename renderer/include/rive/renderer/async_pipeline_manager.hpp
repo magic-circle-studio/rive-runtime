@@ -99,6 +99,11 @@ public:
                                            props.shaderMiscFlags,
                                            platformFeatures);
 
+        if (!m_exactProgramsEnabled)
+        {
+            props.shaderFeatures = ubershaderFeatures;
+        }
+
         PipelineCreateType createType;
 
         switch (m_mode)
@@ -158,6 +163,18 @@ public:
 
         if (iter == m_pipelines.end())
         {
+            if (createType == PipelineCreateType::async &&
+                deferExactPipelineCreation())
+            {
+                // Submit the blocking fallback first. On WebKit, a link
+                // query also waits for every link submitted before it.
+                auto ubershaderProps = props;
+                ubershaderProps.shaderFeatures = ubershaderFeatures;
+                const PipelineType* fallback =
+                    tryGetPipeline(ubershaderProps, platformFeatures);
+                requestExactPipeline(props);
+                return fallback;
+            }
             // We haven't encountered this shader key yet so it's time to ask
             //  the render context to create the program. If it's happening
             //  asynchronously, it might return us an incomplete pipeline
@@ -234,7 +251,13 @@ public:
 
                 // The program was not ready yet so attempt to move its creation
                 //  process forward.
-                if (advanceCreation(*iter->second, props))
+                if (advanceCreation(
+                        deferExactPipelineCreation() &&
+                                props.shaderFeatures == ubershaderFeatures
+                            ? PipelineCreateType::sync
+                            : PipelineCreateType::async,
+                        *iter->second,
+                        props))
                 {
                     // The program was not previously ready, but it is now.
                     return &*iter->second;
@@ -259,6 +282,11 @@ public:
         auto ubershaderProps = props;
         ubershaderProps.shaderFeatures = ubershaderFeatures;
         return tryGetPipeline(ubershaderProps, platformFeatures);
+    }
+
+    void setExactProgramsEnabled(bool enabled)
+    {
+        m_exactProgramsEnabled = enabled;
     }
 
     const VertexShaderType& getVertexShaderSynchronous(
@@ -341,6 +369,19 @@ public:
     }
 
 protected:
+    // GL with parallel linking defers exact programs until the whole frame's
+    // blocking fallbacks have been submitted. Other backends keep their overlap.
+    virtual bool deferExactPipelineCreation() const { return false; }
+    virtual void requestExactPipeline(const PipelineProps&) {}
+
+    bool exactProgramsEnabled() const { return m_exactProgramsEnabled; }
+
+    PipelineType* findPipeline(PipelineKey key) const
+    {
+        auto iter = m_pipelines.find(key);
+        return iter == m_pipelines.end() ? nullptr : iter->second.get();
+    }
+
     bool queuePipelineIfNotFound(const PipelineProps& props,
                                  const PlatformFeatures& platformFeatures)
     {
@@ -459,7 +500,9 @@ protected:
 
     // For renderers like GL that have a step-based async setup,
     //  override this function to attempt to move the shader along its progress.
-    virtual bool advanceCreation(PipelineType&, const PipelineProps&)
+    virtual bool advanceCreation(PipelineCreateType,
+                                 PipelineType&,
+                                 const PipelineProps&)
     {
         return false; // do nothing by default
     }
@@ -581,6 +624,8 @@ protected:
     }
 
 private:
+    bool m_exactProgramsEnabled = true;
+
     struct JobParams
     {
         PipelineProps props;
