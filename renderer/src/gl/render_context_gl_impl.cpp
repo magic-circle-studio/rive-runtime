@@ -1916,6 +1916,18 @@ bool RenderContextGLImpl::DrawProgram::advanceCreation(
             glGetUniformLocation(m_id, glutils::BASE_INSTANCE_UNIFORM_NAME);
     }
 
+#ifdef RIVE_WEBGL
+    if (drawType == gpu::DrawType::imageMesh &&
+        interlockMode == gpu::InterlockMode::depthStencil &&
+        enums::is_flag_set(shaderFeatures,
+                           ShaderFeatures::ENABLE_HSL_BLEND_MODES))
+    {
+        m_imageSurfaceMaterialMatrixLocation =
+            glGetUniformLocation(m_id, GLSL_imageSurfaceMaterialMatrix);
+        m_imageSurfaceMaterialTranslateLocation =
+            glGetUniformLocation(m_id, GLSL_imageSurfaceMaterialTranslate);
+    }
+#endif
     // All done! This program is now usable by the renderer.
     m_pipelineStatus = PipelineStatus::ready;
     return true;
@@ -1928,6 +1940,30 @@ RenderContextGLImpl::DrawProgram::~DrawProgram()
         m_state->deleteProgram(m_id);
     }
 }
+
+#ifdef RIVE_WEBGL
+void RenderContextGLImpl::DrawProgram::setImageSurfaceMaterial(
+    const SurfaceMaterialData* data) const
+{
+    if (data != nullptr)
+    {
+        const auto& matrix = data->screenToUV;
+        glUniform4fv(m_imageSurfaceMaterialMatrixLocation, 1, matrix.values());
+        glUniform4f(m_imageSurfaceMaterialTranslateLocation,
+                    matrix[4],
+                    matrix[5],
+                    static_cast<float>(data->material),
+                    data->timeSeconds);
+        m_imageSurfaceMaterialActive = true;
+    }
+    else if (m_imageSurfaceMaterialActive)
+    {
+        // Plain meshes upload nothing unless this program needs a mode reset.
+        glUniform4f(m_imageSurfaceMaterialTranslateLocation, 0, 0, 0, 0);
+        m_imageSurfaceMaterialActive = false;
+    }
+}
+#endif
 
 static GLuint gl_buffer_id(const BufferRing* bufferRing)
 {
@@ -2966,6 +3002,9 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
 
             case gpu::DrawType::imageMesh:
             {
+#ifdef RIVE_WEBGL
+                drawProgram->setImageSurfaceMaterial(batch.imageSurfaceMaterial);
+#endif
                 LITE_RTTI_CAST_OR_BREAK(vertexBuffer,
                                         RenderBufferGLImpl*,
                                         batch.vertexBuffer);

@@ -440,6 +440,10 @@ private:
 
         PipelineStatus status() const { return m_pipelineStatus; }
 
+#ifdef RIVE_WEBGL
+        void setImageSurfaceMaterial(const SurfaceMaterialData*) const;
+#endif
+
         bool advanceCreation(RenderContextGLImpl*,
                              PipelineCreateType,
                              gpu::DrawType,
@@ -453,6 +457,11 @@ private:
         PipelineStatus m_pipelineStatus = PipelineStatus::notReady;
         GLuint m_id = 0;
         GLint m_baseInstanceUniformLocation = -1;
+#ifdef RIVE_WEBGL
+        GLint m_imageSurfaceMaterialMatrixLocation = -1;
+        GLint m_imageSurfaceMaterialTranslateLocation = -1;
+        mutable bool m_imageSurfaceMaterialActive = false;
+#endif
         const rcp<GLState> m_state;
 #ifdef WITH_RIVE_TOOLS
         SynthesizedFailureType m_synthesizedFailureType =

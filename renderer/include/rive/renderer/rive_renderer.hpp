@@ -9,6 +9,7 @@
 #include "rive/renderer/gpu.hpp"
 #include "rive/renderer/draw.hpp"
 #include "rive/renderer/render_context.hpp"
+#include <optional>
 #include <vector>
 
 namespace rive::gpu
@@ -119,7 +120,8 @@ public:
 #endif
 
 private:
-    void applySurfaceMaterial(gpu::PathDraw&, RiveRenderPath*);
+    std::optional<gpu::SurfaceMaterialData> makeSurfaceMaterialData(
+        RiveRenderPath*);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);
     void clipPathImpl(const RiveRenderPath*,

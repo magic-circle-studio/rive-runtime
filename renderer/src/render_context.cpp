@@ -3720,6 +3720,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushImageMeshDraw(
     batch.vertexBuffer = draw->vertexBuffer();
     batch.uvBuffer = draw->uvBuffer();
     batch.indexBuffer = draw->indexBuffer();
+#ifdef RIVE_WEBGL
+    batch.imageSurfaceMaterial = draw->surfaceMaterialData();
+    if (batch.imageSurfaceMaterial != nullptr)
+    {
+        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+        m_combinedShaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    }
+#endif
     return batch;
 }
 

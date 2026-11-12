@@ -1330,6 +1330,7 @@ struct DrawBatch
     RenderBuffer* vertexBuffer;
     RenderBuffer* uvBuffer;
     RenderBuffer* indexBuffer;
+    const SurfaceMaterialData* imageSurfaceMaterial = nullptr;
 
     // When shaders don't have a mechanism to read the framebuffer (e.g.,
     // WebGL msaa), this is a linked list of all the draws in the batch whose

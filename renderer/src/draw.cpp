@@ -2701,7 +2701,8 @@ ImageMeshDraw::ImageMeshDraw(IAABB pixelBounds,
                              rcp<RenderBuffer> uvBuffer,
                              rcp<RenderBuffer> indexBuffer,
                              uint32_t indexCount,
-                             float opacity) :
+                             float opacity,
+                             const SurfaceMaterialData* surfaceMaterialData) :
 
     Draw(pixelBounds,
          matrix,
@@ -2715,7 +2716,8 @@ ImageMeshDraw::ImageMeshDraw(IAABB pixelBounds,
     m_uvBufferRef(uvBuffer.release()),
     m_indexBufferRef(indexBuffer.release()),
     m_indexCount(indexCount),
-    m_opacity(opacity)
+    m_opacity(opacity),
+    m_surfaceMaterialData(surfaceMaterialData)
 {
     assert(m_vertexBufferRef != nullptr);
     assert(m_uvBufferRef != nullptr);
