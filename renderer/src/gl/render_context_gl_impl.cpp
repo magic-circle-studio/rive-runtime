@@ -3319,27 +3319,25 @@ void RenderContextGLImpl::linkDrawPrograms()
                     ShaderFeatures features,
                     ShaderMiscFlags miscFlags) {
         DrawBatch batch(type, miscFlags, {}, 0, 0, BlendMode::srcOver, {}, {});
-        // Clip reset has no clip-rect feature. The platform mask collapses
-        // clipped variants to the same key when clip planes are unavailable.
-        for (auto clip : {ShaderFeatures::NONE,
-                          ShaderFeatures::ENABLE_CLIP_RECT &
-                              ShaderFeaturesMaskFor(type, desc.interlockMode)})
-        {
-            batch.shaderFeatures = features | clip;
-            m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
-                                           m_platformFeatures);
-        }
+        batch.shaderFeatures = features;
+        m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
+                                       m_platformFeatures);
     };
 
     // Magic Garden's set, in loading-animation then pet first-use order.
     constexpr auto path = DrawType::stencilMidpointFanCover;
     constexpr auto fixed = ShaderMiscFlags::fixedFunctionColorOutput;
+    // Artboards have a clip rect; clip updates and clip reset do not use it.
+    // The platform mask drops this feature when clip planes are unavailable.
+    constexpr auto clip = ShaderFeatures::ENABLE_CLIP_RECT;
+    constexpr auto material = ShaderFeatures::ENABLE_HSL_BLEND_MODES;
     link(path, ShaderFeatures::NONE, fixed);
+    link(path, clip, fixed);
     link(DrawType::clipReset, ShaderFeatures::NONE, fixed);
-    link(path, ShaderFeatures::ENABLE_ADVANCED_BLEND, ShaderMiscFlags::none);
-    link(DrawType::imageMesh, ShaderFeatures::NONE, fixed);
-    link(path, ShaderFeatures::ENABLE_HSL_BLEND_MODES, fixed);
-    link(DrawType::imageMesh, ShaderFeatures::ENABLE_HSL_BLEND_MODES, fixed);
+    link(path, clip | ShaderFeatures::ENABLE_ADVANCED_BLEND, ShaderMiscFlags::none);
+    link(DrawType::imageMesh, clip, fixed);
+    link(path, clip | material, fixed);
+    link(DrawType::imageMesh, clip | material, fixed);
 }
 
 bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
