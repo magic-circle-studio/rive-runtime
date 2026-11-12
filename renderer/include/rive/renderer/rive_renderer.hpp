@@ -120,8 +120,9 @@ public:
 #endif
 
 private:
+    enum class MaterialSpace { path, artboard };
     std::optional<gpu::SurfaceMaterialData> makeSurfaceMaterialData(
-        RiveRenderPath*);
+        MaterialSpace, RiveRenderPath* = nullptr);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);
     void clipPathImpl(const RiveRenderPath*,

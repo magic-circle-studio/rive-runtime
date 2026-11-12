@@ -313,7 +313,9 @@ void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
     {
         auto& pathDraw = static_cast<gpu::PathDraw&>(*draw);
         if (auto data = makeSurfaceMaterialData(
-                pathDraw.imageTexture() == nullptr ? path : nullptr))
+                pathDraw.imageTexture() == nullptr ? MaterialSpace::path
+                                                   : MaterialSpace::artboard,
+                path))
         {
             pathDraw.setSurfaceMaterial(*data);
         }
@@ -322,7 +324,7 @@ void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
 }
 
 std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
-    RiveRenderPath* path)
+    MaterialSpace space, RiveRenderPath* path)
 {
     const auto& state = m_renderStateStack.back();
     if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
@@ -344,7 +346,7 @@ std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
         -bounds.left() / width,
         -bounds.top() / height);
     Mat2D screenToMaterial;
-    if (path == nullptr)
+    if (space == MaterialSpace::artboard)
     {
         // Images use artboard-space material coordinates, without a cached
         // path binding.
@@ -642,10 +644,6 @@ void RiveRenderer::drawImage(const RenderImage* renderImage,
             m_unitQuadIndices = makeBuffer(RenderBufferType::index, indices);
         }
 
-        // Preserve the path route's intermediate 8-bit alpha before the
-        // renderer opacity is applied by drawImageMesh.
-        float pathOpacity =
-            colorAlpha(colorModulateOpacity(0xFFFFFFFF, finalOpacity)) / 255.f;
         RiveRenderer::drawImageMesh(image,
                                    imageSampler,
                                    m_unitQuadVertices,
@@ -654,7 +652,7 @@ void RiveRenderer::drawImage(const RenderImage* renderImage,
                                    4,
                                    6,
                                    blendMode,
-                                   pathOpacity,
+                                   opacity,
                                    additiveness);
         restore();
         return;
@@ -767,7 +765,7 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
 #ifdef RIVE_WEBGL
     if (m_context->frameInterlockMode() == gpu::InterlockMode::depthStencil)
     {
-        if (auto data = makeSurfaceMaterialData(nullptr))
+        if (auto data = makeSurfaceMaterialData(MaterialSpace::artboard))
         {
             materialData = m_context->make<gpu::SurfaceMaterialData>(*data);
         }

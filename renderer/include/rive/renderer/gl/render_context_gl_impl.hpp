@@ -94,10 +94,7 @@ public:
 
     GLState* state() const { return m_state.get(); }
 
-    void setExactProgramsEnabled(bool enabled)
-    {
-        m_pipelineManager.setExactProgramsEnabled(enabled);
-    }
+
 
     // Storage type and rendering method for the feather atlas.
     //
@@ -237,9 +234,24 @@ private:
                         std::unique_ptr<PixelLocalStorageImpl>,
                         ShaderCompilationMode);
 
+    struct AuxiliaryProgram
+    {
+        glutils::Program program = glutils::Program::Zero();
+        PipelineStatus status = PipelineStatus::notReady;
+        operator GLuint() const { return program; }
+        bool pending() const
+        {
+            return program != 0 && status == PipelineStatus::notReady;
+        }
+        bool readyOrAbsent() const
+        {
+            return program == 0 || status == PipelineStatus::ready;
+        }
+    };
+
     void buildFeatherAtlasRenderPipelines();
     bool isProgramLinkComplete(GLuint, PipelineCreateType) const;
-    bool advanceAuxiliaryProgram(GLuint, PipelineStatus*, PipelineCreateType);
+    bool advanceAuxiliaryProgram(AuxiliaryProgram&, PipelineCreateType);
     void startBlitAsDrawProgram();
     void finishBlitAsDrawProgram(PipelineCreateType);
     void finishFeatherAtlasPrograms(PipelineCreateType);
@@ -266,7 +278,6 @@ private:
 
     void flush(const FlushDescriptor&) override;
     size_t prepareFlushPrograms(Span<const FlushDescriptor* const>) override;
-    void postFlush(const RenderContext::FlushResources&) override;
     StandardPipelineProps drawProgramProps(const FlushDescriptor&,
                                           const DrawBatch&) const;
     void clearRenderTargetRects(const FlushDescriptor&);
@@ -335,7 +346,7 @@ private:
     GLuint m_tessVertexTexture = 0;
 
     // Renders feathers to the feather atlas texture.
-    class FeatherAtlasProgram
+    class FeatherAtlasProgram : public AuxiliaryProgram
     {
     public:
         void compile(GLuint vertexShaderID,
@@ -345,17 +356,12 @@ private:
                      size_t numSources,
                      const GLCapabilities&);
         void finish(const GLCapabilities&, GLState*);
-        PipelineStatus status = PipelineStatus::notReady;
-
-        operator GLuint() const { return m_program; }
-
         GLint baseInstanceUniformLocation() const
         {
             return m_baseInstanceUniformLocation;
         }
 
     private:
-        glutils::Program m_program = glutils::Program::Zero();
         GLint m_baseInstanceUniformLocation = -1;
     };
 
@@ -369,10 +375,8 @@ private:
     // Pipelines for clearing and resolving atlases into a GL_R8 texture for
     // sampling.
     glutils::Shader m_featherAtlasResolveVertexShader;
-    glutils::Program m_featherAtlasClearProgram = glutils::Program::Zero();
-    glutils::Program m_featherAtlasResolveProgram = glutils::Program::Zero();
-    PipelineStatus m_featherAtlasClearStatus = PipelineStatus::notReady;
-    PipelineStatus m_featherAtlasResolveStatus = PipelineStatus::notReady;
+    AuxiliaryProgram m_featherAtlasClearProgram;
+    AuxiliaryProgram m_featherAtlasResolveProgram;
     glutils::VAO m_featherAtlasResolveVAO;
     glutils::Texture m_featherAtlasRenderTexture = glutils::Texture::Zero();
     glutils::Texture m_featherAtlasTexture = glutils::Texture::Zero();
@@ -476,14 +480,14 @@ private:
     public:
         GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
         void pollPendingPrograms();
-        const DrawProgram* resolvePipeline(const PipelineProps&,
-                                          const PlatformFeatures&,
-                                          std::unordered_set<uint32_t>*);
-        void startExactPrograms(const PlatformFeatures&);
+        const DrawProgram* requestPipeline(const PipelineProps& props,
+                                           const PlatformFeatures& features)
+        {
+            return queuePipelineIfNotFound(ubershaderPropsFor(props, features),
+                                           features);
+        }
 
     protected:
-        bool deferExactPipelineCreation() const override;
-        void requestExactPipeline(const PipelineProps&) override;
 
         virtual std::unique_ptr<DrawShader> createVertexShader(
             DrawType,
@@ -516,10 +520,8 @@ private:
         {
             DrawProgram* program;
             PipelineProps props;
-            bool isUbershader;
         };
         std::unordered_map<uint32_t, PendingProgram> m_pendingPrograms;
-        std::vector<PipelineProps> m_exactRequests;
     };
 
     GLPipelineManager m_pipelineManager;
@@ -548,17 +550,7 @@ private:
 
     // Used for blitting non-MSAA -> MSAA, which isn't supported by
     // glBlitFramebuffer().
-    glutils::Program m_blitAsDrawProgram = glutils::Program::Zero();
-    PipelineStatus m_blitAsDrawStatus = PipelineStatus::notReady;
-
-    struct ResolvedDrawProgram
-    {
-        StandardPipelineProps props;
-        const DrawProgram* program;
-    };
-    std::vector<ResolvedDrawProgram> m_resolvedDrawPrograms;
-    size_t m_resolvedDrawProgramIndex = 0;
-    bool m_programsPrepared = false;
+    AuxiliaryProgram m_blitAsDrawProgram;
 
     const rcp<GLState> m_state;
 

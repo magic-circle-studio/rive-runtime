@@ -600,7 +600,7 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                 GLSL_ATLAS_RENDER_TARGET_R8_PLS_EXT,
                 GLSL_CLEAR_COVERAGE};
             const char* atlasClearSources[] = {glsl::resolve_atlas};
-            m_featherAtlasClearProgram = glutils::Program();
+            m_featherAtlasClearProgram.program = glutils::Program();
             glAttachShader(m_featherAtlasClearProgram,
                            m_featherAtlasResolveVertexShader);
             glutils::CompileAndAttachShader(m_featherAtlasClearProgram,
@@ -622,7 +622,7 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                                              glsl::flush_uniforms,
                                              glsl::common,
                                              glsl::resolve_atlas};
-        m_featherAtlasResolveProgram = glutils::Program();
+        m_featherAtlasResolveProgram.program = glutils::Program();
         glAttachShader(m_featherAtlasResolveProgram,
                        m_featherAtlasResolveVertexShader);
         glutils::CompileAndAttachShader(m_featherAtlasResolveProgram,
@@ -1178,9 +1178,9 @@ void RenderContextGLImpl::FeatherAtlasProgram::compile(
     size_t numSources,
     const GLCapabilities& capabilities)
 {
-    m_program = glutils::Program();
-    glAttachShader(m_program, vertexShaderID);
-    glutils::CompileAndAttachShader(m_program,
+    program = glutils::Program();
+    glAttachShader(program, vertexShaderID);
+    glutils::CompileAndAttachShader(program,
                                     GL_FRAGMENT_SHADER,
                                     defines,
                                     numDefines,
@@ -1188,34 +1188,34 @@ void RenderContextGLImpl::FeatherAtlasProgram::compile(
                                     numSources,
                                     capabilities,
                                     glutils::DebugPrintErrorAndAbort::no);
-    glutils::LinkProgram(m_program, glutils::DebugPrintErrorAndAbort::no);
+    glutils::LinkProgram(program, glutils::DebugPrintErrorAndAbort::no);
 }
 
 void RenderContextGLImpl::FeatherAtlasProgram::finish(
     const GLCapabilities& capabilities,
     GLState* state)
 {
-    state->bindProgram(m_program);
-    glUniformBlockBinding(m_program,
-                          glGetUniformBlockIndex(m_program, GLSL_FlushUniforms),
+    state->bindProgram(program);
+    glUniformBlockBinding(program,
+                          glGetUniformBlockIndex(program, GLSL_FlushUniforms),
                           FLUSH_UNIFORM_BUFFER_IDX);
-    glutils::Uniform1iByName(m_program,
+    glutils::Uniform1iByName(program,
                              GLSL_tessVertexTexture,
                              TESS_VERTEX_TEXTURE_IDX);
-    glutils::Uniform1iByName(m_program,
+    glutils::Uniform1iByName(program,
                              GLSL_gaussianIntegralTexture,
                              GAUSSIAN_INTEGRAL_TEXTURE_IDX);
     if (!capabilities.ARB_shader_storage_buffer_object)
     {
-        glutils::Uniform1iByName(m_program, GLSL_pathBuffer, PATH_BUFFER_IDX);
-        glutils::Uniform1iByName(m_program,
+        glutils::Uniform1iByName(program, GLSL_pathBuffer, PATH_BUFFER_IDX);
+        glutils::Uniform1iByName(program,
                                  GLSL_contourBuffer,
                                  CONTOUR_BUFFER_IDX);
     }
     if (!capabilities.ANGLE_base_vertex_base_instance_shader_builtin)
     {
         m_baseInstanceUniformLocation =
-            glGetUniformLocation(m_program,
+            glGetUniformLocation(program,
                                  glutils::BASE_INSTANCE_UNIFORM_NAME);
     }
 }
@@ -2194,18 +2194,14 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
     auto renderTarget = static_cast<RenderTargetGL*>(desc.renderTarget);
     if (needsBlitAsDraw(desc))
     {
-        if (!m_programsPrepared)
-        {
-            finishBlitAsDrawProgram(PipelineCreateType::sync);
-        }
-        if (m_blitAsDrawStatus == PipelineStatus::errored)
+        finishBlitAsDrawProgram(PipelineCreateType::sync);
+        if (m_blitAsDrawProgram.status == PipelineStatus::errored)
         {
             return;
         }
     }
-    if (!m_programsPrepared &&
-        (desc.featherAtlasFillBatchCount != 0 ||
-         desc.featherAtlasStrokeBatchCount != 0))
+    if (desc.featherAtlasFillBatchCount != 0 ||
+        desc.featherAtlasStrokeBatchCount != 0)
     {
         if (m_featherAtlasVertexShader == 0)
         {
@@ -2727,11 +2723,7 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
     // Execute the DrawList.
     for (const DrawBatch& batch : *desc.drawList)
     {
-        const auto resolved = m_programsPrepared
-                                  ? m_resolvedDrawPrograms[m_resolvedDrawProgramIndex++]
-                                  : ResolvedDrawProgram{
-                                        drawProgramProps(desc, batch), nullptr};
-        const auto& props = resolved.props;
+        const auto props = drawProgramProps(desc, batch);
         const gpu::DrawType drawType = props.drawType;
         const gpu::ShaderFeatures shaderFeatures = props.shaderFeatures;
         const gpu::ShaderMiscFlags shaderMiscFlags = props.shaderMiscFlags;
@@ -2741,9 +2733,7 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
             continue;
         }
         const DrawProgram* drawProgram =
-            m_programsPrepared
-                ? resolved.program
-                : m_pipelineManager.tryGetPipeline(props, m_platformFeatures);
+            m_pipelineManager.tryGetPipeline(props, m_platformFeatures);
         if (drawProgram == nullptr)
         {
             // There was an issue getting either the requested draw program or
@@ -3211,18 +3201,16 @@ bool RenderContextGLImpl::isProgramLinkComplete(
 }
 
 bool RenderContextGLImpl::advanceAuxiliaryProgram(
-    GLuint program,
-    PipelineStatus* status,
+    AuxiliaryProgram& program,
     PipelineCreateType createType)
 {
-    if (program == 0 || *status != PipelineStatus::notReady ||
-        !isProgramLinkComplete(program, createType))
+    if (!program.pending() || !isProgramLinkComplete(program, createType))
     {
         return false;
     }
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    *status = linked ? PipelineStatus::ready : PipelineStatus::errored;
+    program.status = linked ? PipelineStatus::ready : PipelineStatus::errored;
     return linked != GL_FALSE;
 }
 
@@ -3232,7 +3220,7 @@ void RenderContextGLImpl::startBlitAsDrawProgram()
                              glsl::flush_uniforms,
                              glsl::common,
                              glsl::blit_texture_as_draw};
-    m_blitAsDrawProgram = glutils::Program();
+    m_blitAsDrawProgram.program = glutils::Program();
     glutils::CompileAndAttachShader(m_blitAsDrawProgram,
                                     GL_VERTEX_SHADER,
                                     nullptr,
@@ -3255,9 +3243,7 @@ void RenderContextGLImpl::startBlitAsDrawProgram()
 
 void RenderContextGLImpl::finishBlitAsDrawProgram(PipelineCreateType createType)
 {
-    if (advanceAuxiliaryProgram(m_blitAsDrawProgram,
-                                &m_blitAsDrawStatus,
-                                createType))
+    if (advanceAuxiliaryProgram(m_blitAsDrawProgram, createType))
     {
         m_state->bindProgram(m_blitAsDrawProgram);
         glutils::Uniform1iByName(m_blitAsDrawProgram, GLSL_sourceTexture, 0);
@@ -3270,17 +3256,13 @@ void RenderContextGLImpl::finishFeatherAtlasPrograms(
     for (FeatherAtlasProgram* program :
          {&m_featherAtlasFillProgram, &m_featherAtlasStrokeProgram})
     {
-        if (advanceAuxiliaryProgram(*program, &program->status, createType))
+        if (advanceAuxiliaryProgram(*program, createType))
         {
             program->finish(m_capabilities, m_state.get());
         }
     }
-    std::ignore = advanceAuxiliaryProgram(m_featherAtlasClearProgram,
-                                          &m_featherAtlasClearStatus,
-                                          createType);
-    if (advanceAuxiliaryProgram(m_featherAtlasResolveProgram,
-                                &m_featherAtlasResolveStatus,
-                                createType) &&
+    std::ignore = advanceAuxiliaryProgram(m_featherAtlasClearProgram, createType);
+    if (advanceAuxiliaryProgram(m_featherAtlasResolveProgram, createType) &&
         m_featherAtlasRenderType == FeatherAtlasRenderType::rgba8)
     {
         m_state->bindProgram(m_featherAtlasResolveProgram);
@@ -3297,10 +3279,8 @@ bool RenderContextGLImpl::featherAtlasProgramsReady(
             m_featherAtlasFillProgram.status == PipelineStatus::ready) &&
            (desc.featherAtlasStrokeBatchCount == 0 ||
             m_featherAtlasStrokeProgram.status == PipelineStatus::ready) &&
-           (m_featherAtlasClearProgram == 0 ||
-            m_featherAtlasClearStatus == PipelineStatus::ready) &&
-           (m_featherAtlasResolveProgram == 0 ||
-            m_featherAtlasResolveStatus == PipelineStatus::ready);
+           m_featherAtlasClearProgram.readyOrAbsent() &&
+           m_featherAtlasResolveProgram.readyOrAbsent();
 }
 
 StandardPipelineProps RenderContextGLImpl::drawProgramProps(
@@ -3344,15 +3324,12 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         return 0;
     }
 
-    m_programsPrepared = true;
-    m_resolvedDrawPrograms.clear();
-    m_resolvedDrawProgramIndex = 0;
     m_pipelineManager.pollPendingPrograms();
 
     bool needsBlit = false;
     bool needsFeatherFill = false;
     bool needsFeatherStroke = false;
-    std::unordered_set<uint32_t> pendingDrawPrograms;
+    std::unordered_set<const DrawProgram*> pendingDrawPrograms;
     for (const FlushDescriptor* desc : descriptors)
     {
         needsBlit |= needsBlitAsDraw(*desc);
@@ -3361,9 +3338,13 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         for (const DrawBatch& batch : *desc->drawList)
         {
             auto props = drawProgramProps(*desc, batch);
-            const DrawProgram* program = m_pipelineManager.resolvePipeline(
-                props, m_platformFeatures, &pendingDrawPrograms);
-            m_resolvedDrawPrograms.push_back({props, program});
+            const DrawProgram* program =
+                m_pipelineManager.requestPipeline(props, m_platformFeatures);
+            assert(program != nullptr);
+            if (program->status() == PipelineStatus::notReady)
+            {
+                pendingDrawPrograms.insert(program);
+            }
         }
     }
 
@@ -3371,7 +3352,7 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
     // are polled once, even when several logical flushes need them.
     size_t pendingCount = pendingDrawPrograms.size();
     finishBlitAsDrawProgram(PipelineCreateType::async);
-    if (needsBlit && m_blitAsDrawStatus == PipelineStatus::notReady)
+    if (needsBlit && m_blitAsDrawProgram.pending())
     {
         ++pendingCount;
     }
@@ -3388,27 +3369,11 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         pendingCount += needsFeatherStroke &&
                         m_featherAtlasStrokeProgram.status ==
                             PipelineStatus::notReady;
-        pendingCount += m_featherAtlasClearProgram != 0 &&
-                        m_featherAtlasClearStatus == PipelineStatus::notReady;
-        pendingCount += m_featherAtlasResolveProgram != 0 &&
-                        m_featherAtlasResolveStatus == PipelineStatus::notReady;
+        pendingCount += m_featherAtlasClearProgram.pending();
+        pendingCount += m_featherAtlasResolveProgram.pending();
     }
 
     return pendingCount;
-}
-
-void RenderContextGLImpl::postFlush(const RenderContext::FlushResources&)
-{
-    if (!m_programsPrepared && m_capabilities.KHR_parallel_shader_compile)
-    {
-        // Blocking frames also retire pending links, including families that
-        // this frame did not use. tryFlush already polled them in preflight.
-        m_pipelineManager.pollPendingPrograms();
-    }
-    m_pipelineManager.startExactPrograms(m_platformFeatures);
-    m_programsPrepared = false;
-    m_resolvedDrawPrograms.clear();
-    m_resolvedDrawProgramIndex = 0;
 }
 
 void RenderContextGLImpl::GLPipelineManager::pollPendingPrograms()
@@ -3433,85 +3398,9 @@ void RenderContextGLImpl::GLPipelineManager::pollPendingPrograms()
     }
 }
 
-const RenderContextGLImpl::DrawProgram*
-RenderContextGLImpl::GLPipelineManager::resolvePipeline(
-    const PipelineProps& props,
-    const PlatformFeatures& features,
-    std::unordered_set<uint32_t>* pendingPrograms)
-{
-    if (exactProgramsEnabled())
-    {
-        auto exact = findPipeline(props.createKey(features));
-        if (exact != nullptr && exact->status() == PipelineStatus::ready)
-        {
-            return exact;
-        }
-    }
-    auto uberProps = props;
-    uberProps.shaderFeatures = UbershaderFeaturesMaskFor(props.shaderFeatures,
-                                                        props.drawType,
-                                                        props.interlockMode,
-                                                        props.shaderMiscFlags,
-                                                        features);
-    const uint32_t uberKey = uberProps.createKey(features);
-    queuePipelineIfNotFound(uberProps, features);
-    auto uber = findPipeline(uberKey);
-    assert(uber != nullptr);
-    if (uber->status() == PipelineStatus::notReady)
-    {
-        pendingPrograms->insert(uberKey);
-        return nullptr;
-    }
-    if (uber->status() == PipelineStatus::errored)
-    {
-        return nullptr;
-    }
-    if (exactProgramsEnabled() &&
-        props.shaderFeatures != uberProps.shaderFeatures)
-    {
-        requestExactPipeline(props);
-    }
-    return uber;
-}
-
-void RenderContextGLImpl::GLPipelineManager::startExactPrograms(
-    const PlatformFeatures& features)
-{
-    if (!exactProgramsEnabled())
-    {
-        m_exactRequests.clear();
-        return;
-    }
-    for (const auto& [key, pending] : m_pendingPrograms)
-    {
-        if (pending.isUbershader &&
-            pending.program->status() == PipelineStatus::notReady)
-        {
-            return;
-        }
-    }
-    for (const auto& props : m_exactRequests)
-    {
-        queuePipelineIfNotFound(props, features);
-    }
-    m_exactRequests.clear();
-}
-
 void RenderContextGLImpl::GLPipelineManager::clearCacheInternal()
 {
     m_pendingPrograms.clear();
-    m_exactRequests.clear();
-}
-
-bool RenderContextGLImpl::GLPipelineManager::deferExactPipelineCreation() const
-{
-    return m_context->capabilities().KHR_parallel_shader_compile;
-}
-
-void RenderContextGLImpl::GLPipelineManager::requestExactPipeline(
-    const PipelineProps& props)
-{
-    m_exactRequests.push_back(props);
 }
 
 void RenderContextGLImpl::blitTextureToFramebufferAsDraw(
@@ -3520,11 +3409,7 @@ void RenderContextGLImpl::blitTextureToFramebufferAsDraw(
     uint32_t renderTargetHeight,
     bool bottomUp)
 {
-    if (!m_programsPrepared)
-    {
-        finishBlitAsDrawProgram(PipelineCreateType::sync);
-    }
-    if (m_blitAsDrawStatus != PipelineStatus::ready)
+    if (m_blitAsDrawProgram.status != PipelineStatus::ready)
     {
         return;
     }
@@ -3558,10 +3443,8 @@ RenderContextGLImpl::FeatherAtlasRenderType RenderContextGLImpl::
     m_featherAtlasFillProgram = {};
     m_featherAtlasStrokeProgram = {};
     m_featherAtlasResolveVertexShader = {};
-    m_featherAtlasClearProgram = glutils::Program::Zero();
-    m_featherAtlasResolveProgram = glutils::Program::Zero();
-    m_featherAtlasClearStatus = PipelineStatus::notReady;
-    m_featherAtlasResolveStatus = PipelineStatus::notReady;
+    m_featherAtlasClearProgram = {};
+    m_featherAtlasResolveProgram = {};
 
     // ...And release all the DrawShaders in case any need to be recompiled for
     // sampling a different FeatherAtlasRenderType.
@@ -4190,7 +4073,7 @@ RenderContextGLImpl::GLPipelineManager::GLPipelineManager(
 
 std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
     GLPipelineManager::createPipeline(PipelineCreateType createType,
-                                      uint32_t, // unused key
+                                      uint32_t key,
                                       const PipelineProps& props,
                                       const PlatformFeatures&)
 {
@@ -4207,15 +4090,8 @@ std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
     );
     if (program->status() == PipelineStatus::notReady)
     {
-        bool isUbershader = props.shaderFeatures == UbershaderFeaturesMaskFor(
-            props.shaderFeatures,
-            props.drawType,
-            props.interlockMode,
-            props.shaderMiscFlags,
-            m_context->m_platformFeatures);
         m_pendingPrograms.emplace(
-            props.createKey(m_context->m_platformFeatures),
-            PendingProgram{program.get(), props, isUbershader});
+            key, PendingProgram{program.get(), props});
     }
     return program;
 }
