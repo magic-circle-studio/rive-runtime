@@ -4070,27 +4070,6 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushDraw(
                                             currentBatch->imageSampler,
                                             draw->imageSampler());
                 if (canMergeWithPreviousBatch &&
-                    m_ctx->frameInterlockMode() == InterlockMode::depthStencil)
-                {
-                    // Keep plain paths out of the material/HSL permutation.
-                    bool needsHSL = draw->blendMode() >= BlendMode::hue &&
-                                    paintType != PaintType::clipUpdate &&
-                                    enums::no_flags_set(
-                                        shaderMiscFlags,
-                                        ShaderMiscFlags::borrowedCoveragePass);
-#ifdef RIVE_WEBGL
-                    if (draw->type() == Draw::Type::path)
-                    {
-                        const auto* pathDraw = static_cast<const PathDraw*>(draw);
-                        needsHSL |= pathDraw->hasSurfaceMaterial();
-                    }
-#endif
-                    const bool batchNeedsHSL = enums::is_flag_set(
-                        currentBatch->shaderFeatures,
-                        ShaderFeatures::ENABLE_HSL_BLEND_MODES);
-                    canMergeWithPreviousBatch = batchNeedsHSL == needsHSL;
-                }
-                if (canMergeWithPreviousBatch &&
                     currentBatch->baseElement + currentBatch->elementCount !=
                         baseElement)
                 {
