@@ -254,7 +254,7 @@ private:
     bool advanceAuxiliaryProgram(AuxiliaryProgram&, PipelineCreateType);
     void startBlitAsDrawProgram();
     void finishBlitAsDrawProgram(PipelineCreateType);
-    void finishFeatherAtlasPrograms(PipelineCreateType);
+    void finishFeatherAtlasPrograms(PipelineCreateType, bool fill, bool stroke);
     bool featherAtlasProgramsReady(const FlushDescriptor&) const;
     bool needsBlitAsDraw(const FlushDescriptor&) const;
 

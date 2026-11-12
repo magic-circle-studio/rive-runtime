@@ -644,16 +644,18 @@ void RiveRenderer::drawImage(const RenderImage* renderImage,
             m_unitQuadIndices = makeBuffer(RenderBufferType::index, indices);
         }
 
-        RiveRenderer::drawImageMesh(image,
-                                   imageSampler,
-                                   m_unitQuadVertices,
-                                   m_unitQuadVertices,
-                                   m_unitQuadIndices,
-                                   4,
-                                   6,
-                                   blendMode,
-                                   opacity,
-                                   additiveness);
+        pushImageMeshDraw(m_renderStateStack.back()
+                              .matrix.mapBoundingBox(AABB{0, 0, 1, 1})
+                              .roundOut(),
+                          std::move(imageTexture),
+                          imageSampler,
+                          m_unitQuadVertices,
+                          m_unitQuadVertices,
+                          m_unitQuadIndices,
+                          6,
+                          blendMode,
+                          opacity,
+                          additiveness);
         restore();
         return;
     }
@@ -752,6 +754,29 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
     assert(uvCoords_f32);
     assert(indices_u16);
 
+    pushImageMeshDraw(gpu::Draw::FULLSCREEN_PIXEL_BOUNDS,
+                      std::move(imageTexture),
+                      imageSampler,
+                      std::move(vertices_f32),
+                      std::move(uvCoords_f32),
+                      std::move(indices_u16),
+                      indexCount,
+                      blendMode,
+                      opacity,
+                      additiveness);
+}
+
+void RiveRenderer::pushImageMeshDraw(IAABB pixelBounds,
+                                     rcp<gpu::Texture> imageTexture,
+                                     ImageSampler imageSampler,
+                                     rcp<RenderBuffer> vertices_f32,
+                                     rcp<RenderBuffer> uvCoords_f32,
+                                     rcp<RenderBuffer> indices_u16,
+                                     uint32_t indexCount,
+                                     BlendMode blendMode,
+                                     float opacity,
+                                     float additiveness)
+{
     if (m_renderStateStack.back().overallClipPixelBounds.empty())
     {
         return;
@@ -772,7 +797,7 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
     }
 #endif
     clipAndPushDraw(gpu::DrawUniquePtr(
-        m_context->make<gpu::ImageMeshDraw>(gpu::Draw::FULLSCREEN_PIXEL_BOUNDS,
+        m_context->make<gpu::ImageMeshDraw>(pixelBounds,
                                             m_renderStateStack.back().matrix,
                                             blendMode,
                                             additiveness,

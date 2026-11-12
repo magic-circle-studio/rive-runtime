@@ -2207,7 +2207,9 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
         {
             buildFeatherAtlasRenderPipelines();
         }
-        finishFeatherAtlasPrograms(PipelineCreateType::sync);
+        finishFeatherAtlasPrograms(PipelineCreateType::sync,
+                                   desc.featherAtlasFillBatchCount != 0,
+                                   desc.featherAtlasStrokeBatchCount != 0);
     }
 
     // This context is current on its own thread here, the only place names it
@@ -3251,15 +3253,19 @@ void RenderContextGLImpl::finishBlitAsDrawProgram(PipelineCreateType createType)
 }
 
 void RenderContextGLImpl::finishFeatherAtlasPrograms(
-    PipelineCreateType createType)
+    PipelineCreateType createType,
+    bool fill,
+    bool stroke)
 {
-    for (FeatherAtlasProgram* program :
-         {&m_featherAtlasFillProgram, &m_featherAtlasStrokeProgram})
+    // A sync finish waits for its link, so skip a pass the frame doesn't use.
+    if (fill && advanceAuxiliaryProgram(m_featherAtlasFillProgram, createType))
     {
-        if (advanceAuxiliaryProgram(*program, createType))
-        {
-            program->finish(m_capabilities, m_state.get());
-        }
+        m_featherAtlasFillProgram.finish(m_capabilities, m_state.get());
+    }
+    if (stroke &&
+        advanceAuxiliaryProgram(m_featherAtlasStrokeProgram, createType))
+    {
+        m_featherAtlasStrokeProgram.finish(m_capabilities, m_state.get());
     }
     std::ignore = advanceAuxiliaryProgram(m_featherAtlasClearProgram, createType);
     if (advanceAuxiliaryProgram(m_featherAtlasResolveProgram, createType) &&
@@ -3362,7 +3368,9 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         {
             buildFeatherAtlasRenderPipelines();
         }
-        finishFeatherAtlasPrograms(PipelineCreateType::async);
+        finishFeatherAtlasPrograms(PipelineCreateType::async,
+                                   needsFeatherFill,
+                                   needsFeatherStroke);
         pendingCount += needsFeatherFill &&
                         m_featherAtlasFillProgram.status ==
                             PipelineStatus::notReady;

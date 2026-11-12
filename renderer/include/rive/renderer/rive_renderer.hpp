@@ -124,6 +124,19 @@ private:
     std::optional<gpu::SurfaceMaterialData> makeSurfaceMaterialData(
         MaterialSpace, RiveRenderPath* = nullptr);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
+    // pixelBounds must contain the transformed mesh. Arbitrary meshes pass
+    // FULLSCREEN_PIXEL_BOUNDS; image quads pass their own bounds so overlay
+    // frames update only the pixels they draw.
+    void pushImageMeshDraw(IAABB pixelBounds,
+                           rcp<gpu::Texture>,
+                           ImageSampler,
+                           rcp<RenderBuffer> vertices_f32,
+                           rcp<RenderBuffer> uvCoords_f32,
+                           rcp<RenderBuffer> indices_u16,
+                           uint32_t indexCount,
+                           BlendMode,
+                           float opacity,
+                           float additiveness);
     void clipRectImpl(AABB, const RiveRenderPath* originalPath);
     void clipPathImpl(const RiveRenderPath*,
                       std::optional<StrokeParams> = {},
