@@ -1601,6 +1601,7 @@ void RenderContext::LogicalFlush::writeResources()
                                 /*clipID =*/0,
                                 /*hasClipRect =*/false,
                                 /*hasImage =*/false,
+                                /*hasSurfaceMaterial =*/false,
                                 BlendMode::srcOver,
                                 /*solidUnmultiplied =*/false,
                                 /*additiveness =*/0);
@@ -3149,6 +3150,7 @@ uint32_t RenderContext::LogicalFlush::pushPath(const PathDraw* draw)
         draw->clipID(),
         draw->hasClipRect(),
         draw->hasImageTexture(),
+        draw->hasSurfaceMaterial(),
         draw->blendMode(),
         // Solid paints are unmultiplied for advanced-blend draws, except
         // when depthStencil uses KHR_blend_equation_advanced

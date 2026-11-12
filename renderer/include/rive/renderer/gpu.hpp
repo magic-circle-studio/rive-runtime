@@ -896,6 +896,10 @@ constexpr static ShaderFeatures kVertexShaderFeaturesMask =
 constexpr static ShaderFeatures kExclusiveAtomicUbershaderFeaturesMask =
     ShaderFeatures::ENABLE_ADVANCED_BLEND;
 
+// Image paints require a separate depth-stencil ubershader only when used.
+constexpr static ShaderFeatures kExclusiveDepthStencilUbershaderFeaturesMask =
+    ShaderFeatures::ENABLE_MODULATED_IMAGE;
+
 constexpr static ShaderFeatures ShaderFeaturesMaskFor(
     InterlockMode interlockMode)
 {
@@ -1121,6 +1125,11 @@ constexpr static ShaderFeatures UbershaderFeaturesMaskFor(
         //  requested feature flags.
         outFeatures &=
             (requestedFeatures | ~kExclusiveAtomicUbershaderFeaturesMask);
+    }
+    else if (interlockMode == InterlockMode::depthStencil)
+    {
+        outFeatures &=
+            (requestedFeatures | ~kExclusiveDepthStencilUbershaderFeaturesMask);
     }
 
     // Ensure that we haven't dropped features we care about somehow
@@ -1703,6 +1712,7 @@ public:
              uint32_t clipID,
              bool hasClipRect,
              bool hasImage,
+             bool hasSurfaceMaterial,
              BlendMode,
              bool solidUnmultiplied,
              float additiveness);

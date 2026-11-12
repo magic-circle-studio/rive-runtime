@@ -375,8 +375,7 @@ void ForEachUbershaderPermutation(
                     break;
             }
 
-            // Get the minimal set of ubershader features (with no optional
-            // flags)
+            // The min/max masks enumerate every optional ubershader feature.
             const auto minUbershaderFeatures =
                 UbershaderFeaturesMaskFor(ShaderFeatures::NONE,
                                           drawType,
@@ -1047,6 +1046,7 @@ void PaintData::set(DrawContents singleDrawContents,
                     uint32_t clipID,
                     bool hasClipRect,
                     bool hasImage,
+                    bool hasSurfaceMaterial,
                     BlendMode blendMode,
                     bool solidUnmultiplied,
                     float additiveness)
@@ -1119,6 +1119,10 @@ void PaintData::set(DrawContents singleDrawContents,
     if (hasImage)
     {
         localParams |= PAINT_FLAG_HAS_IMAGE;
+    }
+    if (hasSurfaceMaterial)
+    {
+        localParams |= PAINT_FLAG_HAS_SURFACE_MATERIAL;
     }
     m_params = localParams;
 }

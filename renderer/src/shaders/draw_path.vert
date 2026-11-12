@@ -227,21 +227,22 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
 #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
     if (@ENABLE_HSL_BLEND_MODES)
     {
-        float4 surfaceMaterialTranslate =
-            STORAGE_BUFFER_LOAD4(
-                @paintAuxBuffer,
-                pathID * PAINT_AUX_STRIDE +
-                    PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
-        v_surfaceMaterialData = float4(0.0, 0.0, surfaceMaterialTranslate.zw);
-        if (surfaceMaterialTranslate.z > 0.5)
+        v_surfaceMaterialData = float4(0.0);
+        if ((paintData.x & PAINT_FLAG_HAS_SURFACE_MATERIAL) != 0u)
         {
+            float4 surfaceMaterialTranslate =
+                STORAGE_BUFFER_LOAD4(
+                    @paintAuxBuffer,
+                    pathID * PAINT_AUX_STRIDE +
+                        PAINT_AUX_MATERIAL_TRANSLATE_OFFSET);
             float2x2 surfaceMaterialMatrix = make_float2x2(
                 STORAGE_BUFFER_LOAD4(
                     @paintAuxBuffer,
                     pathID * PAINT_AUX_STRIDE +
                         PAINT_AUX_MATERIAL_MATRIX_OFFSET));
-            v_surfaceMaterialData.xy =
-                MUL(surfaceMaterialMatrix, fragCoord) + surfaceMaterialTranslate.xy;
+            v_surfaceMaterialData = float4(
+                MUL(surfaceMaterialMatrix, fragCoord) + surfaceMaterialTranslate.xy,
+                surfaceMaterialTranslate.zw);
         }
     }
 #endif

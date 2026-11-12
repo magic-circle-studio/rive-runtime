@@ -134,6 +134,7 @@
 #define PAINT_FLAG_EVEN_ODD_FILL 0x200u
 #define PAINT_FLAG_HAS_CLIP_RECT 0x400u
 #define PAINT_FLAG_HAS_IMAGE 0x800u
+#define PAINT_FLAG_HAS_SURFACE_MATERIAL 0x1000u
 
 // PLS draw resources are either updated per flush or per draw. They go into set
 // 0 or set 1, depending on how often they are updated.

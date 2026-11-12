@@ -516,7 +516,7 @@ protected:
         const PipelineProps& props,
         const PlatformFeatures& platformFeatures)
     {
-        bool found = true;
+        bool found = false;
         auto curKey = ShaderUniqueKey(props.drawType,
                                       props.shaderFeatures,
                                       props.interlockMode,

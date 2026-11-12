@@ -200,5 +200,8 @@ private:
 
     // Path of the rectangle [0, 0, 1, 1]. Used to draw images.
     rcp<RiveRenderPath> m_unitRectPath;
+    // Positions and UVs share the same unit-quad coordinates.
+    rcp<RenderBuffer> m_unitQuadVertices;
+    rcp<RenderBuffer> m_unitQuadIndices;
 };
 } // namespace rive
