@@ -85,6 +85,9 @@ public:
     // context.
     void unbindGLInternalResources();
 
+    // Synchronously links Magic Garden's depth-stencil draw programs.
+    void linkDrawPrograms();
+
     // Utility for rendering a texture to an MSAA framebuffer, since
     // glBlitFramebuffer() doesn't support copying non-MSAA to MSAA.
     void blitTextureToFramebufferAsDraw(GLuint textureID,
@@ -480,6 +483,12 @@ private:
     public:
         GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
         void pollPendingPrograms();
+        void linkPipeline(const PipelineProps& props,
+                          const PlatformFeatures& features)
+        {
+            std::ignore = tryGetPipeline(ubershaderPropsFor(props, features),
+                                        features);
+        }
         const DrawProgram* requestPipeline(const PipelineProps& props,
                                            const PlatformFeatures& features)
         {

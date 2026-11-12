@@ -3312,6 +3312,28 @@ StandardPipelineProps RenderContextGLImpl::drawProgramProps(
     };
 }
 
+void RenderContextGLImpl::linkDrawPrograms()
+{
+    const FlushDescriptor desc = {.interlockMode = InterlockMode::depthStencil};
+    auto link = [&](DrawType type,
+                    ShaderFeatures features,
+                    ShaderMiscFlags miscFlags) {
+        DrawBatch batch(type, miscFlags, {}, 0, 0, BlendMode::srcOver, {}, {});
+        batch.shaderFeatures = features;
+        m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
+                                       m_platformFeatures);
+    };
+
+    // Magic Garden's set, in loading-animation then pet first-use order.
+    constexpr auto path = DrawType::stencilMidpointFanCover;
+    constexpr auto fixed = ShaderMiscFlags::fixedFunctionColorOutput;
+    link(path, ShaderFeatures::NONE, fixed);
+    link(DrawType::clipReset, ShaderFeatures::NONE, fixed);
+    link(path, ShaderFeatures::ENABLE_ADVANCED_BLEND, ShaderMiscFlags::none);
+    link(DrawType::imageMesh, ShaderFeatures::NONE, fixed);
+    link(path, ShaderFeatures::ENABLE_HSL_BLEND_MODES, fixed);
+}
+
 bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
 {
     auto target = static_cast<RenderTargetGL*>(desc.renderTarget);
