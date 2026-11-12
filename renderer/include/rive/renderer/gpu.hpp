@@ -896,8 +896,10 @@ constexpr static ShaderFeatures kVertexShaderFeaturesMask =
 constexpr static ShaderFeatures kExclusiveAtomicUbershaderFeaturesMask =
     ShaderFeatures::ENABLE_ADVANCED_BLEND;
 
-// Omit these features from depth-stencil ubershaders unless a draw requests them.
+// Omit these features from depth-stencil path and image-mesh ubershaders unless
+// a draw requests them.
 constexpr static ShaderFeatures kExclusiveDepthStencilUbershaderFeaturesMask =
+    ShaderFeatures::ENABLE_CLIP_RECT |
     ShaderFeatures::ENABLE_MODULATED_IMAGE |
     ShaderFeatures::ENABLE_HSL_BLEND_MODES;
 
@@ -1127,10 +1129,8 @@ constexpr static ShaderFeatures UbershaderFeaturesMaskFor(
         outFeatures &=
             (requestedFeatures | ~kExclusiveAtomicUbershaderFeaturesMask);
     }
-    else if (interlockMode == InterlockMode::depthStencil &&
-             drawType != DrawType::imageMesh)
+    else if (interlockMode == InterlockMode::depthStencil)
     {
-        // Mesh materials switch via uniforms, avoiding another program link.
         outFeatures &=
             (requestedFeatures | ~kExclusiveDepthStencilUbershaderFeaturesMask);
     }

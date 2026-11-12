@@ -3319,9 +3319,16 @@ void RenderContextGLImpl::linkDrawPrograms()
                     ShaderFeatures features,
                     ShaderMiscFlags miscFlags) {
         DrawBatch batch(type, miscFlags, {}, 0, 0, BlendMode::srcOver, {}, {});
-        batch.shaderFeatures = features;
-        m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
-                                       m_platformFeatures);
+        // Clip reset has no clip-rect feature. The platform mask collapses
+        // clipped variants to the same key when clip planes are unavailable.
+        for (auto clip : {ShaderFeatures::NONE,
+                          ShaderFeatures::ENABLE_CLIP_RECT &
+                              ShaderFeaturesMaskFor(type, desc.interlockMode)})
+        {
+            batch.shaderFeatures = features | clip;
+            m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
+                                           m_platformFeatures);
+        }
     };
 
     // Magic Garden's set, in loading-animation then pet first-use order.
@@ -3332,6 +3339,7 @@ void RenderContextGLImpl::linkDrawPrograms()
     link(path, ShaderFeatures::ENABLE_ADVANCED_BLEND, ShaderMiscFlags::none);
     link(DrawType::imageMesh, ShaderFeatures::NONE, fixed);
     link(path, ShaderFeatures::ENABLE_HSL_BLEND_MODES, fixed);
+    link(DrawType::imageMesh, ShaderFeatures::ENABLE_HSL_BLEND_MODES, fixed);
 }
 
 bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
