@@ -3320,8 +3320,16 @@ void RenderContextGLImpl::linkDrawPrograms()
                     ShaderMiscFlags miscFlags) {
         DrawBatch batch(type, miscFlags, {}, 0, 0, BlendMode::srcOver, {}, {});
         batch.shaderFeatures = features;
-        m_pipelineManager.linkPipeline(drawProgramProps(desc, batch),
-                                       m_platformFeatures);
+        auto props = drawProgramProps(desc, batch);
+        if (m_capabilities.KHR_parallel_shader_compile)
+        {
+            std::ignore =
+                m_pipelineManager.requestPipeline(props, m_platformFeatures);
+        }
+        else
+        {
+            m_pipelineManager.linkPipeline(props, m_platformFeatures);
+        }
     };
 
     // Magic Garden's set, in loading-animation then pet first-use order.
@@ -3358,12 +3366,10 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         return 0;
     }
 
-    m_pipelineManager.pollPendingPrograms();
-
     bool needsBlit = false;
     bool needsFeatherFill = false;
     bool needsFeatherStroke = false;
-    std::unordered_set<const DrawProgram*> pendingDrawPrograms;
+    std::unordered_set<const DrawProgram*> framePrograms;
     for (const FlushDescriptor* desc : descriptors)
     {
         needsBlit |= needsBlitAsDraw(*desc);
@@ -3372,23 +3378,24 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
         for (const DrawBatch& batch : *desc->drawList)
         {
             auto props = drawProgramProps(*desc, batch);
-            const DrawProgram* program =
-                m_pipelineManager.requestPipeline(props, m_platformFeatures);
-            assert(program != nullptr);
-            if (program->status() == PipelineStatus::notReady)
-            {
-                pendingDrawPrograms.insert(program);
-            }
+            m_pipelineManager.preparePipeline(props,
+                                              m_platformFeatures,
+                                              framePrograms);
         }
     }
 
     // Auxiliary programs obey the same completion gate as draw programs and
     // are polled once, even when several logical flushes need them.
-    size_t pendingCount = pendingDrawPrograms.size();
-    finishBlitAsDrawProgram(PipelineCreateType::async);
-    if (needsBlit && m_blitAsDrawProgram.pending())
+    size_t pendingCount = std::count_if(
+        framePrograms.begin(),
+        framePrograms.end(),
+        [](const DrawProgram* program) {
+            return program->status() == PipelineStatus::notReady;
+        });
+    if (needsBlit)
     {
-        ++pendingCount;
+        finishBlitAsDrawProgram(PipelineCreateType::async);
+        pendingCount += m_blitAsDrawProgram.pending();
     }
     if (needsFeatherFill || needsFeatherStroke)
     {
@@ -3412,31 +3419,20 @@ size_t RenderContextGLImpl::prepareFlushPrograms(
     return pendingCount;
 }
 
-void RenderContextGLImpl::GLPipelineManager::pollPendingPrograms()
+void RenderContextGLImpl::GLPipelineManager::preparePipeline(
+    const PipelineProps& propsIn,
+    const PlatformFeatures& features,
+    std::unordered_set<const DrawProgram*>& framePrograms)
 {
-    for (auto iter = m_pendingPrograms.begin(); iter != m_pendingPrograms.end();)
+    auto props = ubershaderPropsFor(propsIn, features);
+    bool created;
+    auto* program = queuePipelineIfNotFound(props, features, &created);
+    // Don't poll a link in the same call that submits it, even in later batches.
+    if (program->status() == PipelineStatus::notReady &&
+        framePrograms.insert(program).second && !created)
     {
-        auto& pending = iter->second;
-        if (pending.program->status() == PipelineStatus::notReady)
-        {
-            std::ignore = advanceCreation(PipelineCreateType::async,
-                                          *pending.program,
-                                          pending.props);
-        }
-        if (pending.program->status() != PipelineStatus::notReady)
-        {
-            iter = m_pendingPrograms.erase(iter);
-        }
-        else
-        {
-            ++iter;
-        }
+        std::ignore = advanceCreation(PipelineCreateType::async, *program, props);
     }
-}
-
-void RenderContextGLImpl::GLPipelineManager::clearCacheInternal()
-{
-    m_pendingPrograms.clear();
 }
 
 void RenderContextGLImpl::blitTextureToFramebufferAsDraw(
@@ -4109,7 +4105,7 @@ RenderContextGLImpl::GLPipelineManager::GLPipelineManager(
 
 std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
     GLPipelineManager::createPipeline(PipelineCreateType createType,
-                                      uint32_t key,
+                                      uint32_t,
                                       const PipelineProps& props,
                                       const PlatformFeatures&)
 {
@@ -4124,11 +4120,6 @@ std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
                                          props.synthesizedFailureType
 #endif
     );
-    if (program->status() == PipelineStatus::notReady)
-    {
-        m_pendingPrograms.emplace(
-            key, PendingProgram{program.get(), props});
-    }
     return program;
 }
 

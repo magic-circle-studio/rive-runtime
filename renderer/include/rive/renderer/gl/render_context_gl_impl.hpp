@@ -9,7 +9,6 @@
 #include "rive/renderer/gl/gl_utils.hpp"
 #include "rive/renderer/render_context_helper_impl.hpp"
 
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -85,7 +84,7 @@ public:
     // context.
     void unbindGLInternalResources();
 
-    // Synchronously links Magic Garden's depth-stencil draw programs.
+    // Starts Magic Garden's draw links; synchronous without parallel compile.
     void linkDrawPrograms();
 
     // Utility for rendering a texture to an MSAA framebuffer, since
@@ -482,7 +481,9 @@ private:
 
     public:
         GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
-        void pollPendingPrograms();
+        void preparePipeline(const PipelineProps&,
+                             const PlatformFeatures&,
+                             std::unordered_set<const DrawProgram*>&);
         void linkPipeline(const PipelineProps& props,
                           const PlatformFeatures& features)
         {
@@ -521,16 +522,9 @@ private:
         virtual bool advanceCreation(PipelineCreateType,
                                      DrawProgram&,
                                      const PipelineProps&) override;
-        void clearCacheInternal() override;
 
     private:
         RenderContextGLImpl* m_context;
-        struct PendingProgram
-        {
-            DrawProgram* program;
-            PipelineProps props;
-        };
-        std::unordered_map<uint32_t, PendingProgram> m_pendingPrograms;
     };
 
     GLPipelineManager m_pipelineManager;

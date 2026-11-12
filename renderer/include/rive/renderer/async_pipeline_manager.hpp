@@ -351,10 +351,15 @@ protected:
 
     PipelineType* queuePipelineIfNotFound(
         const PipelineProps& props,
-        const PlatformFeatures& platformFeatures)
+        const PlatformFeatures& platformFeatures,
+        bool* created = nullptr)
     {
         PipelineKey key = props.createKey(platformFeatures);
         auto iter = m_pipelines.find(key);
+        if (created != nullptr)
+        {
+            *created = iter == m_pipelines.end();
+        }
         if (iter != m_pipelines.end())
         {
             // This is already in our pipelines list which means it was already
