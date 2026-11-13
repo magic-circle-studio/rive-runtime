@@ -11,6 +11,7 @@
 #include "rive/math/simd.hpp"
 #include "rive/renderer/rive_render_image.hpp"
 #include "rive/profiler/profiler_macros.h"
+#include <cstring>
 
 namespace rive
 {
@@ -310,22 +311,29 @@ void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
 {
     if (draw != nullptr)
     {
-        applySurfaceMaterial(static_cast<gpu::PathDraw&>(*draw), path);
+        auto& pathDraw = static_cast<gpu::PathDraw&>(*draw);
+        if (auto data = makeSurfaceMaterialData(
+                pathDraw.imageTexture() == nullptr ? MaterialSpace::path
+                                                   : MaterialSpace::artboard,
+                path))
+        {
+            pathDraw.setSurfaceMaterial(*data);
+        }
     }
     clipAndPushDraw(std::move(draw));
 }
 
-void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
-                                        RiveRenderPath* path)
+std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
+    MaterialSpace space, RiveRenderPath* path)
 {
     const auto& state = m_renderStateStack.back();
     if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
     {
-        return;
+        return std::nullopt;
     }
     if (state.surfaceMaterialBounds.isEmptyOrNaN())
     {
-        return;
+        return std::nullopt;
     }
 
     const AABB& bounds = state.surfaceMaterialBounds;
@@ -338,11 +346,10 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
         -bounds.left() / width,
         -bounds.top() / height);
     Mat2D screenToMaterial;
-    if (draw.imageTexture() != nullptr)
+    if (space == MaterialSpace::artboard)
     {
-        // drawImage() reuses one unit-rectangle path for every image. Keep
-        // image material coordinates in artboard space rather than caching
-        // the first image's transform on that shared path.
+        // Images use artboard-space material coordinates, without a cached
+        // path binding.
         screenToMaterial = screenToUV;
     }
     else
@@ -358,7 +365,7 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
         Mat2D screenToLocal;
         if (!localToScreen.invert(&screenToLocal))
         {
-            return;
+            return std::nullopt;
         }
         screenToMaterial =
             path->surfaceMaterialLocalToUV() * screenToLocal;
@@ -370,12 +377,11 @@ void RiveRenderer::applySurfaceMaterial(gpu::PathDraw& draw,
                            screenToMaterial;
     }
 
-    gpu::SurfaceMaterialData materialData = {
+    return gpu::SurfaceMaterialData{
         .screenToUV = screenToMaterial,
         .material = state.surfaceMaterial,
         .timeSeconds = state.surfaceMaterialTimeSeconds,
     };
-    draw.setSurfaceMaterial(materialData);
 }
 
 void RiveRenderer::clipPath(RenderPath* renderPath)
@@ -619,6 +625,41 @@ void RiveRenderer::drawImage(const RenderImage* renderImage,
     save();
     scale(image->width(), image->height());
 
+    if (m_context->frameInterlockMode() == gpu::InterlockMode::depthStencil)
+    {
+        if (m_unitQuadVertices == nullptr)
+        {
+            constexpr float vertices[] = {0, 0, 1, 0, 1, 1, 0, 1};
+            constexpr uint16_t indices[] = {0, 1, 2, 0, 2, 3};
+            auto makeBuffer = [this](RenderBufferType type, const auto& data) {
+                auto buffer = m_context->makeRenderBuffer(
+                    type,
+                    RenderBufferFlags::mappedOnceAtInitialization,
+                    sizeof(data));
+                std::memcpy(buffer->map(), data, sizeof(data));
+                buffer->unmap();
+                return buffer;
+            };
+            m_unitQuadVertices = makeBuffer(RenderBufferType::vertex, vertices);
+            m_unitQuadIndices = makeBuffer(RenderBufferType::index, indices);
+        }
+
+        pushImageMeshDraw(m_renderStateStack.back()
+                              .matrix.mapBoundingBox(AABB{0, 0, 1, 1})
+                              .roundOut(),
+                          std::move(imageTexture),
+                          imageSampler,
+                          m_unitQuadVertices,
+                          m_unitQuadVertices,
+                          m_unitQuadIndices,
+                          6,
+                          blendMode,
+                          opacity,
+                          additiveness);
+        restore();
+        return;
+    }
+
     if (!m_context->frameSupportsImagePaintForPaths())
     {
         // Fall back on ImageRectDraw if the current frame doesn't support
@@ -713,6 +754,29 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
     assert(uvCoords_f32);
     assert(indices_u16);
 
+    pushImageMeshDraw(gpu::Draw::FULLSCREEN_PIXEL_BOUNDS,
+                      std::move(imageTexture),
+                      imageSampler,
+                      std::move(vertices_f32),
+                      std::move(uvCoords_f32),
+                      std::move(indices_u16),
+                      indexCount,
+                      blendMode,
+                      opacity,
+                      additiveness);
+}
+
+void RiveRenderer::pushImageMeshDraw(IAABB pixelBounds,
+                                     rcp<gpu::Texture> imageTexture,
+                                     ImageSampler imageSampler,
+                                     rcp<RenderBuffer> vertices_f32,
+                                     rcp<RenderBuffer> uvCoords_f32,
+                                     rcp<RenderBuffer> indices_u16,
+                                     uint32_t indexCount,
+                                     BlendMode blendMode,
+                                     float opacity,
+                                     float additiveness)
+{
     if (m_renderStateStack.back().overallClipPixelBounds.empty())
     {
         return;
@@ -722,8 +786,18 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
     float finalOpacity =
         std::max(0.0f, opacity * m_renderStateStack.back().modulatedOpacity);
 
+    const gpu::SurfaceMaterialData* materialData = nullptr;
+#ifdef RIVE_WEBGL
+    if (m_context->frameInterlockMode() == gpu::InterlockMode::depthStencil)
+    {
+        if (auto data = makeSurfaceMaterialData(MaterialSpace::artboard))
+        {
+            materialData = m_context->make<gpu::SurfaceMaterialData>(*data);
+        }
+    }
+#endif
     clipAndPushDraw(gpu::DrawUniquePtr(
-        m_context->make<gpu::ImageMeshDraw>(gpu::Draw::FULLSCREEN_PIXEL_BOUNDS,
+        m_context->make<gpu::ImageMeshDraw>(pixelBounds,
                                             m_renderStateStack.back().matrix,
                                             blendMode,
                                             additiveness,
@@ -733,7 +807,8 @@ void RiveRenderer::drawImageMesh(const RenderImage* renderImage,
                                             std::move(uvCoords_f32),
                                             std::move(indices_u16),
                                             indexCount,
-                                            finalOpacity)));
+                                            finalOpacity,
+                                            materialData)));
 }
 
 void RiveRenderer::clipAndPushDraw(gpu::DrawUniquePtr draw)

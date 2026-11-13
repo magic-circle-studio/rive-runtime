@@ -770,6 +770,17 @@ void RenderContext::logicalFlush()
 
 void RenderContext::flush(const FlushResources& flushResources)
 {
+    std::ignore = flushInternal(flushResources, false);
+}
+
+size_t RenderContext::tryFlush(const FlushResources& flushResources)
+{
+    return flushInternal(flushResources, true);
+}
+
+size_t RenderContext::flushInternal(const FlushResources& flushResources,
+                                  bool tryPrograms)
+{
     RIVE_PROF_SCOPE_L(0)
     assert(m_didBeginFrame);
     assert(flushResources.renderTarget->width() ==
@@ -976,6 +987,7 @@ void RenderContext::flush(const FlushResources& flushResources)
 
     m_impl->prepareToFlush(flushResources.currentFrameNumber,
                            flushResources.safeFrameNumber);
+    size_t pendingProgramCount = 0;
     if (mapResourceBuffers(resourceRequirements))
     {
         for (const auto& flush : m_logicalFlushes)
@@ -1009,10 +1021,24 @@ void RenderContext::flush(const FlushResources& flushResources)
 
         unmapResourceBuffers(resourceRequirements);
 
-        // Issue logical flushes to the backend.
-        for (const auto& flush : m_logicalFlushes)
+        if (tryPrograms)
         {
-            m_impl->flush(flush->desc());
+            m_flushDescriptors.clear();
+            for (const auto& flush : m_logicalFlushes)
+            {
+                m_flushDescriptors.push_back(&flush->desc());
+            }
+            pendingProgramCount =
+                m_impl->prepareFlushPrograms(m_flushDescriptors);
+        }
+
+        // A pending frame consumes its recording without touching the target.
+        if (pendingProgramCount == 0)
+        {
+            for (const auto& flush : m_logicalFlushes)
+            {
+                m_impl->flush(flush->desc());
+            }
         }
     }
     else
@@ -1047,6 +1073,7 @@ void RenderContext::flush(const FlushResources& flushResources)
     {
         resetContainers();
     }
+    return pendingProgramCount;
 }
 
 static uint32_t pls_transient_backing_plane_count(
@@ -1296,6 +1323,22 @@ void RenderContext::LogicalFlush::layoutResources(
         // When we don't clear, we only update the draw bounds.
         m_flushDesc.renderTargetUpdateBounds =
             m_flushDesc.renderTarget->bounds().intersect(m_combinedDrawBounds);
+    }
+    if (logicalFlushIdx == 0 &&
+        frameDescriptor.loadAction == gpu::LoadAction::preserveRenderTarget)
+    {
+        m_flushDesc.clearRects = flushResources.clearRects;
+        for (const IAABB& rect : m_flushDesc.clearRects)
+        {
+            IAABB clipped = rect.intersect(m_flushDesc.renderTarget->bounds());
+            if (!clipped.empty())
+            {
+                m_flushDesc.renderTargetUpdateBounds =
+                    m_flushDesc.renderTargetUpdateBounds.empty()
+                        ? clipped
+                        : m_flushDesc.renderTargetUpdateBounds.join(clipped);
+            }
+        }
     }
     if (m_flushDesc.renderTargetUpdateBounds.empty())
     {
@@ -3675,6 +3718,14 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushImageMeshDraw(
     batch.vertexBuffer = draw->vertexBuffer();
     batch.uvBuffer = draw->uvBuffer();
     batch.indexBuffer = draw->indexBuffer();
+#ifdef RIVE_WEBGL
+    batch.imageSurfaceMaterial = draw->surfaceMaterialData();
+    if (batch.imageSurfaceMaterial != nullptr)
+    {
+        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+        m_combinedShaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    }
+#endif
     return batch;
 }
 

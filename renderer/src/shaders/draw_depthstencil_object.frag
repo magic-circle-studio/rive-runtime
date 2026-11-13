@@ -17,6 +17,10 @@ FRAG_TEXTURE_BLOCK_END
 DYNAMIC_SAMPLER_BLOCK_BEGIN
 SAMPLER_DYNAMIC_IMAGE(imageSampler)
 DYNAMIC_SAMPLER_BLOCK_END
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+uniform highp float4 @imageSurfaceMaterialMatrix;
+uniform highp float4 @imageSurfaceMaterialTranslate;
+#endif
 #endif // @DRAW_IMAGE_MESH
 
 FRAG_DATA_MAIN(half4, @drawFragmentMain)
@@ -49,6 +53,25 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
                                                  v_imageTexCoord,
                                                  uniforms.mipMapLODBias) *
                   v_imageModulatedColor;
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES && @imageSurfaceMaterialTranslate.z != 0.0)
+    {
+        float2 fragCoord = _fragCoord.xy;
+#ifdef @ENABLE_RENDER_TARGET_BOTTOM_UP
+        if (uniforms.renderTargetBottomUp != 0u)
+        {
+            fragCoord.y = float(uniforms.renderTargetHeight) - fragCoord.y;
+        }
+#endif
+        float2 materialCoord =
+            MUL(make_float2x2(@imageSurfaceMaterialMatrix), fragCoord) +
+            @imageSurfaceMaterialTranslate.xy;
+        color = apply_surface_material_to_paint(
+            color,
+            float4(materialCoord, @imageSurfaceMaterialTranslate.zw),
+            true);
+    }
+#endif
 #else
     half coverage =
 #ifdef @FEATHER_ATLAS_BLIT

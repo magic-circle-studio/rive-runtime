@@ -260,10 +260,18 @@ public:
         // 'safeFrameNumber' are safe to be released or recycled.
         uint64_t currentFrameNumber = 0;
         uint64_t safeFrameNumber = 0;
+
+        // Overlay clears in render-target coordinates, consumed with the frame.
+        Span<const IAABB> clearRects;
     };
 
     // Submits all GPU commands that have been built up since beginFrame().
     void flush(const FlushResources&);
+
+    // Consumes the frame without drawing if programs are pending. Returns the
+    // number of missing programs, or zero after issuing the frame. Backends
+    // without a program preflight retain their blocking flush behavior.
+    size_t tryFlush(const FlushResources&);
 
     // Called when the client will stop rendering. Releases all CPU and GPU
     // resources associated with this render context.
@@ -932,7 +940,10 @@ private:
         RIVE_DEBUG_CODE(bool m_hasDoneLayout = false;)
     };
 
+    size_t flushInternal(const FlushResources&, bool tryPrograms);
+
     std::vector<std::unique_ptr<LogicalFlush>> m_logicalFlushes;
+    std::vector<const FlushDescriptor*> m_flushDescriptors;
 
     // Writes out TessVertexSpans that are used to tessellate the vertices
     // in a path.

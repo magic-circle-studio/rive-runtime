@@ -92,12 +92,8 @@ public:
     {
         PipelineProps props = propsIn;
 
-        ShaderFeatures ubershaderFeatures =
-            gpu::UbershaderFeaturesMaskFor(props.shaderFeatures,
-                                           props.drawType,
-                                           props.interlockMode,
-                                           props.shaderMiscFlags,
-                                           platformFeatures);
+        const ShaderFeatures ubershaderFeatures =
+            ubershaderPropsFor(props, platformFeatures).shaderFeatures;
 
         PipelineCreateType createType;
 
@@ -234,7 +230,7 @@ public:
 
                 // The program was not ready yet so attempt to move its creation
                 //  process forward.
-                if (advanceCreation(*iter->second, props))
+                if (advanceCreation(createType, *iter->second, props))
                 {
                     // The program was not previously ready, but it is now.
                     return &*iter->second;
@@ -341,24 +337,42 @@ public:
     }
 
 protected:
-    bool queuePipelineIfNotFound(const PipelineProps& props,
-                                 const PlatformFeatures& platformFeatures)
+    static PipelineProps ubershaderPropsFor(
+        PipelineProps props,
+        const PlatformFeatures& features)
+    {
+        props.shaderFeatures = UbershaderFeaturesMaskFor(props.shaderFeatures,
+                                                        props.drawType,
+                                                        props.interlockMode,
+                                                        props.shaderMiscFlags,
+                                                        features);
+        return props;
+    }
+
+    PipelineType* queuePipelineIfNotFound(
+        const PipelineProps& props,
+        const PlatformFeatures& platformFeatures,
+        bool* created = nullptr)
     {
         PipelineKey key = props.createKey(platformFeatures);
         auto iter = m_pipelines.find(key);
+        if (created != nullptr)
+        {
+            *created = iter == m_pipelines.end();
+        }
         if (iter != m_pipelines.end())
         {
             // This is already in our pipelines list which means it was already
             // created.
-            return false;
+            return iter->second.get();
         }
 
         auto pipeline = createPipeline(PipelineCreateType::async,
                                        key,
                                        props,
                                        platformFeatures);
-        m_pipelines.insert({key, std::move(pipeline)});
-        return true;
+        return m_pipelines.insert({key, std::move(pipeline)})
+            .first->second.get();
     }
 
     void waitForPipelineForRender(PipelineKey key)
@@ -459,7 +473,9 @@ protected:
 
     // For renderers like GL that have a step-based async setup,
     //  override this function to attempt to move the shader along its progress.
-    virtual bool advanceCreation(PipelineType&, const PipelineProps&)
+    virtual bool advanceCreation(PipelineCreateType,
+                                 PipelineType&,
+                                 const PipelineProps&)
     {
         return false; // do nothing by default
     }
@@ -473,7 +489,7 @@ protected:
         const PipelineProps& props,
         const PlatformFeatures& platformFeatures)
     {
-        bool found = true;
+        bool found = false;
         auto curKey = ShaderUniqueKey(props.drawType,
                                       props.shaderFeatures,
                                       props.interlockMode,
@@ -581,6 +597,7 @@ protected:
     }
 
 private:
+
     struct JobParams
     {
         PipelineProps props;

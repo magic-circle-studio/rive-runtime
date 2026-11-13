@@ -446,6 +446,7 @@ RenderContextGLImpl::RenderContextGLImpl(
     {
         m_plsImpl->init(m_state);
     }
+    startBlitAsDrawProgram();
 }
 
 RenderContextGLImpl::~RenderContextGLImpl()
@@ -551,12 +552,14 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                                   glsl::common,
                                   glsl::draw_path_common,
                                   glsl::render_atlas};
-    m_featherAtlasVertexShader.compile(GL_VERTEX_SHADER,
-                                       defines.data(),
-                                       defines.size(),
-                                       atlasSources,
-                                       std::size(atlasSources),
-                                       m_capabilities);
+    m_featherAtlasVertexShader.reset(glutils::CompileShader(
+        GL_VERTEX_SHADER,
+        defines.data(),
+        defines.size(),
+        atlasSources,
+        std::size(atlasSources),
+        m_capabilities,
+        glutils::DebugPrintErrorAndAbort::no));
 
     defines.push_back(GLSL_ATLAS_FEATHERED_FILL);
     m_featherAtlasFillProgram.compile(m_featherAtlasVertexShader,
@@ -564,8 +567,7 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                                       defines.size(),
                                       atlasSources,
                                       std::size(atlasSources),
-                                      m_capabilities,
-                                      m_state.get());
+                                      m_capabilities);
     defines.pop_back();
 
     defines.push_back(GLSL_ATLAS_FEATHERED_STROKE);
@@ -574,17 +576,18 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                                         defines.size(),
                                         atlasSources,
                                         std::size(atlasSources),
-                                        m_capabilities,
-                                        m_state.get());
+                                        m_capabilities);
     defines.pop_back();
 
     if (needsFeatherAtlasResolveDraw(m_featherAtlasRenderType))
     {
         // Build the pipelines for clearing and resolving
         // EXT_shader_pixel_local_storage.
-        m_featherAtlasResolveVertexShader.compile(GL_VERTEX_SHADER,
-                                                  glsl::resolve_atlas,
-                                                  m_capabilities);
+        m_featherAtlasResolveVertexShader.reset(glutils::CompileShader(
+            GL_VERTEX_SHADER,
+            glsl::resolve_atlas,
+            m_capabilities,
+            glutils::DebugPrintErrorAndAbort::no));
 
         if (m_featherAtlasRenderType ==
             FeatherAtlasRenderType::r8PixelLocalStorageEXT)
@@ -597,17 +600,19 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                 GLSL_ATLAS_RENDER_TARGET_R8_PLS_EXT,
                 GLSL_CLEAR_COVERAGE};
             const char* atlasClearSources[] = {glsl::resolve_atlas};
-            m_featherAtlasClearProgram = glutils::Program();
+            m_featherAtlasClearProgram.program = glutils::Program();
             glAttachShader(m_featherAtlasClearProgram,
                            m_featherAtlasResolveVertexShader);
-            m_featherAtlasClearProgram.compileAndAttachShader(
-                GL_FRAGMENT_SHADER,
-                atlasClearDefines,
-                std::size(atlasClearDefines),
-                atlasClearSources,
-                std::size(atlasClearSources),
-                m_capabilities);
-            m_featherAtlasClearProgram.link();
+            glutils::CompileAndAttachShader(m_featherAtlasClearProgram,
+                                            GL_FRAGMENT_SHADER,
+                                            atlasClearDefines,
+                                            std::size(atlasClearDefines),
+                                            atlasClearSources,
+                                            std::size(atlasClearSources),
+                                            m_capabilities,
+                                            glutils::DebugPrintErrorAndAbort::no);
+            glutils::LinkProgram(m_featherAtlasClearProgram,
+                                 glutils::DebugPrintErrorAndAbort::no);
 #else
             RIVE_UNREACHABLE();
 #endif
@@ -617,27 +622,19 @@ void RenderContextGLImpl::buildFeatherAtlasRenderPipelines()
                                              glsl::flush_uniforms,
                                              glsl::common,
                                              glsl::resolve_atlas};
-        m_featherAtlasResolveProgram = glutils::Program();
+        m_featherAtlasResolveProgram.program = glutils::Program();
         glAttachShader(m_featherAtlasResolveProgram,
                        m_featherAtlasResolveVertexShader);
-        m_featherAtlasResolveProgram.compileAndAttachShader(
-            GL_FRAGMENT_SHADER,
-            defines.data(),
-            defines.size(),
-            atlasResolveSources,
-            std::size(atlasResolveSources),
-            m_capabilities);
-        m_featherAtlasResolveProgram.link();
-
-        if (m_featherAtlasRenderType == FeatherAtlasRenderType::rgba8)
-        {
-            // The "rgba8" resolve shader reads the coverageCount data via
-            // texelFetch().
-            m_state->bindProgram(m_featherAtlasResolveProgram);
-            glutils::Uniform1iByName(m_featherAtlasResolveProgram,
-                                     GLSL_atlasRenderTexture,
-                                     0);
-        }
+        glutils::CompileAndAttachShader(m_featherAtlasResolveProgram,
+                                        GL_FRAGMENT_SHADER,
+                                        defines.data(),
+                                        defines.size(),
+                                        atlasResolveSources,
+                                        std::size(atlasResolveSources),
+                                        m_capabilities,
+                                        glutils::DebugPrintErrorAndAbort::no);
+        glutils::LinkProgram(m_featherAtlasResolveProgram,
+                             glutils::DebugPrintErrorAndAbort::no);
     }
 }
 
@@ -1179,39 +1176,46 @@ void RenderContextGLImpl::FeatherAtlasProgram::compile(
     size_t numDefines,
     const char* sources[],
     size_t numSources,
+    const GLCapabilities& capabilities)
+{
+    program = glutils::Program();
+    glAttachShader(program, vertexShaderID);
+    glutils::CompileAndAttachShader(program,
+                                    GL_FRAGMENT_SHADER,
+                                    defines,
+                                    numDefines,
+                                    sources,
+                                    numSources,
+                                    capabilities,
+                                    glutils::DebugPrintErrorAndAbort::no);
+    glutils::LinkProgram(program, glutils::DebugPrintErrorAndAbort::no);
+}
+
+void RenderContextGLImpl::FeatherAtlasProgram::finish(
     const GLCapabilities& capabilities,
     GLState* state)
 {
-    m_program = glutils::Program();
-    glAttachShader(m_program, vertexShaderID);
-    m_program.compileAndAttachShader(GL_FRAGMENT_SHADER,
-                                     defines,
-                                     numDefines,
-                                     sources,
-                                     numSources,
-                                     capabilities);
-    m_program.link();
-    state->bindProgram(m_program);
-    glUniformBlockBinding(m_program,
-                          glGetUniformBlockIndex(m_program, GLSL_FlushUniforms),
+    state->bindProgram(program);
+    glUniformBlockBinding(program,
+                          glGetUniformBlockIndex(program, GLSL_FlushUniforms),
                           FLUSH_UNIFORM_BUFFER_IDX);
-    glutils::Uniform1iByName(m_program,
+    glutils::Uniform1iByName(program,
                              GLSL_tessVertexTexture,
                              TESS_VERTEX_TEXTURE_IDX);
-    glutils::Uniform1iByName(m_program,
+    glutils::Uniform1iByName(program,
                              GLSL_gaussianIntegralTexture,
                              GAUSSIAN_INTEGRAL_TEXTURE_IDX);
     if (!capabilities.ARB_shader_storage_buffer_object)
     {
-        glutils::Uniform1iByName(m_program, GLSL_pathBuffer, PATH_BUFFER_IDX);
-        glutils::Uniform1iByName(m_program,
+        glutils::Uniform1iByName(program, GLSL_pathBuffer, PATH_BUFFER_IDX);
+        glutils::Uniform1iByName(program,
                                  GLSL_contourBuffer,
                                  CONTOUR_BUFFER_IDX);
     }
     if (!capabilities.ANGLE_base_vertex_base_instance_shader_builtin)
     {
         m_baseInstanceUniformLocation =
-            glGetUniformLocation(m_program,
+            glGetUniformLocation(program,
                                  glutils::BASE_INSTANCE_UNIFORM_NAME);
     }
 }
@@ -1281,14 +1285,6 @@ void RenderContextGLImpl::resizeFeatherAtlasTexture(uint32_t width,
                    width,
                    height);
     glutils::SetTexture2DSamplingParams(GL_LINEAR, GL_LINEAR);
-
-    if (m_featherAtlasVertexShader == 0)
-    {
-        // Don't compile the atlas programs until we get an indication that
-        // they will be used.
-        // FIXME: Do this in parallel at startup!!
-        buildFeatherAtlasRenderPipelines();
-    }
 
     m_featherAtlasRenderFBO = glutils::Framebuffer();
     glBindFramebuffer(GL_FRAMEBUFFER, m_featherAtlasRenderFBO);
@@ -1764,12 +1760,16 @@ RenderContextGLImpl::DrawProgram::DrawProgram(
     glAttachShader(m_id, m_fragmentShader->id());
     glutils::LinkProgram(m_id, glutils::DebugPrintErrorAndAbort::no);
 
-    std::ignore = advanceCreation(renderContextImpl,
-                                  createType,
-                                  drawType,
-                                  shaderFeatures,
-                                  interlockMode,
-                                  shaderMiscFlags);
+    if (createType == PipelineCreateType::sync ||
+        !renderContextImpl->capabilities().KHR_parallel_shader_compile)
+    {
+        std::ignore = advanceCreation(renderContextImpl,
+                                      createType,
+                                      drawType,
+                                      shaderFeatures,
+                                      interlockMode,
+                                      shaderMiscFlags);
+    }
 }
 
 bool RenderContextGLImpl::DrawProgram::advanceCreation(
@@ -1783,18 +1783,9 @@ bool RenderContextGLImpl::DrawProgram::advanceCreation(
     // This function should only be called if we're in the middle of creation.
     assert(m_pipelineStatus == PipelineStatus::notReady);
 
-    if (createType == PipelineCreateType::async &&
-        renderContextImpl->capabilities().KHR_parallel_shader_compile)
+    if (!renderContextImpl->isProgramLinkComplete(m_id, createType))
     {
-        // Like above, this is async creation so verify the program is linked
-        //  before continuing.
-
-        GLint completed = 0;
-        glGetProgramiv(m_id, GL_COMPLETION_STATUS_KHR, &completed);
-        if (completed == 0)
-        {
-            return false;
-        }
+        return false;
     }
 
 #ifdef WITH_RIVE_TOOLS
@@ -1925,6 +1916,18 @@ bool RenderContextGLImpl::DrawProgram::advanceCreation(
             glGetUniformLocation(m_id, glutils::BASE_INSTANCE_UNIFORM_NAME);
     }
 
+#ifdef RIVE_WEBGL
+    if (drawType == gpu::DrawType::imageMesh &&
+        interlockMode == gpu::InterlockMode::depthStencil &&
+        enums::is_flag_set(shaderFeatures,
+                           ShaderFeatures::ENABLE_HSL_BLEND_MODES))
+    {
+        m_imageSurfaceMaterialMatrixLocation =
+            glGetUniformLocation(m_id, GLSL_imageSurfaceMaterialMatrix);
+        m_imageSurfaceMaterialTranslateLocation =
+            glGetUniformLocation(m_id, GLSL_imageSurfaceMaterialTranslate);
+    }
+#endif
     // All done! This program is now usable by the renderer.
     m_pipelineStatus = PipelineStatus::ready;
     return true;
@@ -1937,6 +1940,30 @@ RenderContextGLImpl::DrawProgram::~DrawProgram()
         m_state->deleteProgram(m_id);
     }
 }
+
+#ifdef RIVE_WEBGL
+void RenderContextGLImpl::DrawProgram::setImageSurfaceMaterial(
+    const SurfaceMaterialData* data) const
+{
+    if (data != nullptr)
+    {
+        const auto& matrix = data->screenToUV;
+        glUniform4fv(m_imageSurfaceMaterialMatrixLocation, 1, matrix.values());
+        glUniform4f(m_imageSurfaceMaterialTranslateLocation,
+                    matrix[4],
+                    matrix[5],
+                    static_cast<float>(data->material),
+                    data->timeSeconds);
+        m_imageSurfaceMaterialActive = true;
+    }
+    else if (m_imageSurfaceMaterialActive)
+    {
+        // Plain meshes upload nothing unless this program needs a mode reset.
+        glUniform4f(m_imageSurfaceMaterialTranslateLocation, 0, 0, 0, 0);
+        m_imageSurfaceMaterialActive = false;
+    }
+}
+#endif
 
 static GLuint gl_buffer_id(const BufferRing* bufferRing)
 {
@@ -2165,6 +2192,25 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
 {
     assert(desc.interlockMode != gpu::InterlockMode::clockwiseAtomic);
     auto renderTarget = static_cast<RenderTargetGL*>(desc.renderTarget);
+    if (needsBlitAsDraw(desc))
+    {
+        finishBlitAsDrawProgram(PipelineCreateType::sync);
+        if (m_blitAsDrawProgram.status == PipelineStatus::errored)
+        {
+            return;
+        }
+    }
+    if (desc.featherAtlasFillBatchCount != 0 ||
+        desc.featherAtlasStrokeBatchCount != 0)
+    {
+        if (m_featherAtlasVertexShader == 0)
+        {
+            buildFeatherAtlasRenderPipelines();
+        }
+        finishFeatherAtlasPrograms(PipelineCreateType::sync,
+                                   desc.featherAtlasFillBatchCount != 0,
+                                   desc.featherAtlasStrokeBatchCount != 0);
+    }
 
     // This context is current on its own thread here, the only place names it
     // owns can be deleted.
@@ -2309,7 +2355,8 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
 
     // Render the feather atlas if we have any offscreen feathers.
     if ((desc.featherAtlasFillBatchCount | desc.featherAtlasStrokeBatchCount) !=
-        0)
+            0 &&
+        featherAtlasProgramsReady(desc))
     {
         // Finish setting up the atlas render pass and clear the atlas.
         m_state->setPipelineState(gpu::COLOR_ONLY_PIPELINE_STATE,
@@ -2589,6 +2636,13 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
     {
         assert(desc.msaaSampleCount == 0);
         assert(m_plsImpl != nullptr);
+        if (!desc.clearRects.empty())
+        {
+            // PLS loads the destination after these clears. Its headless
+            // framebuffer has no color attachment that glClear could clear.
+            renderTarget->bindDestinationFramebuffer(GL_FRAMEBUFFER);
+            clearRenderTargetRects(desc);
+        }
         m_plsImpl->activatePixelLocalStorage(this, desc);
         if (desc.interlockMode == gpu::InterlockMode::atomics)
         {
@@ -2654,6 +2708,11 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
         }
     }
 
+    if (desc.interlockMode == gpu::InterlockMode::depthStencil)
+    {
+        clearRenderTargetRects(desc);
+    }
+
     bool clipPlanesEnabled = false;
 
     const auto fullUpdateScissorRect =
@@ -2666,28 +2725,17 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
     // Execute the DrawList.
     for (const DrawBatch& batch : *desc.drawList)
     {
-        const gpu::DrawType drawType = batch.drawType;
-        gpu::ShaderFeatures shaderFeatures =
-            desc.interlockMode == gpu::InterlockMode::atomics
-                ? desc.combinedShaderFeatures
-                : batch.shaderFeatures;
-        gpu::ShaderMiscFlags shaderMiscFlags = batch.shaderMiscFlags;
-        if (desc.interlockMode != gpu::InterlockMode::depthStencil)
+        const auto props = drawProgramProps(desc, batch);
+        const gpu::DrawType drawType = props.drawType;
+        const gpu::ShaderFeatures shaderFeatures = props.shaderFeatures;
+        const gpu::ShaderMiscFlags shaderMiscFlags = props.shaderMiscFlags;
+        if (drawType == DrawType::featherAtlasBlit &&
+            !featherAtlasProgramsReady(desc))
         {
-            assert(m_plsImpl != nullptr);
-            shaderMiscFlags |= m_plsImpl->shaderMiscFlags(desc, drawType);
+            continue;
         }
-        const DrawProgram* drawProgram = m_pipelineManager.tryGetPipeline(
-            {
-                .drawType = drawType,
-                .shaderFeatures = shaderFeatures,
-                .interlockMode = desc.interlockMode,
-                .shaderMiscFlags = shaderMiscFlags,
-#ifdef WITH_RIVE_TOOLS
-                .synthesizedFailureType = desc.synthesizedFailureType,
-#endif
-            },
-            m_platformFeatures);
+        const DrawProgram* drawProgram =
+            m_pipelineManager.tryGetPipeline(props, m_platformFeatures);
         if (drawProgram == nullptr)
         {
             // There was an issue getting either the requested draw program or
@@ -2946,6 +2994,9 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
 
             case gpu::DrawType::imageMesh:
             {
+#ifdef RIVE_WEBGL
+                drawProgram->setImageSurfaceMaterial(batch.imageSurfaceMaterial);
+#endif
                 LITE_RTTI_CAST_OR_BREAK(vertexBuffer,
                                         RenderBufferGLImpl*,
                                         batch.vertexBuffer);
@@ -3116,34 +3167,283 @@ void RenderContextGLImpl::drawIndexedInstancedNoInstancedAttribs(
     }
 }
 
+void RenderContextGLImpl::clearRenderTargetRects(const FlushDescriptor& desc)
+{
+    if (desc.clearRects.empty())
+    {
+        return;
+    }
+    auto target = static_cast<RenderTargetGL*>(desc.renderTarget);
+    m_state->setPipelineState(gpu::COLOR_ONLY_PIPELINE_STATE);
+    glClearColor(0, 0, 0, 0);
+    for (const IAABB& rect : desc.clearRects)
+    {
+        IAABB clipped = rect.intersect(target->bounds());
+        if (!clipped.empty())
+        {
+            m_state->setScissor(clipped, target->height(), target->bottomUp());
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+    }
+    m_state->disableScissor();
+}
+
+bool RenderContextGLImpl::isProgramLinkComplete(
+    GLuint program,
+    PipelineCreateType createType) const
+{
+    if (createType == PipelineCreateType::async &&
+        m_capabilities.KHR_parallel_shader_compile)
+    {
+        GLint completed = GL_FALSE;
+        glGetProgramiv(program, GL_COMPLETION_STATUS_KHR, &completed);
+        return completed != GL_FALSE;
+    }
+    return true;
+}
+
+bool RenderContextGLImpl::advanceAuxiliaryProgram(
+    AuxiliaryProgram& program,
+    PipelineCreateType createType)
+{
+    if (!program.pending() || !isProgramLinkComplete(program, createType))
+    {
+        return false;
+    }
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    program.status = linked ? PipelineStatus::ready : PipelineStatus::errored;
+    return linked != GL_FALSE;
+}
+
+void RenderContextGLImpl::startBlitAsDrawProgram()
+{
+    const char* sources[] = {glsl::constants,
+                             glsl::flush_uniforms,
+                             glsl::common,
+                             glsl::blit_texture_as_draw};
+    m_blitAsDrawProgram.program = glutils::Program();
+    glutils::CompileAndAttachShader(m_blitAsDrawProgram,
+                                    GL_VERTEX_SHADER,
+                                    nullptr,
+                                    0,
+                                    sources,
+                                    std::size(sources),
+                                    m_capabilities,
+                                    glutils::DebugPrintErrorAndAbort::no);
+    glutils::CompileAndAttachShader(m_blitAsDrawProgram,
+                                    GL_FRAGMENT_SHADER,
+                                    nullptr,
+                                    0,
+                                    sources,
+                                    std::size(sources),
+                                    m_capabilities,
+                                    glutils::DebugPrintErrorAndAbort::no);
+    glutils::LinkProgram(m_blitAsDrawProgram,
+                         glutils::DebugPrintErrorAndAbort::no);
+}
+
+void RenderContextGLImpl::finishBlitAsDrawProgram(PipelineCreateType createType)
+{
+    if (advanceAuxiliaryProgram(m_blitAsDrawProgram, createType))
+    {
+        m_state->bindProgram(m_blitAsDrawProgram);
+        glutils::Uniform1iByName(m_blitAsDrawProgram, GLSL_sourceTexture, 0);
+    }
+}
+
+void RenderContextGLImpl::finishFeatherAtlasPrograms(
+    PipelineCreateType createType,
+    bool fill,
+    bool stroke)
+{
+    // A sync finish waits for its link, so skip a pass the frame doesn't use.
+    if (fill && advanceAuxiliaryProgram(m_featherAtlasFillProgram, createType))
+    {
+        m_featherAtlasFillProgram.finish(m_capabilities, m_state.get());
+    }
+    if (stroke &&
+        advanceAuxiliaryProgram(m_featherAtlasStrokeProgram, createType))
+    {
+        m_featherAtlasStrokeProgram.finish(m_capabilities, m_state.get());
+    }
+    std::ignore = advanceAuxiliaryProgram(m_featherAtlasClearProgram, createType);
+    if (advanceAuxiliaryProgram(m_featherAtlasResolveProgram, createType) &&
+        m_featherAtlasRenderType == FeatherAtlasRenderType::rgba8)
+    {
+        m_state->bindProgram(m_featherAtlasResolveProgram);
+        glutils::Uniform1iByName(m_featherAtlasResolveProgram,
+                                 GLSL_atlasRenderTexture,
+                                 0);
+    }
+}
+
+bool RenderContextGLImpl::featherAtlasProgramsReady(
+    const FlushDescriptor& desc) const
+{
+    return (desc.featherAtlasFillBatchCount == 0 ||
+            m_featherAtlasFillProgram.status == PipelineStatus::ready) &&
+           (desc.featherAtlasStrokeBatchCount == 0 ||
+            m_featherAtlasStrokeProgram.status == PipelineStatus::ready) &&
+           m_featherAtlasClearProgram.readyOrAbsent() &&
+           m_featherAtlasResolveProgram.readyOrAbsent();
+}
+
+StandardPipelineProps RenderContextGLImpl::drawProgramProps(
+    const FlushDescriptor& desc,
+    const DrawBatch& batch) const
+{
+    auto miscFlags = batch.shaderMiscFlags;
+    if (desc.interlockMode != gpu::InterlockMode::depthStencil)
+    {
+        assert(m_plsImpl != nullptr);
+        miscFlags |= m_plsImpl->shaderMiscFlags(desc, batch.drawType);
+    }
+    return {
+        .drawType = batch.drawType,
+        .shaderFeatures = desc.interlockMode == gpu::InterlockMode::atomics
+                              ? desc.combinedShaderFeatures
+                              : batch.shaderFeatures,
+        .interlockMode = desc.interlockMode,
+        .shaderMiscFlags = miscFlags,
+#ifdef WITH_RIVE_TOOLS
+        .synthesizedFailureType = desc.synthesizedFailureType,
+#endif
+    };
+}
+
+void RenderContextGLImpl::linkDrawPrograms()
+{
+    const FlushDescriptor desc = {.interlockMode = InterlockMode::depthStencil};
+    auto link = [&](DrawType type,
+                    ShaderFeatures features,
+                    ShaderMiscFlags miscFlags) {
+        DrawBatch batch(type, miscFlags, {}, 0, 0, BlendMode::srcOver, {}, {});
+        batch.shaderFeatures = features;
+        auto props = drawProgramProps(desc, batch);
+        if (m_capabilities.KHR_parallel_shader_compile)
+        {
+            std::ignore =
+                m_pipelineManager.requestPipeline(props, m_platformFeatures);
+        }
+        else
+        {
+            m_pipelineManager.linkPipeline(props, m_platformFeatures);
+        }
+    };
+
+    // Magic Garden's set, in loading-animation then pet first-use order.
+    constexpr auto path = DrawType::stencilMidpointFanCover;
+    constexpr auto fixed = ShaderMiscFlags::fixedFunctionColorOutput;
+    // Artboards have a clip rect; clip updates and clip reset do not use it.
+    // The platform mask drops this feature when clip planes are unavailable.
+    constexpr auto clip = ShaderFeatures::ENABLE_CLIP_RECT;
+    constexpr auto material = ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+    link(path, ShaderFeatures::NONE, fixed);
+    link(path, clip, fixed);
+    link(DrawType::clipReset, ShaderFeatures::NONE, fixed);
+    link(path, clip | ShaderFeatures::ENABLE_ADVANCED_BLEND, ShaderMiscFlags::none);
+    link(DrawType::imageMesh, clip, fixed);
+    link(path, clip | material, fixed);
+    link(DrawType::imageMesh, clip | material, fixed);
+}
+
+bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
+{
+    auto target = static_cast<RenderTargetGL*>(desc.renderTarget);
+    auto framebuffer = lite_rtti_cast<FramebufferRenderTargetGL*>(target);
+    return desc.colorLoadAction == LoadAction::preserveRenderTarget &&
+           desc.msaaSampleCount > 1 &&
+           !m_capabilities.EXT_multisampled_render_to_texture &&
+           (framebuffer == nullptr || framebuffer->sampleCount() <= 1);
+}
+
+size_t RenderContextGLImpl::prepareFlushPrograms(
+    Span<const FlushDescriptor* const> descriptors)
+{
+    if (!m_capabilities.KHR_parallel_shader_compile)
+    {
+        return 0;
+    }
+
+    bool needsBlit = false;
+    bool needsFeatherFill = false;
+    bool needsFeatherStroke = false;
+    std::unordered_set<const DrawProgram*> framePrograms;
+    for (const FlushDescriptor* desc : descriptors)
+    {
+        needsBlit |= needsBlitAsDraw(*desc);
+        needsFeatherFill |= desc->featherAtlasFillBatchCount != 0;
+        needsFeatherStroke |= desc->featherAtlasStrokeBatchCount != 0;
+        for (const DrawBatch& batch : *desc->drawList)
+        {
+            auto props = drawProgramProps(*desc, batch);
+            m_pipelineManager.preparePipeline(props,
+                                              m_platformFeatures,
+                                              framePrograms);
+        }
+    }
+
+    // Auxiliary programs obey the same completion gate as draw programs and
+    // are polled once, even when several logical flushes need them.
+    size_t pendingCount = std::count_if(
+        framePrograms.begin(),
+        framePrograms.end(),
+        [](const DrawProgram* program) {
+            return program->status() == PipelineStatus::notReady;
+        });
+    if (needsBlit)
+    {
+        finishBlitAsDrawProgram(PipelineCreateType::async);
+        pendingCount += m_blitAsDrawProgram.pending();
+    }
+    if (needsFeatherFill || needsFeatherStroke)
+    {
+        if (m_featherAtlasVertexShader == 0)
+        {
+            buildFeatherAtlasRenderPipelines();
+        }
+        finishFeatherAtlasPrograms(PipelineCreateType::async,
+                                   needsFeatherFill,
+                                   needsFeatherStroke);
+        pendingCount += needsFeatherFill &&
+                        m_featherAtlasFillProgram.status ==
+                            PipelineStatus::notReady;
+        pendingCount += needsFeatherStroke &&
+                        m_featherAtlasStrokeProgram.status ==
+                            PipelineStatus::notReady;
+        pendingCount += m_featherAtlasClearProgram.pending();
+        pendingCount += m_featherAtlasResolveProgram.pending();
+    }
+
+    return pendingCount;
+}
+
+void RenderContextGLImpl::GLPipelineManager::preparePipeline(
+    const PipelineProps& propsIn,
+    const PlatformFeatures& features,
+    std::unordered_set<const DrawProgram*>& framePrograms)
+{
+    auto props = ubershaderPropsFor(propsIn, features);
+    bool created;
+    auto* program = queuePipelineIfNotFound(props, features, &created);
+    // Don't poll a link in the same call that submits it, even in later batches.
+    if (program->status() == PipelineStatus::notReady &&
+        framePrograms.insert(program).second && !created)
+    {
+        std::ignore = advanceCreation(PipelineCreateType::async, *program, props);
+    }
+}
+
 void RenderContextGLImpl::blitTextureToFramebufferAsDraw(
     GLuint textureID,
     const IAABB& bounds,
     uint32_t renderTargetHeight,
     bool bottomUp)
 {
-    if (m_blitAsDrawProgram == 0)
+    if (m_blitAsDrawProgram.status != PipelineStatus::ready)
     {
-        const char* blitSources[] = {glsl::constants,
-                                     glsl::flush_uniforms,
-                                     glsl::common,
-                                     glsl::blit_texture_as_draw};
-        m_blitAsDrawProgram = glutils::Program();
-        m_blitAsDrawProgram.compileAndAttachShader(GL_VERTEX_SHADER,
-                                                   nullptr,
-                                                   0,
-                                                   blitSources,
-                                                   std::size(blitSources),
-                                                   m_capabilities);
-        m_blitAsDrawProgram.compileAndAttachShader(GL_FRAGMENT_SHADER,
-                                                   nullptr,
-                                                   0,
-                                                   blitSources,
-                                                   std::size(blitSources),
-                                                   m_capabilities);
-        m_blitAsDrawProgram.link();
-        m_state->bindProgram(m_blitAsDrawProgram);
-        glutils::Uniform1iByName(m_blitAsDrawProgram, GLSL_sourceTexture, 0);
+        return;
     }
 
     m_state->setPipelineState(gpu::COLOR_ONLY_PIPELINE_STATE,
@@ -3175,8 +3475,8 @@ RenderContextGLImpl::FeatherAtlasRenderType RenderContextGLImpl::
     m_featherAtlasFillProgram = {};
     m_featherAtlasStrokeProgram = {};
     m_featherAtlasResolveVertexShader = {};
-    m_featherAtlasClearProgram = glutils::Program::Zero();
-    m_featherAtlasResolveProgram = glutils::Program::Zero();
+    m_featherAtlasClearProgram = {};
+    m_featherAtlasResolveProgram = {};
 
     // ...And release all the DrawShaders in case any need to be recompiled for
     // sampling a different FeatherAtlasRenderType.
@@ -3805,11 +4105,11 @@ RenderContextGLImpl::GLPipelineManager::GLPipelineManager(
 
 std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
     GLPipelineManager::createPipeline(PipelineCreateType createType,
-                                      uint32_t, // unused key
+                                      uint32_t,
                                       const PipelineProps& props,
                                       const PlatformFeatures&)
 {
-    return std::make_unique<DrawProgram>(m_context,
+    auto program = std::make_unique<DrawProgram>(m_context,
                                          createType,
                                          props.drawType,
                                          props.shaderFeatures,
@@ -3820,6 +4120,7 @@ std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
                                          props.synthesizedFailureType
 #endif
     );
+    return program;
 }
 
 PipelineStatus RenderContextGLImpl::GLPipelineManager::getPipelineStatus(
@@ -3829,11 +4130,12 @@ PipelineStatus RenderContextGLImpl::GLPipelineManager::getPipelineStatus(
 }
 
 bool RenderContextGLImpl::GLPipelineManager::advanceCreation(
+    PipelineCreateType createType,
     DrawProgram& pipelineState,
     const PipelineProps& props)
 {
     return pipelineState.advanceCreation(m_context,
-                                         PipelineCreateType::async,
+                                         createType,
                                          props.drawType,
                                          props.shaderFeatures,
                                          props.interlockMode,

@@ -896,6 +896,13 @@ constexpr static ShaderFeatures kVertexShaderFeaturesMask =
 constexpr static ShaderFeatures kExclusiveAtomicUbershaderFeaturesMask =
     ShaderFeatures::ENABLE_ADVANCED_BLEND;
 
+// Omit these features from depth-stencil path and image-mesh ubershaders unless
+// a draw requests them.
+constexpr static ShaderFeatures kExclusiveDepthStencilUbershaderFeaturesMask =
+    ShaderFeatures::ENABLE_CLIP_RECT |
+    ShaderFeatures::ENABLE_MODULATED_IMAGE |
+    ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+
 constexpr static ShaderFeatures ShaderFeaturesMaskFor(
     InterlockMode interlockMode)
 {
@@ -1122,6 +1129,11 @@ constexpr static ShaderFeatures UbershaderFeaturesMaskFor(
         outFeatures &=
             (requestedFeatures | ~kExclusiveAtomicUbershaderFeaturesMask);
     }
+    else if (interlockMode == InterlockMode::depthStencil)
+    {
+        outFeatures &=
+            (requestedFeatures | ~kExclusiveDepthStencilUbershaderFeaturesMask);
+    }
 
     // Ensure that we haven't dropped features we care about somehow
     assert((requestedFeatures & outFeatures) == requestedFeatures);
@@ -1321,6 +1333,7 @@ struct DrawBatch
     RenderBuffer* vertexBuffer;
     RenderBuffer* uvBuffer;
     RenderBuffer* indexBuffer;
+    const SurfaceMaterialData* imageSurfaceMaterial = nullptr;
 
     // When shaders don't have a mechanism to read the framebuffer (e.g.,
     // WebGL msaa), this is a linked list of all the draws in the batch whose
@@ -1391,6 +1404,7 @@ struct FlushDescriptor
 
     IAABB renderTargetUpdateBounds; // drawBounds, or renderTargetBounds if
                                     // loadAction == LoadAction::clear.
+    Span<const IAABB> clearRects;
 
     // If nonzero, frames are split up into virtual tiles of this size.
     //
