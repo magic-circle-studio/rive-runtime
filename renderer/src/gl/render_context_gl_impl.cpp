@@ -3346,6 +3346,10 @@ void RenderContextGLImpl::linkDrawPrograms()
     link(DrawType::imageMesh, clip, fixed);
     link(path, clip | material, fixed);
     link(DrawType::imageMesh, clip | material, fixed);
+    // A Gold pet in an advanced-blend form, such as the FireHorse's fire.
+    link(path,
+         clip | material | ShaderFeatures::ENABLE_ADVANCED_BLEND,
+         ShaderMiscFlags::none);
 }
 
 bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
