@@ -770,16 +770,11 @@ void RenderContext::logicalFlush()
 
 void RenderContext::flush(const FlushResources& flushResources)
 {
-    std::ignore = flushInternal(flushResources, false);
+    std::ignore = flush(flushResources, PendingPrograms::wait);
 }
 
-size_t RenderContext::tryFlush(const FlushResources& flushResources)
-{
-    return flushInternal(flushResources, true);
-}
-
-size_t RenderContext::flushInternal(const FlushResources& flushResources,
-                                  bool tryPrograms)
+bool RenderContext::flush(const FlushResources& flushResources,
+                          PendingPrograms pendingPrograms)
 {
     RIVE_PROF_SCOPE_L(0)
     assert(m_didBeginFrame);
@@ -987,7 +982,7 @@ size_t RenderContext::flushInternal(const FlushResources& flushResources,
 
     m_impl->prepareToFlush(flushResources.currentFrameNumber,
                            flushResources.safeFrameNumber);
-    size_t pendingProgramCount = 0;
+    bool drawn = true;
     if (mapResourceBuffers(resourceRequirements))
     {
         for (const auto& flush : m_logicalFlushes)
@@ -1021,19 +1016,21 @@ size_t RenderContext::flushInternal(const FlushResources& flushResources,
 
         unmapResourceBuffers(resourceRequirements);
 
-        if (tryPrograms)
+        if (pendingPrograms != PendingPrograms::wait)
         {
             m_flushDescriptors.clear();
             for (const auto& flush : m_logicalFlushes)
             {
                 m_flushDescriptors.push_back(&flush->desc());
             }
-            pendingProgramCount =
-                m_impl->prepareFlushPrograms(m_flushDescriptors);
+            drawn = m_impl->prepareFlushPrograms(
+                m_flushDescriptors,
+                /*pollLinks=*/pendingPrograms == PendingPrograms::skipFrame);
         }
 
-        // A pending frame consumes its recording without touching the target.
-        if (pendingProgramCount == 0)
+        // A frame that doesn't draw consumes its recording without touching
+        // the target.
+        if (drawn)
         {
             for (const auto& flush : m_logicalFlushes)
             {
@@ -1045,6 +1042,7 @@ size_t RenderContext::flushInternal(const FlushResources& flushResources,
     {
         fprintf(stderr, "Buffer mapping failed, cannot render.\n");
         unmapResourceBuffers(resourceRequirements);
+        drawn = false;
     }
 
     m_impl->postFlush(flushResources);
@@ -1073,7 +1071,7 @@ size_t RenderContext::flushInternal(const FlushResources& flushResources,
     {
         resetContainers();
     }
-    return pendingProgramCount;
+    return drawn;
 }
 
 static uint32_t pls_transient_backing_plane_count(
@@ -1323,22 +1321,6 @@ void RenderContext::LogicalFlush::layoutResources(
         // When we don't clear, we only update the draw bounds.
         m_flushDesc.renderTargetUpdateBounds =
             m_flushDesc.renderTarget->bounds().intersect(m_combinedDrawBounds);
-    }
-    if (logicalFlushIdx == 0 &&
-        frameDescriptor.loadAction == gpu::LoadAction::preserveRenderTarget)
-    {
-        m_flushDesc.clearRects = flushResources.clearRects;
-        for (const IAABB& rect : m_flushDesc.clearRects)
-        {
-            IAABB clipped = rect.intersect(m_flushDesc.renderTarget->bounds());
-            if (!clipped.empty())
-            {
-                m_flushDesc.renderTargetUpdateBounds =
-                    m_flushDesc.renderTargetUpdateBounds.empty()
-                        ? clipped
-                        : m_flushDesc.renderTargetUpdateBounds.join(clipped);
-            }
-        }
     }
     if (m_flushDesc.renderTargetUpdateBounds.empty())
     {
@@ -3718,14 +3700,6 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushImageMeshDraw(
     batch.vertexBuffer = draw->vertexBuffer();
     batch.uvBuffer = draw->uvBuffer();
     batch.indexBuffer = draw->indexBuffer();
-#ifdef RIVE_WEBGL
-    batch.imageSurfaceMaterial = draw->surfaceMaterialData();
-    if (batch.imageSurfaceMaterial != nullptr)
-    {
-        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
-        m_combinedShaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
-    }
-#endif
     return batch;
 }
 
@@ -3782,14 +3756,11 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
                                 draw->paintType(),
                                 vertexCount,
                                 baseVertex);
-#ifdef RIVE_WEBGL
     if (draw->hasSurfaceMaterial())
     {
-        // Materials share the existing HSL helper permutation but do not need
-        // destination reads or advanced-blend render passes.
-        batch.shaderFeatures |= ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+        // Unlike HSL blend modes, materials read no destination color.
+        batch.shaderFeatures |= kSurfaceMaterialShaderFeatures;
     }
-#endif
 
     auto pathShaderFeatures = gpu::ShaderFeatures::NONE;
     if (draw->featherRadius() != 0 &&

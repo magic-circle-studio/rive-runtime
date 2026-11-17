@@ -271,7 +271,7 @@ public:
     }
     bool hasSurfaceMaterial() const
     {
-        return m_surfaceMaterialData.material != gpu::SurfaceMaterial::none;
+        return m_surfaceMaterialData.material != SurfaceMaterial::none;
     }
     void setSurfaceMaterial(const gpu::SurfaceMaterialData& data)
     {
@@ -566,18 +566,13 @@ public:
                   rcp<RenderBuffer> uvBuffer,
                   rcp<RenderBuffer> indexBuffer,
                   uint32_t indexCount,
-                  float opacity,
-                  const SurfaceMaterialData* = nullptr);
+                  float opacity);
 
     RenderBuffer* vertexBuffer() const { return m_vertexBufferRef; }
     RenderBuffer* uvBuffer() const { return m_uvBufferRef; }
     RenderBuffer* indexBuffer() const { return m_indexBufferRef; }
     uint32_t indexCount() const { return m_indexCount; }
     float opacity() const { return m_opacity; }
-    const SurfaceMaterialData* surfaceMaterialData() const
-    {
-        return m_surfaceMaterialData;
-    }
 
     gpu::DrawBatch* pushToRenderContext(RenderContext::LogicalFlush*,
                                         int subpassIndex) override;
@@ -590,7 +585,6 @@ protected:
     RenderBuffer* const m_indexBufferRef;
     const uint32_t m_indexCount;
     const float m_opacity;
-    const SurfaceMaterialData* const m_surfaceMaterialData;
 };
 
 // Resets the clip by either entirely erasing the existing clip, or intersecting
