@@ -309,22 +309,20 @@ void RiveRenderer::drawPath(RenderPath* renderPath, RenderPaint* renderPaint)
 void RiveRenderer::clipAndPushPathDraw(gpu::DrawUniquePtr draw,
                                        RiveRenderPath* path)
 {
-    if (draw != nullptr)
+    auto* pathDraw = static_cast<gpu::PathDraw*>(draw.get());
+    // Raster images draw plain.
+    if (pathDraw != nullptr && pathDraw->imageTexture() == nullptr)
     {
-        auto& pathDraw = static_cast<gpu::PathDraw&>(*draw);
-        if (auto data = makeSurfaceMaterialData(
-                pathDraw.imageTexture() == nullptr ? MaterialSpace::path
-                                                   : MaterialSpace::artboard,
-                path))
+        if (auto data = makeSurfaceMaterialData(path))
         {
-            pathDraw.setSurfaceMaterial(*data);
+            pathDraw->setSurfaceMaterial(*data);
         }
     }
     clipAndPushDraw(std::move(draw));
 }
 
 std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
-    MaterialSpace space, RiveRenderPath* path)
+    RiveRenderPath* path)
 {
     const auto& state = m_renderStateStack.back();
     if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
@@ -340,36 +338,25 @@ std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
     const float width = bounds.width();
     const float height = bounds.height();
     const Mat2D& localToScreen = state.matrix;
-    const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
-        1.f / width,
-        1.f / height,
-        -bounds.left() / width,
-        -bounds.top() / height);
-    Mat2D screenToMaterial;
-    if (space == MaterialSpace::artboard)
+    // A collapsed pose (e.g. scaled to zero) draws plain and binds nothing.
+    Mat2D screenToLocal;
+    if (!localToScreen.invert(&screenToLocal))
     {
-        // Images use artboard-space material coordinates, without a cached
-        // path binding.
-        screenToMaterial = screenToUV;
+        return std::nullopt;
     }
-    else
+    if (!path->hasSurfaceMaterialBinding())
     {
-        if (!path->hasSurfaceMaterialBinding())
-        {
-            // Capture one stable local-to-material mapping. Later poses invert
-            // their current transform so the material follows the path instead
-            // of remaining attached to screen pixels.
-            path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
-        }
-
-        Mat2D screenToLocal;
-        if (!localToScreen.invert(&screenToLocal))
-        {
-            return std::nullopt;
-        }
-        screenToMaterial =
-            path->surfaceMaterialLocalToUV() * screenToLocal;
+        // Capture one stable local-to-material mapping. Later poses invert
+        // their current transform so the material follows the path instead
+        // of remaining attached to screen pixels.
+        const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
+            1.f / width,
+            1.f / height,
+            -bounds.left() / width,
+            -bounds.top() / height);
+        path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
     }
+    Mat2D screenToMaterial = path->surfaceMaterialLocalToUV() * screenToLocal;
 
     if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
     {
@@ -786,16 +773,6 @@ void RiveRenderer::pushImageMeshDraw(IAABB pixelBounds,
     float finalOpacity =
         std::max(0.0f, opacity * m_renderStateStack.back().modulatedOpacity);
 
-    const gpu::SurfaceMaterialData* materialData = nullptr;
-#ifdef RIVE_WEBGL
-    if (m_context->frameInterlockMode() == gpu::InterlockMode::depthStencil)
-    {
-        if (auto data = makeSurfaceMaterialData(MaterialSpace::artboard))
-        {
-            materialData = m_context->make<gpu::SurfaceMaterialData>(*data);
-        }
-    }
-#endif
     clipAndPushDraw(gpu::DrawUniquePtr(
         m_context->make<gpu::ImageMeshDraw>(pixelBounds,
                                             m_renderStateStack.back().matrix,
@@ -807,8 +784,7 @@ void RiveRenderer::pushImageMeshDraw(IAABB pixelBounds,
                                             std::move(uvCoords_f32),
                                             std::move(indices_u16),
                                             indexCount,
-                                            finalOpacity,
-                                            materialData)));
+                                            finalOpacity)));
 }
 
 void RiveRenderer::clipAndPushDraw(gpu::DrawUniquePtr draw)

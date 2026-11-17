@@ -260,18 +260,26 @@ public:
         // 'safeFrameNumber' are safe to be released or recycled.
         uint64_t currentFrameNumber = 0;
         uint64_t safeFrameNumber = 0;
-
-        // Overlay clears in render-target coordinates, consumed with the frame.
-        Span<const IAABB> clearRects;
     };
 
     // Submits all GPU commands that have been built up since beginFrame().
     void flush(const FlushResources&);
 
-    // Consumes the frame without drawing if programs are pending. Returns the
-    // number of missing programs, or zero after issuing the frame. Backends
-    // without a program preflight retain their blocking flush behavior.
-    size_t tryFlush(const FlushResources&);
+    // What a flush does about programs its frame needs that are still linking.
+    // Backends without non-blocking program creation always wait.
+    enum class PendingPrograms
+    {
+        // Wait for them and draw, as flush() does.
+        wait,
+        // Start their links and consume the frame without drawing; draw only
+        // when none are pending.
+        skipFrame,
+        // Start every link the frame needs and consume it without drawing.
+        linkOnly,
+    };
+
+    // Returns whether the frame drew.
+    bool flush(const FlushResources&, PendingPrograms);
 
     // Called when the client will stop rendering. Releases all CPU and GPU
     // resources associated with this render context.
@@ -939,8 +947,6 @@ private:
 
         RIVE_DEBUG_CODE(bool m_hasDoneLayout = false;)
     };
-
-    size_t flushInternal(const FlushResources&, bool tryPrograms);
 
     std::vector<std::unique_ptr<LogicalFlush>> m_logicalFlushes;
     std::vector<const FlushDescriptor*> m_flushDescriptors;

@@ -9,6 +9,7 @@
 #include "rive/renderer/gl/gl_utils.hpp"
 #include "rive/renderer/render_context_helper_impl.hpp"
 
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -84,9 +85,6 @@ public:
     // context.
     void unbindGLInternalResources();
 
-    // Starts Magic Garden's draw links; synchronous without parallel compile.
-    void linkDrawPrograms();
-
     // Utility for rendering a texture to an MSAA framebuffer, since
     // glBlitFramebuffer() doesn't support copying non-MSAA to MSAA.
     void blitTextureToFramebufferAsDraw(GLuint textureID,
@@ -95,8 +93,6 @@ public:
                                         bool bottomUp);
 
     GLState* state() const { return m_state.get(); }
-
-
 
     // Storage type and rendering method for the feather atlas.
     //
@@ -236,28 +232,10 @@ private:
                         std::unique_ptr<PixelLocalStorageImpl>,
                         ShaderCompilationMode);
 
-    struct AuxiliaryProgram
-    {
-        glutils::Program program = glutils::Program::Zero();
-        PipelineStatus status = PipelineStatus::notReady;
-        operator GLuint() const { return program; }
-        bool pending() const
-        {
-            return program != 0 && status == PipelineStatus::notReady;
-        }
-        bool readyOrAbsent() const
-        {
-            return program == 0 || status == PipelineStatus::ready;
-        }
-    };
-
     void buildFeatherAtlasRenderPipelines();
     bool isProgramLinkComplete(GLuint, PipelineCreateType) const;
-    bool advanceAuxiliaryProgram(AuxiliaryProgram&, PipelineCreateType);
     void startBlitAsDrawProgram();
     void finishBlitAsDrawProgram(PipelineCreateType);
-    void finishFeatherAtlasPrograms(PipelineCreateType, bool fill, bool stroke);
-    bool featherAtlasProgramsReady(const FlushDescriptor&) const;
     bool needsBlitAsDraw(const FlushDescriptor&) const;
 
     std::unique_ptr<BufferRing> makeUniformBufferRing(
@@ -279,10 +257,10 @@ private:
     void preBeginFrame(RenderContext*) override;
 
     void flush(const FlushDescriptor&) override;
-    size_t prepareFlushPrograms(Span<const FlushDescriptor* const>) override;
+    bool prepareFlushPrograms(Span<const FlushDescriptor* const>,
+                              bool pollLinks) override;
     StandardPipelineProps drawProgramProps(const FlushDescriptor&,
                                           const DrawBatch&) const;
-    void clearRenderTargetRects(const FlushDescriptor&);
 
     // We have observed Adreno 308 crash when drawing too many instances spread
     // across any number of draw calls. This class breaks them up with glFlush
@@ -348,7 +326,7 @@ private:
     GLuint m_tessVertexTexture = 0;
 
     // Renders feathers to the feather atlas texture.
-    class FeatherAtlasProgram : public AuxiliaryProgram
+    class FeatherAtlasProgram
     {
     public:
         void compile(GLuint vertexShaderID,
@@ -356,14 +334,18 @@ private:
                      size_t numDefines,
                      const char* sources[],
                      size_t numSources,
-                     const GLCapabilities&);
-        void finish(const GLCapabilities&, GLState*);
+                     const GLCapabilities&,
+                     GLState* state);
+
+        operator GLuint() const { return m_program; }
+
         GLint baseInstanceUniformLocation() const
         {
             return m_baseInstanceUniformLocation;
         }
 
     private:
+        glutils::Program m_program = glutils::Program::Zero();
         GLint m_baseInstanceUniformLocation = -1;
     };
 
@@ -377,8 +359,8 @@ private:
     // Pipelines for clearing and resolving atlases into a GL_R8 texture for
     // sampling.
     glutils::Shader m_featherAtlasResolveVertexShader;
-    AuxiliaryProgram m_featherAtlasClearProgram;
-    AuxiliaryProgram m_featherAtlasResolveProgram;
+    glutils::Program m_featherAtlasClearProgram = glutils::Program::Zero();
+    glutils::Program m_featherAtlasResolveProgram = glutils::Program::Zero();
     glutils::VAO m_featherAtlasResolveVAO;
     glutils::Texture m_featherAtlasRenderTexture = glutils::Texture::Zero();
     glutils::Texture m_featherAtlasTexture = glutils::Texture::Zero();
@@ -446,10 +428,6 @@ private:
 
         PipelineStatus status() const { return m_pipelineStatus; }
 
-#ifdef RIVE_WEBGL
-        void setImageSurfaceMaterial(const SurfaceMaterialData*) const;
-#endif
-
         bool advanceCreation(RenderContextGLImpl*,
                              PipelineCreateType,
                              gpu::DrawType,
@@ -463,11 +441,6 @@ private:
         PipelineStatus m_pipelineStatus = PipelineStatus::notReady;
         GLuint m_id = 0;
         GLint m_baseInstanceUniformLocation = -1;
-#ifdef RIVE_WEBGL
-        GLint m_imageSurfaceMaterialMatrixLocation = -1;
-        GLint m_imageSurfaceMaterialTranslateLocation = -1;
-        mutable bool m_imageSurfaceMaterialActive = false;
-#endif
         const rcp<GLState> m_state;
 #ifdef WITH_RIVE_TOOLS
         SynthesizedFailureType m_synthesizedFailureType =
@@ -483,22 +456,10 @@ private:
         GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
         void preparePipeline(const PipelineProps&,
                              const PlatformFeatures&,
-                             std::unordered_set<const DrawProgram*>&);
-        void linkPipeline(const PipelineProps& props,
-                          const PlatformFeatures& features)
-        {
-            std::ignore = tryGetPipeline(ubershaderPropsFor(props, features),
-                                        features);
-        }
-        const DrawProgram* requestPipeline(const PipelineProps& props,
-                                           const PlatformFeatures& features)
-        {
-            return queuePipelineIfNotFound(ubershaderPropsFor(props, features),
-                                           features);
-        }
+                             std::unordered_set<const DrawProgram*>&,
+                             bool pollLinks);
 
     protected:
-
         virtual std::unique_ptr<DrawShader> createVertexShader(
             DrawType,
             ShaderFeatures,
@@ -553,7 +514,10 @@ private:
 
     // Used for blitting non-MSAA -> MSAA, which isn't supported by
     // glBlitFramebuffer().
-    AuxiliaryProgram m_blitAsDrawProgram;
+    glutils::Program m_blitAsDrawProgram = glutils::Program::Zero();
+    // Links in the background from the first frame that needs it; see
+    // prepareFlushPrograms.
+    PipelineStatus m_blitAsDrawProgramStatus = PipelineStatus::notReady;
 
     const rcp<GLState> m_state;
 

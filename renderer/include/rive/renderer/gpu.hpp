@@ -14,11 +14,9 @@
 #include "rive/shapes/paint/color.hpp"
 #include "rive/renderer/trivial_block_allocator.hpp"
 #include "rive/shapes/paint/image_sampler.hpp"
-#include "rive/surface_material.hpp"
 
 #include <algorithm>
 #include <functional>
-#include <numeric>
 #include <optional>
 
 // Use the define to run the feather LUT code
@@ -429,9 +427,13 @@ enum class PaintType : uint32_t
     radialGradient,
 };
 
-// Keep existing renderer call sites source-compatible while the material type
-// lives in core runtime code, where image bindings can also reference it.
-using SurfaceMaterial = rive::SurfaceMaterial;
+// Material drawn over an artboard's vector paths; raster images draw plain.
+enum class SurfaceMaterial : uint32_t
+{
+    none = 0,
+    gold = 1,
+    rainbow = 2,
+};
 
 struct SurfaceMaterialData
 {
@@ -865,8 +867,7 @@ enum class ShaderFeatures
     ENABLE_ADVANCED_BLEND = 1 << 2,
     ENABLE_FEATHER = 1 << 3,
 
-    // Fragment-only features. The WebGL surface-material fork also reuses the
-    // HSL bit to gate its vertex varying without adding a pipeline permutation.
+    // Fragment-only features.
     ENABLE_EVEN_ODD = 1 << 4,
     ENABLE_NESTED_CLIPPING = 1 << 5,
     ENABLE_HSL_BLEND_MODES = 1 << 6,
@@ -877,10 +878,11 @@ enum class ShaderFeatures
 constexpr static size_t ShaderFeatureCount = 9;
 constexpr static ShaderFeatures kAllShaderFeatures =
     static_cast<gpu::ShaderFeatures>((1 << ShaderFeatureCount) - 1);
-constexpr static ShaderFeatures kSurfaceMaterialVertexShaderFeatures =
+// Surface materials need vertex and fragment code. They reuse the HSL bit, so
+// the fork does not widen every backend's shader key for a package that only
+// ships WebGL2 materials.
+constexpr static ShaderFeatures kSurfaceMaterialShaderFeatures =
 #ifdef RIVE_WEBGL
-    // Reuse an existing WebGL feature bit so the fork does not widen every
-    // backend's shader key for a package that only ships WebGL2 materials.
     ShaderFeatures::ENABLE_HSL_BLEND_MODES;
 #else
     ShaderFeatures::NONE;
@@ -888,8 +890,7 @@ constexpr static ShaderFeatures kSurfaceMaterialVertexShaderFeatures =
 constexpr static ShaderFeatures kVertexShaderFeaturesMask =
     ShaderFeatures::ENABLE_CLIPPING | ShaderFeatures::ENABLE_CLIP_RECT |
     ShaderFeatures::ENABLE_ADVANCED_BLEND | ShaderFeatures::ENABLE_FEATHER |
-    ShaderFeatures::ENABLE_MODULATED_IMAGE |
-    kSurfaceMaterialVertexShaderFeatures;
+    ShaderFeatures::ENABLE_MODULATED_IMAGE | kSurfaceMaterialShaderFeatures;
 
 // These shader features change the way atomic pipelines are set up (or cause
 //  validation failures when enabled but not used)
@@ -1333,7 +1334,6 @@ struct DrawBatch
     RenderBuffer* vertexBuffer;
     RenderBuffer* uvBuffer;
     RenderBuffer* indexBuffer;
-    const SurfaceMaterialData* imageSurfaceMaterial = nullptr;
 
     // When shaders don't have a mechanism to read the framebuffer (e.g.,
     // WebGL msaa), this is a linked list of all the draws in the batch whose
@@ -1404,7 +1404,6 @@ struct FlushDescriptor
 
     IAABB renderTargetUpdateBounds; // drawBounds, or renderTargetBounds if
                                     // loadAction == LoadAction::clear.
-    Span<const IAABB> clearRects;
 
     // If nonzero, frames are split up into virtual tiles of this size.
     //
@@ -1779,10 +1778,7 @@ static_assert(sizeof(PaintAuxData) ==
                   8);
 static_assert(256 % sizeof(PaintAuxData) == 0);
 constexpr static size_t kPaintAuxBufferAlignmentInElements =
-    256 / std::gcd<size_t>(256, sizeof(PaintAuxData));
-static_assert((kPaintAuxBufferAlignmentInElements * sizeof(PaintAuxData)) %
-                  256 ==
-              0);
+    256 / sizeof(PaintAuxData);
 
 // High level structure of the "contour" storage buffer. Each contour of every
 // path has a data record describing its info.

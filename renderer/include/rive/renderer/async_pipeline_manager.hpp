@@ -92,8 +92,12 @@ public:
     {
         PipelineProps props = propsIn;
 
-        const ShaderFeatures ubershaderFeatures =
-            ubershaderPropsFor(props, platformFeatures).shaderFeatures;
+        ShaderFeatures ubershaderFeatures =
+            gpu::UbershaderFeaturesMaskFor(props.shaderFeatures,
+                                           props.drawType,
+                                           props.interlockMode,
+                                           props.shaderMiscFlags,
+                                           platformFeatures);
 
         PipelineCreateType createType;
 
@@ -489,7 +493,7 @@ protected:
         const PipelineProps& props,
         const PlatformFeatures& platformFeatures)
     {
-        bool found = false;
+        bool found = true;
         auto curKey = ShaderUniqueKey(props.drawType,
                                       props.shaderFeatures,
                                       props.interlockMode,
@@ -597,7 +601,6 @@ protected:
     }
 
 private:
-
     struct JobParams
     {
         PipelineProps props;
