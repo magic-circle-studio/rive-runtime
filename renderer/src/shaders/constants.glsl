@@ -444,7 +444,7 @@
 #define BUFFER_IMAGE_TILE_SIZE_LOG2 5u
 
 // PathData has a specific number of uint32x4 elements in it.
-#define PATH_DATA_ELEMENT_COUNT 9u
+#define PATH_DATA_ELEMENT_COUNT 11u
 
 #ifdef __cplusplus
   #if __cplusplus >= 201703

@@ -4214,6 +4214,11 @@ gpu::DrawBatch& RenderContext::LogicalFlush::pushPathDraw(
       draw->paintType(),
       vertexCount,
       baseVertex);
+  if (draw->hasSurfaceMaterial())
+  {
+    // Unlike HSL blend modes, materials read no destination color.
+    batch.shaderFeatures |= kSurfaceMaterialShaderFeatures;
+  }
 
   auto pathShaderFeatures = gpu::ShaderFeatures::NONE;
   if (draw->featherRadius() != 0 &&

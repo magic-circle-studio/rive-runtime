@@ -352,6 +352,19 @@ public:
       CoverageType,
       const RenderContext::FrameDescriptor&);
 
+  const gpu::SurfaceMaterialData* surfaceMaterialData() const
+  {
+    return hasSurfaceMaterial() ? &m_surfaceMaterialData : nullptr;
+  }
+  bool hasSurfaceMaterial() const
+  {
+    return m_surfaceMaterialData.material != SurfaceMaterial::none;
+  }
+  void setSurfaceMaterial(const gpu::SurfaceMaterialData& data)
+  {
+    m_surfaceMaterialData = data;
+  }
+
   CoverageType coverageType() const { return m_coverageType; }
 
   FillRule pathFillRule() const { return m_pathFillRule; }
@@ -573,6 +586,7 @@ protected:
   const Mat2D m_inverseGradientTransform;
   const gpu::PaintType m_paintType;
   const CoverageType m_coverageType;
+  gpu::SurfaceMaterialData m_surfaceMaterialData;
   // This fill draws its AA as a final, separate hairline stroke in its own
   // subpass. (depthStencil only).
   bool m_hasHairlinePass = false;

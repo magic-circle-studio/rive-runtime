@@ -437,6 +437,21 @@ enum class PaintType : uint32_t
   angularGradient,
 };
 
+// Material drawn over an artboard's vector paths; raster images draw plain.
+enum class SurfaceMaterial : uint32_t
+{
+  none = 0,
+  gold = 1,
+  rainbow = 2,
+};
+
+struct SurfaceMaterialData
+{
+  Mat2D screenToUV;
+  SurfaceMaterial material = SurfaceMaterial::none;
+  float timeSeconds = 0;
+};
+
 // Specifies the location of a simple or complex horizontal color ramp within
 // the gradient texture. A simple color ramp is two texels wide, beginning at
 // the specified row and column. A complex color ramp spans the entire width of
@@ -1126,12 +1141,22 @@ constexpr static size_t ShaderFeatureCount = 10;
 constexpr static ShaderFeatures
     kAllShaderFeatures = static_cast<gpu::ShaderFeatures>(
         (1 << ShaderFeatureCount) - 1);
+// Surface materials need vertex and fragment code. They reuse the HSL bit, so
+// the fork does not widen every backend's shader key for a package that only
+// ships WebGL2 materials.
+constexpr static ShaderFeatures kSurfaceMaterialShaderFeatures =
+#ifdef RIVE_WEBGL
+    ShaderFeatures::ENABLE_HSL_BLEND_MODES;
+#else
+    ShaderFeatures::NONE;
+#endif
 constexpr static ShaderFeatures
     kVertexShaderFeaturesMask = ShaderFeatures::ENABLE_CLIPPING |
                                 ShaderFeatures::ENABLE_CLIP_RECT |
                                 ShaderFeatures::ENABLE_ADVANCED_BLEND |
                                 ShaderFeatures::ENABLE_FEATHER |
-                                ShaderFeatures::ENABLE_MODULATED_IMAGE;
+                                ShaderFeatures::ENABLE_MODULATED_IMAGE |
+                                kSurfaceMaterialShaderFeatures;
 
 // These shader features change the way atomic pipelines are set up (or cause
 //  validation failures when enabled but not used)
@@ -2055,16 +2080,20 @@ private:
   WRITEONLY float m_imageMatrix[6]; // Maps _fragCoord to image coordinates.
   WRITEONLY float m_imageTextureLOD;
 
-  // Padding out to a whole uint32x4.
-  WRITEONLY float m_padding[1];
+  WRITEONLY float m_padding; // Aligns the material data to a uint32x4.
+
+  // Surface material, in the 10th and 11th uint32x4s.
+  WRITEONLY float m_surfaceMaterialMatrix[6]; // Maps _fragCoord to UVs.
+  WRITEONLY float m_surfaceMaterialMode;      // SurfaceMaterial.
+  WRITEONLY float m_surfaceMaterialTimeSeconds;
 };
 static_assert(
     sizeof(PathData) %
         StorageBufferElementSizeInBytes(PathData::kBufferStructure) ==
     0);
 // PathData doesn't have to divide into 256 in order to align flush boundaries
-// on 256 bytes (as required by buffer binding offsets). If it's 144 bytes,
-// we can align at 16 * 144 == 9 * 256 bytes.
+// on 256 bytes (as required by buffer binding offsets). With 176-byte records,
+// we can align at 16 * 176 == 11 * 256 bytes.
 constexpr static size_t kPathBufferAlignmentInElements = 256 /
                                                          std::gcd<size_t>(
                                                              256,

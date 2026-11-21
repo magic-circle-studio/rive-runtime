@@ -46,6 +46,10 @@
 #include "generated/shaders/render_atlas.glsl.hpp"
 #include "generated/shaders/resolve_atlas.glsl.hpp"
 #include "generated/shaders/stencil_draw.glsl.hpp"
+#ifdef RIVE_WEBGL
+#include "generated/shaders/surface_material.glsl.hpp"
+#include "generated/shaders/surface_material_dispatch.glsl.hpp"
+#endif
 #include "generated/shaders/tessellate.glsl.hpp"
 
 #ifdef RIVE_WEBGL
@@ -1519,6 +1523,9 @@ RenderContextGLImpl::DrawShader::DrawShader(
 #endif
 
   std::vector<const char*> defines;
+#ifdef RIVE_WEBGL
+  defines.push_back(GLSL_RIVE_SURFACE_MATERIAL);
+#endif
   if (renderContextImpl->m_plsImpl != nullptr &&
       interlockMode != gpu::InterlockMode::depthStencil)
   {
@@ -1657,6 +1664,16 @@ RenderContextGLImpl::DrawShader::DrawShader(
   sources.push_back(glsl::constants);
   sources.push_back(glsl::flush_uniforms);
   sources.push_back(glsl::common);
+#ifdef RIVE_WEBGL
+  if (shaderType == GL_FRAGMENT_SHADER &&
+      enums::is_flag_set(
+          shaderFeatures,
+          ShaderFeatures::ENABLE_HSL_BLEND_MODES))
+  {
+    sources.push_back(glsl::surface_material);
+    sources.push_back(glsl::surface_material_dispatch);
+  }
+#endif
   if (shaderType == GL_FRAGMENT_SHADER &&
       enums::is_flag_set(shaderFeatures, ShaderFeatures::ENABLE_ADVANCED_BLEND))
   {

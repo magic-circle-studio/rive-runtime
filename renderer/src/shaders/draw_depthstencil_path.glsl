@@ -44,6 +44,9 @@ NO_PERSPECTIVE VARYING(0, float4, v_paint);
 #ifdef @ENABLE_MODULATED_IMAGE
 NO_PERSPECTIVE VARYING(2, float3, v_image);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(3, float4, v_surfaceMaterialData);
+#endif
 VARYING_BLOCK_END
 
 #ifdef @VERTEX
@@ -56,6 +59,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
   #endif
   #ifdef @ENABLE_MODULATED_IMAGE
   VARYING_INIT(v_image, float3);
+  #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_INIT(v_surfaceMaterialData, float4);
   #endif
 
   #ifdef @DS_POLAR_STROKE
@@ -336,9 +342,19 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
   #ifdef @ENABLE_MODULATED_IMAGE
     v_image = float3(0.0, 0.0, 0.0);
   #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    v_surfaceMaterialData = float4(0);
+  #endif
   }
   else
   {
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+    if (@ENABLE_HSL_BLEND_MODES)
+    {
+      v_surfaceMaterialData = find_surface_material_data(pathID, fragCoord);
+    }
+  #endif
+
     uint paintType = pathParams & 0xfu;
     bool paintHasAdvancedBlend = false;
   #ifdef @ENABLE_ADVANCED_BLEND
@@ -436,6 +452,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexIdx, _instanceIdx)
   #ifdef @ENABLE_MODULATED_IMAGE
   VARYING_PACK(v_image);
   #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_PACK(v_surfaceMaterialData);
+  #endif
   EMIT_VERTEX(pos);
 }
 #endif // @VERTEX
@@ -454,6 +473,9 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
   #endif
   #ifdef @ENABLE_ADVANCED_BLEND
   VARYING_UNPACK(v_blendMode, half);
+  #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_UNPACK(v_surfaceMaterialData, float4);
   #endif
 
   #ifdef @ENABLE_ADVANCED_BLEND
@@ -513,6 +535,21 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
       imageColor = make_half4(unmultiply_rgb(imageColor), imageColor.a);
 
     color *= imageColor;
+  }
+  #endif
+
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  if (@ENABLE_HSL_BLEND_MODES)
+  {
+    color = apply_surface_material_to_paint(
+        color,
+        v_surfaceMaterialData,
+    #ifdef @ENABLE_ADVANCED_BLEND
+        !@ENABLE_ADVANCED_BLEND || blendMode == BLEND_SRC_OVER
+    #else
+        true
+    #endif
+    );
   }
   #endif
 

@@ -71,6 +71,20 @@ public:
   GrInnerFanTriangulator* createTriangulator(
       TrivialBlockAllocator& perFrameAllocator) const;
 
+  bool hasSurfaceMaterialBinding() const { return m_hasSurfaceMaterialBinding; }
+  const Mat2D& surfaceMaterialLocalToUV() const
+  {
+    return m_surfaceMaterialLocalToUV;
+  }
+  void captureSurfaceMaterialBinding(const Mat2D& localToUV)
+  {
+    if (!m_hasSurfaceMaterialBinding)
+    {
+      m_surfaceMaterialLocalToUV = localToUV;
+      m_hasSurfaceMaterialBinding = true;
+    }
+  }
+
   // 1-dimensional feathering along the normal vector quits looking like a
   // blur when there is strong curvature. This method returns a copy of the
   // path with shorter, flatter curves that will more accurately depict a
@@ -121,6 +135,8 @@ private:
   mutable float m_coarseArea;
   float m_softenedCopyRotation = 0;
   mutable uint64_t m_rawPathMutationID;
+  Mat2D m_surfaceMaterialLocalToUV;
+  bool m_hasSurfaceMaterialBinding = false;
 
   // Cached inner-fan triangulation, in a dedicated allocator so it outlives
   // any single frame. Allocated only once a path has been asked to

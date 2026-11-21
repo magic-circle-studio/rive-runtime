@@ -59,6 +59,9 @@ VARYING(8, float2, v_coverageCoord);
 #ifdef @ENABLE_MODULATED_IMAGE
 NO_PERSPECTIVE VARYING(9, float3, v_image);
 #endif
+#if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+NO_PERSPECTIVE VARYING(10, float4, v_surfaceMaterialData);
+#endif
 
 VARYING_BLOCK_END
 
@@ -101,6 +104,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
   #endif
   #ifdef @ENABLE_ADVANCED_BLEND
   VARYING_INIT(v_blendMode, half);
+  #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_INIT(v_surfaceMaterialData, float4);
   #endif
   #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
   VARYING_INIT(v_coveragePlacement, uint2);
@@ -209,6 +215,13 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
   if (uniforms.renderTargetBottomUp != 0u)
   {
     fragCoord.y = float(uniforms.renderTargetHeight) - fragCoord.y;
+  }
+  #endif
+
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  if (@ENABLE_HSL_BLEND_MODES)
+  {
+    v_surfaceMaterialData = find_surface_material_data(pathID, fragCoord);
   }
   #endif
 
@@ -347,6 +360,9 @@ VERTEX_MAIN(@drawVertexMain, Attrs, attrs, _vertexID, _instanceID)
   #endif
   #ifdef @ENABLE_ADVANCED_BLEND
   VARYING_PACK(v_blendMode);
+  #endif
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_PACK(v_surfaceMaterialData);
   #endif
   #ifdef @RENDER_MODE_CLOCKWISE_ATOMIC
   VARYING_PACK(v_coveragePlacement);

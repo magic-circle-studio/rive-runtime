@@ -51,6 +51,26 @@ STORAGE_BUFFER_U32x1(
     @virtualPatchBuffer);
   #endif
 VERTEX_STORAGE_BUFFER_BLOCK_END
+
+  #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+// [materialCoord.xy, SurfaceMaterial, timeSeconds]
+INLINE float4 find_surface_material_data(uint pathID, float2 fragCoord)
+{
+  float4 materialTranslate = uintBitsToFloat(STORAGE_BUFFER_LOAD4(
+      @pathBuffer,
+      pathID * PATH_DATA_ELEMENT_COUNT + 10u));
+  float4 materialData = float4(0.0, 0.0, materialTranslate.zw);
+  if (materialTranslate.z > 0.5)
+  {
+    float2x2 materialMatrix = make_float2x2(
+        uintBitsToFloat(STORAGE_BUFFER_LOAD4(
+            @pathBuffer,
+            pathID * PATH_DATA_ELEMENT_COUNT + 9u)));
+    materialData.xy = MUL(materialMatrix, fragCoord) + materialTranslate.xy;
+  }
+  return materialData;
+}
+  #endif
 #endif // @VERTEX
 
 #if defined(@ENABLE_FEATHER) || defined(@FEATHER_ATLAS_BLIT)

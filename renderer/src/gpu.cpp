@@ -1435,6 +1435,23 @@ PathData::PathData(
     m_inverseFwidth.x = 0;
     m_inverseFwidth.y = 0;
   }
+
+  if (const auto* surfaceMaterialData = draw.surfaceMaterialData())
+  {
+    Mat2D screenToUV = surfaceMaterialData->screenToUV;
+    if (renderTarget->bottomUp(platformFeatures))
+    {
+      screenToUV = screenToUV * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
+    }
+    write_matrix(m_surfaceMaterialMatrix, screenToUV);
+    m_surfaceMaterialMode = static_cast<float>(surfaceMaterialData->material);
+    m_surfaceMaterialTimeSeconds = surfaceMaterialData->timeSeconds;
+  }
+  else
+  {
+    m_surfaceMaterialMode = static_cast<float>(SurfaceMaterial::none);
+    m_surfaceMaterialTimeSeconds = 0;
+  }
 }
 
 PathData::PathData(ColorInt clearColor)

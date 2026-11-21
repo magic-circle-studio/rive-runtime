@@ -51,6 +51,9 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
     #ifdef @ENABLE_ADVANCED_BLEND
   VARYING_UNPACK(v_blendMode, half);
     #endif
+    #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  VARYING_UNPACK(v_surfaceMaterialData, float4);
+    #endif
   #endif // !@DRAW_IMAGE_MESH
 
   #ifdef @DRAW_IMAGE_MESH
@@ -84,6 +87,21 @@ FRAG_DATA_MAIN(half4, @drawFragmentMain)
       cast_half_to_ushort(v_blendMode),
     #endif
       v_paint FRAGMENT_CONTEXT_UNPACK);
+    #if defined(@RIVE_SURFACE_MATERIAL) && defined(@ENABLE_HSL_BLEND_MODES)
+  if (@ENABLE_HSL_BLEND_MODES)
+  {
+    color = apply_surface_material_to_paint(
+        color,
+        v_surfaceMaterialData,
+      #ifdef @ENABLE_ADVANCED_BLEND
+        !@ENABLE_ADVANCED_BLEND ||
+            cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+      #else
+        true
+      #endif
+    );
+  }
+    #endif
   #endif
 
   // Need to check both flags here because in GL when

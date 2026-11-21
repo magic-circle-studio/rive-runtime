@@ -9,6 +9,7 @@
 #include "rive/renderer/gpu.hpp"
 #include "rive/renderer/draw.hpp"
 #include "rive/renderer/render_context.hpp"
+#include <optional>
 #include <vector>
 
 namespace rive::gpu
@@ -89,6 +90,16 @@ public:
     return true;
   }
 
+  void setSurfaceMaterial(
+      gpu::SurfaceMaterial material,
+      const AABB& bounds,
+      float timeSeconds)
+  {
+    m_renderStateStack.back().surfaceMaterial = material;
+    m_renderStateStack.back().surfaceMaterialBounds = bounds;
+    m_renderStateStack.back().surfaceMaterialTimeSeconds = timeSeconds;
+  }
+
   // Gives [dst] the clip this renderer currently applies, for a draw
   // re-issued through a fresh renderer. [dst] must be another renderer on the
   // same context with no clip of its own. Its transform is neither used nor
@@ -142,6 +153,9 @@ private:
   // complex to be supported by the GPU buffers, even after a logical flush,
   // then nothing is drawn.
   void clipAndPushDraw(gpu::DrawUniquePtr);
+  void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
+  std::optional<gpu::SurfaceMaterialData> makeSurfaceMaterialData(
+      RiveRenderPath*);
 
   // Pushes any necessary clip updates to m_internalDrawBatch and sets the
   // Draw's clipID and clipRectInverseMatrix, if any. Returns failure if the
@@ -171,6 +185,9 @@ private:
     // The pixel bounds for all clipping (clip rects *and* clip paths),
     // which defaults to a maximally-large rectangle
     IAABB overallClipPixelBounds = IAABB::makeMaximal();
+    gpu::SurfaceMaterial surfaceMaterial = gpu::SurfaceMaterial::none;
+    AABB surfaceMaterialBounds;
+    float surfaceMaterialTimeSeconds = 0;
   };
   // Makes [state]'s clipRectInverseMatrix in the current epoch.
   void makeClipRectInverseMatrix(RenderState& state);

@@ -17,6 +17,23 @@ namespace rive
 {
 namespace
 {
+// Rainbow's angle and density are part of the material preset. Aspect comes
+// from each surface's bounds instead of assuming a particular artboard size.
+constexpr float kRainbowAxisX = -0.64278761f;
+constexpr float kRainbowAxisY = 0.76604444f;
+constexpr float kRainbowSquish = 2.5f;
+
+Mat2D rainbowUVProjection(float aspect)
+{
+  return Mat2D(
+      -kRainbowAxisX * kRainbowSquish,
+      0.0f,
+      kRainbowAxisY * kRainbowSquish * aspect,
+      0.0f,
+      0.5f + (kRainbowAxisX - kRainbowAxisY) * kRainbowSquish * 0.5f,
+      0.0f);
+}
+
 class AutoSaveRestore
 {
 public:
@@ -482,28 +499,95 @@ void RiveRenderer::drawPath(RenderPath* renderPath, RenderPaint* renderPaint)
       // Softening prunes empty segments, which can leave nothing to draw.
       if (gpu::PathDraw::fillTessellatesEmpty(softenedPath->getRawPath()))
         return;
-      clipAndPushDraw(gpu::PathDraw::Make(
-          m_context,
-          m_renderStateStack.back().matrix,
-          imageMatrixPtr,
-          std::move(softenedPath),
-          path->getFillRule(),
-          paint,
-          m_renderStateStack.back().modulatedOpacity,
-          m_renderStateStack.back().modulatedColor));
+      clipAndPushPathDraw(
+          gpu::PathDraw::Make(
+              m_context,
+              m_renderStateStack.back().matrix,
+              imageMatrixPtr,
+              std::move(softenedPath),
+              path->getFillRule(),
+              paint,
+              m_renderStateStack.back().modulatedOpacity,
+              m_renderStateStack.back().modulatedColor),
+          path);
       return;
     }
   }
 
-  clipAndPushDraw(gpu::PathDraw::Make(
-      m_context,
-      m_renderStateStack.back().matrix,
-      imageMatrixPtr,
-      ref_rcp(path),
-      path->getFillRule(),
-      paint,
-      m_renderStateStack.back().modulatedOpacity,
-      m_renderStateStack.back().modulatedColor));
+  clipAndPushPathDraw(
+      gpu::PathDraw::Make(
+          m_context,
+          m_renderStateStack.back().matrix,
+          imageMatrixPtr,
+          ref_rcp(path),
+          path->getFillRule(),
+          paint,
+          m_renderStateStack.back().modulatedOpacity,
+          m_renderStateStack.back().modulatedColor),
+      path);
+}
+
+void RiveRenderer::clipAndPushPathDraw(
+    gpu::DrawUniquePtr draw,
+    RiveRenderPath* path)
+{
+  auto* pathDraw = static_cast<gpu::PathDraw*>(draw.get());
+  // Raster images draw plain.
+  if (pathDraw != nullptr && pathDraw->imageTexture() == nullptr)
+  {
+    if (auto data = makeSurfaceMaterialData(path))
+    {
+      pathDraw->setSurfaceMaterial(*data);
+    }
+  }
+  clipAndPushDraw(std::move(draw));
+}
+
+std::optional<gpu::SurfaceMaterialData> RiveRenderer::makeSurfaceMaterialData(
+    RiveRenderPath* path)
+{
+  const auto& state = m_renderStateStack.back();
+  if (state.surfaceMaterial == gpu::SurfaceMaterial::none)
+  {
+    return std::nullopt;
+  }
+  if (state.surfaceMaterialBounds.isEmptyOrNaN())
+  {
+    return std::nullopt;
+  }
+
+  const AABB& bounds = state.surfaceMaterialBounds;
+  const float width = bounds.width();
+  const float height = bounds.height();
+  const Mat2D& localToScreen = state.matrix;
+  // A collapsed pose draws plain and leaves the binding untouched.
+  Mat2D screenToLocal;
+  if (!localToScreen.invert(&screenToLocal))
+  {
+    return std::nullopt;
+  }
+  if (!path->hasSurfaceMaterialBinding())
+  {
+    // Capture a local-space binding that follows the path across poses.
+    const Mat2D screenToUV = Mat2D::fromScaleAndTranslation(
+        1.f / width,
+        1.f / height,
+        -bounds.left() / width,
+        -bounds.top() / height);
+    path->captureSurfaceMaterialBinding(screenToUV * localToScreen);
+  }
+  Mat2D screenToMaterial = path->surfaceMaterialLocalToUV() * screenToLocal;
+
+  if (state.surfaceMaterial == gpu::SurfaceMaterial::rainbow)
+  {
+    screenToMaterial = rainbowUVProjection(width / height) * screenToMaterial;
+  }
+
+  return gpu::SurfaceMaterialData{
+      .screenToUV = screenToMaterial,
+      .material = state.surfaceMaterial,
+      .timeSeconds = state.surfaceMaterialTimeSeconds,
+  };
 }
 
 void RiveRenderer::clipPath(RenderPath* renderPath)
