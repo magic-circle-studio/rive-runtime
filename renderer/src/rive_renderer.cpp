@@ -11,6 +11,7 @@
 #include "rive/renderer/rive_render_image.hpp"
 #include "rive/renderer/rive_render_paint.hpp"
 #include "rive/profiler/profiler_macros.h"
+#include <cstring>
 
 namespace rive
 {
@@ -860,6 +861,49 @@ void RiveRenderer::drawImage(
   // Scale the view matrix so we can draw this image as the rect [0, 0, 1, 1].
   AutoSaveRestore autoSaveRestore(this);
   scale(image->width(), image->height());
+
+  if (m_context->frameInterlockMode() == gpu::InterlockMode::depthStencil)
+  {
+    // Depth-stencil frames draw an image as one cached quad mesh, which shares
+    // the image-mesh programs, instead of stenciling and covering a rect with
+    // an image paint. Its bounds let overlay frames touch only its pixels.
+    if (m_renderStateStack.back().overallClipPixelBounds.empty())
+    {
+      return;
+    }
+    if (m_unitQuadVertices == nullptr)
+    {
+      constexpr float vertices[] = {0, 0, 1, 0, 1, 1, 0, 1};
+      constexpr uint16_t indices[] = {0, 1, 2, 0, 2, 3};
+      auto makeBuffer = [this](RenderBufferType type, const auto& data) {
+        auto buffer = m_context->makeRenderBuffer(
+            type,
+            RenderBufferFlags::mappedOnceAtInitialization,
+            sizeof(data));
+        std::memcpy(buffer->map(), data, sizeof(data));
+        buffer->unmap();
+        return buffer;
+      };
+      m_unitQuadVertices = makeBuffer(RenderBufferType::vertex, vertices);
+      m_unitQuadIndices = makeBuffer(RenderBufferType::index, indices);
+    }
+    const Mat2D& m = m_renderStateStack.back().matrix;
+    clipAndPushDraw(gpu::DrawUniquePtr(m_context->make<gpu::ImageMeshDraw>(
+        m.mapBoundingBox(AABB{0, 0, 1, 1}).roundOut(),
+        m,
+        blendMode,
+        additiveness,
+        std::move(imageTexture),
+        imageSampler,
+        m_unitQuadVertices,
+        m_unitQuadVertices,
+        m_unitQuadIndices,
+        6,
+        modulated(0xFFFFFFFF, finalOpacity),
+        Vec2D{0.0f, 0.0f},
+        Vec2D{1.0f, 1.0f})));
+    return;
+  }
 
   if (!m_context->frameSupportsImagePaintForPaths())
   {

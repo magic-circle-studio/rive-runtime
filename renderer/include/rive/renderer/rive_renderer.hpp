@@ -235,5 +235,9 @@ private:
 
   // Path of the rectangle [0, 0, 1, 1]. Used to draw images.
   rcp<RiveRenderPath> m_unitRectPath;
+  // Positions and UVs of the same unit quad, for images that depth-stencil
+  // frames draw as image meshes.
+  rcp<RenderBuffer> m_unitQuadVertices;
+  rcp<RenderBuffer> m_unitQuadIndices;
 };
 } // namespace rive
