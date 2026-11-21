@@ -347,17 +347,20 @@ public:
     processCompletedJobs();
   }
 
-  bool queuePipelineIfNotFound(
+  PipelineType* queuePipelineIfNotFound(
       const PipelineProps& props,
-      const PlatformFeatures& platformFeatures)
+      const PlatformFeatures& platformFeatures,
+      bool* created = nullptr)
   {
     PipelineKey key = props.createKey(platformFeatures);
     auto iter = m_pipelines.find(key);
+    if (created != nullptr)
+    {
+      *created = iter == m_pipelines.end();
+    }
     if (iter != m_pipelines.end())
     {
-      // This is already in our pipelines list which means it was already
-      // created.
-      return false;
+      return iter->second.get();
     }
 
     auto pipeline = createPipeline(
@@ -365,11 +368,23 @@ public:
         key,
         props,
         platformFeatures);
-    m_pipelines.insert({key, std::move(pipeline)});
-    return true;
+    return m_pipelines.insert({key, std::move(pipeline)}).first->second.get();
   }
 
 protected:
+  static PipelineProps ubershaderPropsFor(
+      PipelineProps props,
+      const PlatformFeatures& features)
+  {
+    props.shaderFeatures = UbershaderFeaturesMaskFor(
+        props.shaderFeatures,
+        props.drawType,
+        props.interlockMode,
+        props.shaderMiscFlags,
+        features);
+    return props;
+  }
+
   void waitForPipelineForRender(PipelineKey key)
   {
     auto iter = m_pipelines.find(key);

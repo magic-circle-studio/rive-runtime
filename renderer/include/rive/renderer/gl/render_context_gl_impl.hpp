@@ -10,6 +10,7 @@
 #include "rive/renderer/render_context_helper_impl.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace rive
@@ -247,6 +248,10 @@ private:
       ShaderCompilationMode);
 
   void buildFeatherAtlasRenderPipelines();
+  bool isProgramLinkComplete(GLuint, PipelineCreateType) const;
+  void startBlitAsDrawProgram();
+  void finishBlitAsDrawProgram(PipelineCreateType);
+  bool needsBlitAsDraw(const FlushDescriptor&) const;
 
   std::unique_ptr<BufferRing> makeUniformBufferRing(
       size_t capacityInBytes) override;
@@ -268,6 +273,12 @@ private:
   void preBeginFrame(RenderContext*) override;
 
   void flush(const FlushDescriptor&) override;
+  bool prepareFlushPrograms(
+      Span<const FlushDescriptor* const>,
+      bool pollLinks) override;
+  StandardPipelineProps drawProgramProps(
+      const FlushDescriptor&,
+      const DrawBatch&) const;
 
   // We have observed Adreno 308 crash when drawing too many instances spread
   // across any number of draw calls. This class breaks them up with glFlush
@@ -469,6 +480,11 @@ private:
 
   public:
     GLPipelineManager(ShaderCompilationMode, RenderContextGLImpl*);
+    void preparePipeline(
+        const PipelineProps&,
+        const PlatformFeatures&,
+        std::unordered_set<const DrawProgram*>&,
+        bool pollLinks);
 
   protected:
     virtual std::unique_ptr<DrawShader> createVertexShader(
@@ -527,6 +543,9 @@ private:
   // Used for blitting non-MSAA -> MSAA, which isn't supported by
   // glBlitFramebuffer().
   glutils::Program m_blitAsDrawProgram = glutils::Program::Zero();
+  // Links in the background from the first frame that needs it; see
+  // prepareFlushPrograms.
+  PipelineStatus m_blitAsDrawProgramStatus = PipelineStatus::notReady;
 
   // The GLCapabilities::avoidTexSubImage2DOnInFlightTextures workaround, when
   // enabled, requires us to use a ring of textures when polyfilling storage

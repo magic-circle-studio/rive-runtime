@@ -20,6 +20,7 @@
 #include "rive/renderer/texture.hpp"
 #include "shaders/constants.glsl"
 
+#include <algorithm>
 #include <cctype>
 #include <initializer_list>
 #include <tuple>
@@ -1865,13 +1866,17 @@ RenderContextGLImpl::DrawProgram::DrawProgram(
   glAttachShader(m_id, m_fragmentShader->id());
   glutils::LinkProgram(m_id, glutils::DebugPrintErrorAndAbort::no);
 
-  std::ignore = advanceCreation(
-      renderContextImpl,
-      createType,
-      drawType,
-      shaderFeatures,
-      interlockMode,
-      shaderMiscFlags);
+  if (createType == PipelineCreateType::sync ||
+      !renderContextImpl->capabilities().KHR_parallel_shader_compile)
+  {
+    std::ignore = advanceCreation(
+        renderContextImpl,
+        createType,
+        drawType,
+        shaderFeatures,
+        interlockMode,
+        shaderMiscFlags);
+  }
 }
 
 bool RenderContextGLImpl::DrawProgram::advanceCreation(
@@ -1885,18 +1890,9 @@ bool RenderContextGLImpl::DrawProgram::advanceCreation(
   // This function should only be called if we're in the middle of creation.
   assert(m_pipelineStatus == PipelineStatus::notReady);
 
-  if (createType == PipelineCreateType::async &&
-      renderContextImpl->capabilities().KHR_parallel_shader_compile)
+  if (!renderContextImpl->isProgramLinkComplete(m_id, createType))
   {
-    // Like above, this is async creation so verify the program is linked
-    // before continuing.
-
-    GLint completed = 0;
-    glGetProgramiv(m_id, GL_COMPLETION_STATUS_KHR, &completed);
-    if (completed == 0)
-    {
-      return false;
-    }
+    return false;
   }
 
 #ifdef WITH_RIVE_TOOLS
@@ -2280,6 +2276,82 @@ void RenderContextGLImpl::preBeginFrame(RenderContext* ctx)
     //  the test.
     m_pipelineManager.clearCache();
   }
+}
+
+StandardPipelineProps RenderContextGLImpl::drawProgramProps(
+    const FlushDescriptor& desc,
+    const DrawBatch& batch) const
+{
+  auto shaderMiscFlags = batch.shaderMiscFlags;
+  if (desc.interlockMode != InterlockMode::depthStencil)
+  {
+    assert(m_plsImpl != nullptr);
+    shaderMiscFlags |= m_plsImpl->shaderMiscFlags(desc, batch.drawType);
+  }
+  return {
+      .drawType = batch.drawType,
+      .shaderFeatures = desc.interlockMode == InterlockMode::atomics
+                            ? desc.combinedShaderFeatures
+                            : batch.shaderFeatures,
+      .interlockMode = desc.interlockMode,
+      .shaderMiscFlags = shaderMiscFlags,
+#ifdef WITH_RIVE_TOOLS
+      .synthesizedFailureType = desc.synthesizedFailureType,
+#endif
+  };
+}
+
+bool RenderContextGLImpl::needsBlitAsDraw(const FlushDescriptor& desc) const
+{
+  auto* target = static_cast<RenderTargetGL*>(desc.renderTarget);
+  auto* framebuffer = lite_rtti_cast<FramebufferRenderTargetGL*>(target);
+  return desc.colorLoadAction == LoadAction::preserveRenderTarget &&
+         desc.msaaSampleCount > 1 &&
+         !m_capabilities.EXT_multisampled_render_to_texture &&
+         (framebuffer == nullptr || framebuffer->sampleCount() <= 1);
+}
+
+bool RenderContextGLImpl::prepareFlushPrograms(
+    Span<const FlushDescriptor* const> descriptors,
+    bool pollLinks)
+{
+  bool needsBlit = false;
+  std::unordered_set<const DrawProgram*> framePrograms;
+  for (const FlushDescriptor* desc : descriptors)
+  {
+    needsBlit |= needsBlitAsDraw(*desc);
+    for (const DrawBatch& batch : *desc->drawList)
+    {
+      m_pipelineManager.preparePipeline(
+          drawProgramProps(*desc, batch),
+          m_platformFeatures,
+          framePrograms,
+          pollLinks);
+    }
+  }
+
+  if (needsBlit)
+  {
+    startBlitAsDrawProgram();
+  }
+  if (!pollLinks)
+  {
+    return false;
+  }
+  if (needsBlit)
+  {
+    finishBlitAsDrawProgram(PipelineCreateType::async);
+    if (m_blitAsDrawProgramStatus == PipelineStatus::notReady)
+    {
+      return false;
+    }
+  }
+  return std::none_of(
+      framePrograms.begin(),
+      framePrograms.end(),
+      [](const DrawProgram* program) {
+        return program->status() == PipelineStatus::notReady;
+      });
 }
 
 void RenderContextGLImpl::flush(const FlushDescriptor& desc)
@@ -2822,28 +2894,12 @@ void RenderContextGLImpl::flush(const FlushDescriptor& desc)
   // Execute the DrawList.
   for (const DrawBatch& batch : *desc.drawList)
   {
-    const gpu::DrawType drawType = batch.drawType;
-    gpu::ShaderFeatures shaderFeatures = desc.interlockMode ==
-                                                 gpu::InterlockMode::atomics
-                                             ? desc.combinedShaderFeatures
-                                             : batch.shaderFeatures;
-    gpu::ShaderMiscFlags shaderMiscFlags = batch.shaderMiscFlags;
-    if (desc.interlockMode != gpu::InterlockMode::depthStencil)
-    {
-      assert(m_plsImpl != nullptr);
-      shaderMiscFlags |= m_plsImpl->shaderMiscFlags(desc, drawType);
-    }
-    const DrawProgram* drawProgram = m_pipelineManager.tryGetPipeline(
-        {
-            .drawType = drawType,
-            .shaderFeatures = shaderFeatures,
-            .interlockMode = desc.interlockMode,
-            .shaderMiscFlags = shaderMiscFlags,
-#ifdef WITH_RIVE_TOOLS
-            .synthesizedFailureType = desc.synthesizedFailureType,
-#endif
-        },
-        m_platformFeatures);
+    const auto props = drawProgramProps(desc, batch);
+    const gpu::DrawType drawType = props.drawType;
+    const gpu::ShaderFeatures shaderFeatures = props.shaderFeatures;
+    const gpu::ShaderMiscFlags shaderMiscFlags = props.shaderMiscFlags;
+    const DrawProgram* drawProgram =
+        m_pipelineManager.tryGetPipeline(props, m_platformFeatures);
     if (drawProgram == nullptr)
     {
       // There was an issue getting either the requested draw program or
@@ -3294,37 +3350,85 @@ void RenderContextGLImpl::drawIndexedInstancedNoInstancedAttribs(
   }
 }
 
+void RenderContextGLImpl::startBlitAsDrawProgram()
+{
+  if (m_blitAsDrawProgram != 0)
+  {
+    return;
+  }
+  const char* blitSources[] = {
+      glsl::constants,
+      glsl::flush_uniforms,
+      glsl::common,
+      glsl::blit_texture_as_draw};
+  m_blitAsDrawProgram = glutils::Program();
+  glutils::CompileAndAttachShader(
+      m_blitAsDrawProgram,
+      GL_VERTEX_SHADER,
+      nullptr,
+      0,
+      blitSources,
+      std::size(blitSources),
+      m_capabilities,
+      glutils::DebugPrintErrorAndAbort::no);
+  glutils::CompileAndAttachShader(
+      m_blitAsDrawProgram,
+      GL_FRAGMENT_SHADER,
+      nullptr,
+      0,
+      blitSources,
+      std::size(blitSources),
+      m_capabilities,
+      glutils::DebugPrintErrorAndAbort::no);
+  glutils::LinkProgram(
+      m_blitAsDrawProgram,
+      glutils::DebugPrintErrorAndAbort::no);
+}
+
+bool RenderContextGLImpl::isProgramLinkComplete(
+    GLuint program,
+    PipelineCreateType createType) const
+{
+  if (createType == PipelineCreateType::async &&
+      m_capabilities.KHR_parallel_shader_compile)
+  {
+    GLint completed = GL_FALSE;
+    glGetProgramiv(program, GL_COMPLETION_STATUS_KHR, &completed);
+    return completed != GL_FALSE;
+  }
+  return true;
+}
+
+void RenderContextGLImpl::finishBlitAsDrawProgram(PipelineCreateType createType)
+{
+  if (m_blitAsDrawProgramStatus != PipelineStatus::notReady ||
+      !isProgramLinkComplete(m_blitAsDrawProgram, createType))
+  {
+    return;
+  }
+  GLint linked = GL_FALSE;
+  glGetProgramiv(m_blitAsDrawProgram, GL_LINK_STATUS, &linked);
+  if (linked == GL_FALSE)
+  {
+    m_blitAsDrawProgramStatus = PipelineStatus::errored;
+    return;
+  }
+  m_blitAsDrawProgramStatus = PipelineStatus::ready;
+  m_state->bindProgram(m_blitAsDrawProgram);
+  glutils::Uniform1iByName(m_blitAsDrawProgram, GLSL_sourceTexture, 0);
+}
+
 void RenderContextGLImpl::blitTextureToFramebufferAsDraw(
     GLuint textureID,
     const IAABB& bounds,
     uint32_t renderTargetHeight,
     bool bottomUp)
 {
-  if (m_blitAsDrawProgram == 0)
+  startBlitAsDrawProgram();
+  finishBlitAsDrawProgram(PipelineCreateType::sync);
+  if (m_blitAsDrawProgramStatus != PipelineStatus::ready)
   {
-    const char* blitSources[] = {
-        glsl::constants,
-        glsl::flush_uniforms,
-        glsl::common,
-        glsl::blit_texture_as_draw};
-    m_blitAsDrawProgram = glutils::Program();
-    m_blitAsDrawProgram.compileAndAttachShader(
-        GL_VERTEX_SHADER,
-        nullptr,
-        0,
-        blitSources,
-        std::size(blitSources),
-        m_capabilities);
-    m_blitAsDrawProgram.compileAndAttachShader(
-        GL_FRAGMENT_SHADER,
-        nullptr,
-        0,
-        blitSources,
-        std::size(blitSources),
-        m_capabilities);
-    m_blitAsDrawProgram.link();
-    m_state->bindProgram(m_blitAsDrawProgram);
-    glutils::Uniform1iByName(m_blitAsDrawProgram, GLSL_sourceTexture, 0);
+    return;
   }
 
   m_state->setPipelineState(
@@ -4074,6 +4178,23 @@ RenderContextGLImpl::GLPipelineManager::GLPipelineManager(
     : Super(mode)
     , m_context(context)
 {}
+
+void RenderContextGLImpl::GLPipelineManager::preparePipeline(
+    const PipelineProps& propsIn,
+    const PlatformFeatures& features,
+    std::unordered_set<const DrawProgram*>& framePrograms,
+    bool pollLinks)
+{
+  auto props = ubershaderPropsFor(propsIn, features);
+  bool created;
+  auto* program = queuePipelineIfNotFound(props, features, &created);
+  // Track new links so later batches cannot poll them.
+  if (program->status() == PipelineStatus::notReady &&
+      framePrograms.insert(program).second && !created && pollLinks)
+  {
+    std::ignore = advanceCreation(PipelineCreateType::async, *program, props);
+  }
+}
 
 std::unique_ptr<RenderContextGLImpl::DrawProgram> RenderContextGLImpl::
     GLPipelineManager::createPipeline(

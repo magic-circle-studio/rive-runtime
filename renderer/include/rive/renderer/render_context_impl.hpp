@@ -235,6 +235,17 @@ public:
   // multiple times).
   virtual void flush(const gpu::FlushDescriptor&) = 0;
 
+  // Starts creating every program these flushes need, without waiting on a
+  // link. With pollLinks, also checks the links submitted earlier. Returns
+  // whether the flushes can draw: always false without pollLinks. Backends
+  // without non-blocking program creation create them when they flush.
+  virtual bool prepareFlushPrograms(
+      Span<const gpu::FlushDescriptor* const>,
+      bool pollLinks)
+  {
+    return pollLinks;
+  }
+
   // Called after all logical flushes in a frame have completed.
   virtual void postFlush(const RenderContext::FlushResources&) {}
 

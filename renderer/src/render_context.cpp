@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <limits>
 #include <string_view>
+#include <tuple>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -881,6 +882,13 @@ void RenderContext::logicalFlush()
 
 void RenderContext::flush(const FlushResources& flushResources)
 {
+  std::ignore = flush(flushResources, PendingPrograms::wait);
+}
+
+bool RenderContext::flush(
+    const FlushResources& flushResources,
+    PendingPrograms pendingPrograms)
+{
   RIVE_PROF_SCOPE_L(0)
   assert(m_didBeginFrame);
   assert(
@@ -1105,6 +1113,7 @@ void RenderContext::flush(const FlushResources& flushResources)
   m_impl->prepareToFlush(
       flushResources.currentFrameNumber,
       flushResources.safeFrameNumber);
+  bool drawn = true;
   if (mapResourceBuffers(resourceRequirements))
   {
     for (const auto& flush : m_logicalFlushes)
@@ -1143,9 +1152,21 @@ void RenderContext::flush(const FlushResources& flushResources)
 
     unmapResourceBuffers(resourceRequirements);
 
+    if (pendingPrograms != PendingPrograms::wait)
+    {
+      m_flushDescriptors.clear();
+      for (const auto& flush : m_logicalFlushes)
+      {
+        m_flushDescriptors.push_back(&flush->desc());
+      }
+      drawn = m_impl->prepareFlushPrograms(
+          m_flushDescriptors,
+          /*pollLinks=*/pendingPrograms == PendingPrograms::skipFrame);
+    }
+
     // Issue logical flushes to the backend. A zero-area target has no pixels
     // to touch.
-    if (m_frameDescriptor.renderTargetWidth != 0 &&
+    if (drawn && m_frameDescriptor.renderTargetWidth != 0 &&
         m_frameDescriptor.renderTargetHeight != 0)
     {
       for (const auto& flush : m_logicalFlushes)
@@ -1158,6 +1179,7 @@ void RenderContext::flush(const FlushResources& flushResources)
   {
     fprintf(stderr, "Buffer mapping failed, cannot render.\n");
     unmapResourceBuffers(resourceRequirements);
+    drawn = false;
   }
 
   m_impl->postFlush(flushResources);
@@ -1190,6 +1212,7 @@ void RenderContext::flush(const FlushResources& flushResources)
   {
     resetContainers();
   }
+  return drawn;
 }
 
 static uint32_t pls_transient_backing_plane_count(
