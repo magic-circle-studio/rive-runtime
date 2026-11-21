@@ -1397,8 +1397,13 @@ constexpr static ShaderFeatures UbershaderFeaturesMaskFor(
   }
   else if (interlockMode == InterlockMode::depthStencil)
   {
-    outFeatures &=
-        (requestedFeatures | ~kExclusiveDepthStencilUbershaderFeaturesMask);
+    ShaderFeatures exclusive = kExclusiveDepthStencilUbershaderFeaturesMask;
+    if (drawType == DrawType::depthStrokes)
+    {
+      // Plain and material strokes share one program, so it links once.
+      exclusive &= ~kSurfaceMaterialShaderFeatures;
+    }
+    outFeatures &= (requestedFeatures | ~exclusive);
   }
 
   // Ensure that we haven't dropped features we care about somehow
