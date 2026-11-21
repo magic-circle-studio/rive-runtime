@@ -1139,6 +1139,13 @@ constexpr static ShaderFeatures
     kExclusiveAtomicUbershaderFeaturesMask = ShaderFeatures::
         ENABLE_ADVANCED_BLEND;
 
+// Omit these features from depth-stencil ubershaders unless a draw requests
+// them, so the programs most draws use skip their branches.
+constexpr static ShaderFeatures kExclusiveDepthStencilUbershaderFeaturesMask =
+    ShaderFeatures::ENABLE_CLIP_RECT | ShaderFeatures::ENABLE_MODULATED_IMAGE |
+    ShaderFeatures::ENABLE_HSL_BLEND_MODES |
+    ShaderFeatures::ENABLE_ANGULAR_GRADIENT;
+
 constexpr static ShaderFeatures ShaderFeaturesMaskFor(
     InterlockMode interlockMode)
 {
@@ -1362,6 +1369,11 @@ constexpr static ShaderFeatures UbershaderFeaturesMaskFor(
     // Turn off the exclusive atomic features unless they're set in our
     //  requested feature flags.
     outFeatures &= (requestedFeatures | ~kExclusiveAtomicUbershaderFeaturesMask);
+  }
+  else if (interlockMode == InterlockMode::depthStencil)
+  {
+    outFeatures &=
+        (requestedFeatures | ~kExclusiveDepthStencilUbershaderFeaturesMask);
   }
 
   // Ensure that we haven't dropped features we care about somehow
