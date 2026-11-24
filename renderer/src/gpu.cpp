@@ -986,18 +986,6 @@ static void writeTranslate(volatile float* dst, const Mat2D& matrix)
     dst[1] = vals[5];
 }
 
-static Mat2D orient_for_framebuffer(Mat2D matrix,
-                                    const RenderTarget* renderTarget,
-                                    const PlatformFeatures& platformFeatures)
-{
-    if (renderTarget->bottomUp(platformFeatures))
-    {
-        matrix =
-            matrix * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
-    }
-    return matrix;
-}
-
 void PathData::set(const Mat2D& m,
                    float strokeRadius,
                    float featherRadius,
@@ -1279,8 +1267,12 @@ void PaintAuxData::set(const Mat2D& viewMatrix,
     if (surfaceMaterialData != nullptr &&
         surfaceMaterialData->material != SurfaceMaterial::none)
     {
-        Mat2D screenToUV = orient_for_framebuffer(
-            surfaceMaterialData->screenToUV, renderTarget, platformFeatures);
+        Mat2D screenToUV = surfaceMaterialData->screenToUV;
+        if (renderTarget->bottomUp(platformFeatures))
+        {
+            screenToUV =
+                screenToUV * Mat2D(1, 0, 0, -1, 0, renderTarget->height());
+        }
         write_matrix(m_surfaceMaterialMatrix, screenToUV);
         m_surfaceMaterialMode = static_cast<float>(surfaceMaterialData->material);
         m_surfaceMaterialTimeSeconds = surfaceMaterialData->timeSeconds;

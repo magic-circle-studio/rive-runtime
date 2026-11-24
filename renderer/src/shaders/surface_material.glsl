@@ -52,9 +52,8 @@ INLINE half3 apply_gold_material(half3 baseColor,
     return mix(gold, baseColor, make_half(inkProtection * 0.94));
 }
 
-// This is the six-stop linear gradient used by Magic Circle's original
-// Rainbow filter. Keep the branchless mix chain: dynamically indexed local
-// arrays miscompile on some Mali GPUs.
+// Rainbow's six-stop linear gradient. Keep the branchless mix chain:
+// dynamically indexed local arrays miscompile on some Mali GPUs.
 INLINE half3 surface_rainbow_color(float t)
 {
     float segment = clamp(t, 0.0, 1.0) * 5.0;

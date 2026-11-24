@@ -35,13 +35,6 @@ public:
     void transform(const Mat2D& matrix) override;
     void drawPath(RenderPath*, RenderPaint*) override;
     void clipPath(RenderPath*) override;
-    void setSurfaceMaterialOverride(SurfaceMaterial material) override
-    {
-        if (material != SurfaceMaterial::inherit)
-        {
-            m_renderStateStack.back().surfaceMaterial = material;
-        }
-    }
     void drawImage(const RenderImage*,
                    ImageSampler,
                    BlendMode,
@@ -89,9 +82,7 @@ public:
                             const AABB& bounds,
                             float timeSeconds)
     {
-        m_renderStateStack.back().surfaceMaterial =
-            material == SurfaceMaterial::inherit ? SurfaceMaterial::none
-                                                 : material;
+        m_renderStateStack.back().surfaceMaterial = material;
         m_renderStateStack.back().surfaceMaterialBounds = bounds;
         m_renderStateStack.back().surfaceMaterialTimeSeconds = timeSeconds;
     }
@@ -120,9 +111,8 @@ public:
 #endif
 
 private:
-    enum class MaterialSpace { path, artboard };
     std::optional<gpu::SurfaceMaterialData> makeSurfaceMaterialData(
-        MaterialSpace, RiveRenderPath* = nullptr);
+        RiveRenderPath*);
     void clipAndPushPathDraw(gpu::DrawUniquePtr, RiveRenderPath*);
     // pixelBounds must contain the transformed mesh. Arbitrary meshes pass
     // FULLSCREEN_PIXEL_BOUNDS; image quads pass their own bounds so overlay

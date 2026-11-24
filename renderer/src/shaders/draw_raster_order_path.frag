@@ -176,13 +176,13 @@ PLS_MAIN(@drawFragmentMain)
             color = apply_surface_material_to_paint(
                 color,
                 v_surfaceMaterialData,
-                
 #ifdef @ENABLE_ADVANCED_BLEND
-            !@ENABLE_ADVANCED_BLEND || cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
+                !@ENABLE_ADVANCED_BLEND ||
+                    cast_half_to_ushort(v_blendMode) == BLEND_SRC_OVER
 #else
-            true
+                true
 #endif
-);
+            );
         }
 #endif // RIVE_SURFACE_MATERIAL && ENABLE_HSL_BLEND_MODES
 
