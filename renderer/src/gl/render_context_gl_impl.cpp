@@ -3560,6 +3560,41 @@ bool RenderContextGLImpl::tryStartAsyncUbershaderCreation(
   return true;
 }
 
+// ANGLE's Direct3D 11 renderer string carries the PCI device ID, e.g.
+// "ANGLE (Intel, Intel(R) HD Graphics 4600 (0x00000412) Direct3D11 ...". Its
+// high byte names an Intel generation: 0x01 Sandy and Ivy Bridge, 0x0F Bay
+// Trail, 0x04/0x0A/0x0C/0x0D Haswell, 0x16 Broadwell and 0x22 Braswell.
+// Skylake, the first Gen 9, is 0x19.
+static bool is_pre_gen9_intel(const char* rendererString)
+{
+  const char* hexDigit = strstr(rendererString, "(0x");
+  if (strncmp(rendererString, "ANGLE (Intel", 12) != 0 || hexDigit == nullptr)
+  {
+    return false;
+  }
+  uint32_t deviceId = 0;
+  for (hexDigit += 3; isxdigit(static_cast<unsigned char>(*hexDigit));
+       ++hexDigit)
+  {
+    char c = static_cast<char>(tolower(static_cast<unsigned char>(*hexDigit)));
+    deviceId = deviceId * 16 + (isdigit(c) ? c - '0' : c - 'a' + 10);
+  }
+  switch (deviceId >> 8)
+  {
+    case 0x01:
+    case 0x04:
+    case 0x0A:
+    case 0x0C:
+    case 0x0D:
+    case 0x0F:
+    case 0x16:
+    case 0x22:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // The sscanf subset these fixed version strings need, %u and whitespace, so
 // the wasm does not link all of scanf. Returns how many values it read.
 static int scanVersion(
@@ -4131,6 +4166,15 @@ std::unique_ptr<RenderContext> RenderContextGLImpl::MakeContext(
       // ANGLE_shader_pixel_local_storage is currently broken with
       // GL_TEXTURE_2D_ARRAY on ANGLE's d3d11 renderer.
       capabilities.avoidTexture2DArrayWithWebGLPLS = true;
+      if (is_pre_gen9_intel(rendererString))
+      {
+        // Haswell, Broadwell and Braswell drivers advertise coherent PLS on
+        // d3d11, but the GPU process dies within seconds of the first PLS
+        // frames, until Chrome refuses WebGL to the page. Draw with MSAA
+        // there.
+        capabilities.ANGLE_shader_pixel_local_storage = false;
+        capabilities.ANGLE_shader_pixel_local_storage_coherent = false;
+      }
     }
   }
 
